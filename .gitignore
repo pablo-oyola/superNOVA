@@ -1,0 +1,14 @@
+no_sync/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.vscode/
+.codex-worklog
+.codex
+.agents
+.pytest_cache/
+tests/
+*.egg-info/
+*.code-workspace

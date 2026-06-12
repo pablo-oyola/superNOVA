@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynova"
+description = "SuperNOVA: A Python package for computing the ideal MHD stability of tokamak equilibria."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "unyt",
+    "numba",
+    "xarray",
+    "pycocos",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["supernova*"]
+
+[tool.setuptools.dynamic.version]
+attr = "supernova.__version__"
