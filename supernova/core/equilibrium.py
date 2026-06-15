@@ -11,30 +11,26 @@ would usable?).
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
 import xarray as xr
 from pycocos import Equilibrium
 from ..radial.profile import Profile
 from findiff import Diff
 from .._logger import get_logger
 from ..radial.profile import ProfileFactoryPsiThetaZeta
-from ..radial.base import RadialFE
-from scipy.constants import mu_0
-from sympy import Rational
 
 logger = get_logger(__name__)
 
 from typing import Optional, List, Any, Tuple
 import unyt
-from unyt.dimensions import (
-    length as u_length,
-    mass as u_mass,
-    time as u_time,
-    current_mks as u_current_mks,
-    magnetic_field as u_magnetic_field,
-    magnetic_flux as u_magnetic_flux,
-    pressure as u_pressure,
-    density as u_mass_density,
+from ._mhd_equivalence import (
+    _has_unyt_units,
+    _sync_xarray_units_attr,
+    _unytfy_my_xarray,
+    _in_unit_system,
+    _deunytfy_my_xarray,
+    _to_normalized_expression_units,
+    _expression_binary_op,
+    create_nova_registry
 )
 
 # --- Used to interprete user-provided operations.
@@ -63,134 +59,6 @@ _ALLOWED_EXPRESSION_FUNCTIONS = {
 _ALLOWED_EXPRESSION_CONSTANTS = {"pi": np.pi, "e": np.e, "mu_0": 1*unyt.mu_0}
 
 
-def _has_unyt_units(x: Any) -> bool:
-    """
-    Return True for unyt arrays/quantities without depending on exact subclasses.
-    """
-    return hasattr(x, "units") and hasattr(x, "in_base")
-
-
-def _rebind_unyt_registry(x: Any, reg: unyt.UnitRegistry=None):
-    """
-    Recreate a unyt value in the local registry.
-    """
-    if reg is None or not _has_unyt_units(x):
-        return x
-    return x.value * unyt.Unit(str(x.units), registry=reg)
-
-
-def _sync_xarray_units_attr(x: xr.DataArray) -> xr.DataArray:
-    """
-    Make the xarray units attribute follow the actual unyt data units.
-    """
-    if _has_unyt_units(x.data):
-        x.attrs["units"] = str(x.data.units)
-    elif "units" not in x.attrs:
-        x.attrs["units"] = "dimensionless"
-    return x
-
-
-def _unytfy_my_xarray(x: xr.DataArray, reg: unyt.UnitRegistry=None) -> xr.DataArray:
-    """
-    Using unyt, we attach the units.
-    """
-    x = x.copy(deep=True)
-
-    if _has_unyt_units(x.data):
-        x.data = _rebind_unyt_registry(x.data, reg=reg)
-        return _sync_xarray_units_attr(x)
-
-    if 'units' not in x.attrs:
-        x.attrs['units'] = 'dimensionless'
-        x.data = x.data * unyt.Unit('dimensionless', registry=reg)
-        return x
-
-    try:
-        x.data = x.data * unyt.Unit(x.attrs['units'], registry=reg)
-    except KeyError as e:
-        print(f"Cannot find the units of {x.name} "
-              f"with units {x.attrs['units']}. Following the exception {e}")
-        raise e
-    return _sync_xarray_units_attr(x)
-
-
-def _in_unit_system(x: Any, unit_system, reg: unyt.UnitRegistry=None):
-    """
-    Convert xarray fields, unyt constants, or plain scalars to a unit system.
-    """
-    if isinstance(x, xr.DataArray):
-        out = _unytfy_my_xarray(x, reg=reg)
-        out.data = out.data.in_base(unit_system)
-        return _sync_xarray_units_attr(out)
-
-    if _has_unyt_units(x):
-        return _rebind_unyt_registry(x, reg=reg).in_base(unit_system)
-
-    if isinstance(x, (int, float, complex, np.number)):
-        return x
-
-    raise TypeError(f"Cannot convert object of type {type(x).__name__} to a unit system.")
-
-
-def _deunytfy_my_xarray(x: xr.DataArray, reg: unyt.UnitRegistry=None) -> xr.DataArray:
-    """
-    Using unyt, we dequantify the units.
-    """
-    x = x.copy(deep=True)
-
-    if _has_unyt_units(x.data):
-        x.attrs['units'] = str(x.data.units)
-        x.data = x.data.value
-    elif 'units' not in x.attrs:
-        x.attrs['units'] = 'dimensionless'
-    return x
-
-
-def _to_normalized_expression_units(name: str, x: Any, reg: unyt.UnitRegistry):
-    """
-    Recast operands into normalized MHD-stress algebra.
-
-    In normalized expressions:
-        pressure means μ0 p, scaled by Baxis**2.
-        B0 remains a magnetic field.
-        kappa_s remains B**2-like.
-    """
-    if name == "mu_0":
-        return 1.0
-
-    B2_unit = unyt.Unit("Baxis", registry=reg)**2
-    p0_unit = unyt.Unit("p0", registry=reg)
-
-    if name == "pressure":
-        if isinstance(x, xr.DataArray):
-            out = x.copy(deep=True)
-            # x is already in the normalized unit system, so its value is p/p0.
-            out.data = out.data.to(p0_unit).value * B2_unit
-            return _sync_xarray_units_attr(out)
-
-        if _has_unyt_units(x):
-            return x.to(p0_unit).value * B2_unit
-
-    return x
-
-def _expression_binary_op(left: Any, right: Any, op):
-    """
-    Apply a binary expression operation while preserving xarray coordinates.
-    """
-    if isinstance(left, xr.DataArray) and isinstance(right, xr.DataArray):
-        return _sync_xarray_units_attr(op(left, right))
-
-    if isinstance(left, xr.DataArray):
-        out = left.copy(deep=True)
-        out.data = op(left.data, right)
-        return _sync_xarray_units_attr(out)
-
-    if isinstance(right, xr.DataArray):
-        out = right.copy(deep=True)
-        out.data = op(left, right.data)
-        return _sync_xarray_units_attr(out)
-
-    return op(left, right)
 
 class superEquilibrium:
     """
@@ -534,135 +402,12 @@ class superEquilibrium:
         | Density                | n0               | Density at the axis        |
         | Pressure               | 1/(Baxis^2/mu_0) | On-axis magnetic pressure  |
         """
-        # We need to create our own registry first:
-        reg = unyt.UnitRegistry()
-
-        aminor = self.aminor * unyt.m
-        B0 = self.Baxis * unyt.T
-        n0 = self.density.data.real.interp(x=0.0, method='cubic').values[0] * unyt.m**(-3)
-        mass_ion = 1*unyt.amu
-        rho0 = (n0 * mass_ion).to('kg/m**3')
-        mu0 = unyt.mu_0
-        vA = (B0 / np.sqrt(mu0 * rho0)).to('m/s')
-        tauA = (aminor / vA).to('s')
-
-        M0 = rho0 * aminor**3
-        I0 = B0 * aminor / mu0
-        p0 = (B0**2 / mu0).to("Pa")
-        psi0 = (B0 * aminor**2).to("Wb")
-
-        # We will create new symbols to store the normalization factors.
-        # All base_value entries must be in MKS values for the given dimension.
-        reg.add(
-            "aminor",
-            base_value=float(aminor.to("m").value),
-            dimensions=u_length,
-            tex_repr=r"a",
-        )
-
-        reg.add(
-            "M0",
-            base_value=float(M0.to("kg").value),
-            dimensions=u_mass,
-            tex_repr=r"M_0",
-        )
-
-        reg.add(
-            "tauA",
-            base_value=float(tauA.to("s").value),
-            dimensions=u_time,
-            tex_repr=r"\tau_A",
-        )
-
-        reg.add(
-            "I0",
-            base_value=float(I0.to("A").value),
-            dimensions=u_current_mks,
-            tex_repr=r"I_0",
-        )
-
-        # Useful derived named units.
-        reg.add(
-            "Baxis",
-            base_value=float(B0.to("T").value),
-            dimensions=u_magnetic_field,
-            tex_repr=r"B_{\rm axis}",
-        )
-
-        reg.add(
-            "rhoaxis",
-            base_value=float(rho0.to("kg/m**3").value),
-            dimensions=u_mass_density,
-            tex_repr=r"\rho_\rm{axis}",
-        )
-
-        reg.add(
-            "p0",
-            base_value=float(p0.to("Pa").value),
-            dimensions=u_pressure,
-            tex_repr=r"\frac{B_{\rm axis}^2}{\mu_0}",
-        )
-
-        reg.add(
-            "sqrt_p0",
-            base_value=np.sqrt(float(p0.to("Pa").value)),
-            dimensions=u_pressure**Rational(1, 2),
-            tex_repr=r"\sqrt{p_0}",
-        )
-
-        reg.add(
-            "psi0",
-            base_value=float(psi0.to("Wb").value),
-            dimensions=u_magnetic_flux,
-            tex_repr=r"\psi_\rm{wall}",
-        )
-
-        # Optional but useful.
-        reg.add(
-            "vA",
-            base_value=float(vA.to("m/s").value),
-            dimensions=u_length / u_time,
-            tex_repr=r"v_A^\rm{axis}",
-        )
-
-        reg.add(
-            "omegaA",
-            base_value=float((1.0 / tauA).to("Hz").value),
-            dimensions=1 / u_time,
-            tex_repr=r"\omega_A",
-        )
-
-        reg.add(
-            "naxis",
-            base_value=float(n0.to("m**-3").value),
-            dimensions=1 / u_length**3,
-            tex_repr=r"n_{\rm axis}",
-        )
-
-        self.registry = reg
-        self.my_norm_name = f"nova_{id(self)}"
-        self.my_norm = unyt.UnitSystem(
-                                        self.my_norm_name,
-                                        length_unit=unyt.Unit("aminor", registry=reg),
-                                        mass_unit=unyt.Unit("M0", registry=reg),
-                                        time_unit=unyt.Unit("tauA", registry=reg),
-                                        temperature_unit="K",
-                                        angle_unit="rad",
-                                        current_mks_unit=unyt.Unit("I0", registry=reg),
-                                        luminous_intensity_unit="cd",
-                                        registry=reg,
-                                    )
-        self.my_norm["magnetic_field"] = unyt.Unit("Baxis", registry=reg)
-        self.my_norm["pressure"] = unyt.Unit("p0", registry=reg)
-        self.my_norm["magnetic_flux"] = unyt.Unit("psi0", registry=reg)
-
-        # Depending on unyt version, this may or may not be accepted as a string
-        # dimension key. If it fails, you can simply normalize rho_mass explicitly
-        # with .to("rhoaxis") instead of relying on .in_base().
-        try:
-            self.my_norm["density"] = unyt.Unit("rhoaxis", registry=reg)
-        except Exception:
-            pass
+        self.reg_name = f"nova_{id(self)}"
+        n0 = self.density.data.real.interp(x=0.0).values.squeeze()
+        self.my_norm, self.registry = create_nova_registry(self.reg_name,
+                                                           self.aminor * unyt.m, 
+                                                           self.Baxis * unyt.T, 
+                                                           n0 * unyt.m**(-3))
 
     # --------------------
     # Handling new additions to the real space and magnetic space databases.
