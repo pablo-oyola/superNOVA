@@ -12,7 +12,9 @@ We build using numba/cupy/accelerator the matrices to solve the continuum spectr
 
 import numpy as np
 from .._utils import njit, prange
-from scipy.constants import mu_0
+# from scipy.constants import mu_0
+
+mu_0 = 1.0 # Normalized units.
 
 # -------------------------------------
 # General kernels.  
