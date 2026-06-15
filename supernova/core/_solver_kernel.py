@@ -10,7 +10,8 @@ r"""
 
 import numpy as np
 from .._utils import njit, prange
-from scipy.constants import mu_0
+# from scipy.constants import mu_0
+mu_0 = 1.0 # Normalized units.
 from dataclasses import dataclass
 
 # Some of the kernels are already implemented.

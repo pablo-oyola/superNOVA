@@ -9,11 +9,11 @@ T(\omega) x = 0
 import numpy as np
 import matplotlib.pyplot as plt
 import xarray as xr
+import unyt
 from .equilibrium import superEquilibrium
 from .continuum import superContinuum
 from ..radial.base import RadialFE
 from ..radial.profile import Profile
-from .antenna import antenna
 
 # Let's import the kernels
 from ._solver_kernel import apply_to_reduced, solver_blocks, eval_M_at, build_solver_blocks
@@ -21,7 +21,6 @@ from ._antenna import Antenna
 from ._boundary import idealSeparatrixBC, couplingPressureDisplacementBC, regularityAxisBC
 from ._petsc_helpers import KrylovSolver
 # Let's import the PETSc interface for the Krylov inversion.
-
 
 
 class superSolver:
@@ -123,18 +122,18 @@ class superSolver:
 
         """
 
-        _to_compute = ['kappa_Psi/gpsi_psi',             # C11, also for D12                    - 0
-                       'B0**2',   # C12 - second part (still need to divide by h).                - 1
-                       '(J_B - shear*gpsi_psi) * shear / B0**2',  # C12 - third part              - 2
-                       'B0**2/gpsi_psi',    # The O operator (still need to divide by h).         - 3
+        _to_compute = ['kappa_Psi/gpsi_psi',             # C11, also for D12                      - 0
+                       'B0**2/h',   # C12 - second part                                           - 1
+                       '(mu_0*J_B - shear*gpsi_psi) * shear / B0**2',  # C12 - third part              - 2
+                       'B0**2/gpsi_psi/h',    # The O operator                                    - 3
                        '- divPsiVec', # C22 - Precomputed.                                        - 4
-                       '(shear*gpsi_psi - J_B)',  # D11 (still needs division by h).              - 5
+                       '(shear*gpsi_psi - J_B)/h',  # D11                                         - 5
                        'kappa_s',  # D21 - first part; distinct from the continuum K operator.    - 6
                        '1/B0**2', # F11 second part.                                              - 7
                        'gpsi_psi/B0**2 * shear', # F12 - first part                               - 8
                        '- J_B/B0**2', # F12 - second part                                         - 9
-                       '-1/B0**4', # F21 - still needs to be multiplied by h.                     - 10
-                       '-kappa_Psi/(gpsi_psi*B0**2)', # F22 - needs to be multiplied by h.        - 11
+                       '-1/B0**4*h', # F21                                                        - 10
+                       '-kappa_Psi/(gpsi_psi*B0**2)*h', # F22                                     - 11
                        '1/gpsi_psi', # Harmonic operator needed by lambda/gpsi_psi.               - 12
                        'gpsi_theta/gpsi_psi', # Surface phase term for e^{i(m*theta-n*zeta)}.     - 13
                        'gpsi_zeta/gpsi_psi', # Surface phase term for e^{i(m*theta-n*zeta)}.      - 14
@@ -142,21 +141,28 @@ class superSolver:
         
         # We only build the elements at the collocation nodes
         # and using the user-provided FE basis.
-        tmp = self.equ(*_to_compute)
+        # tmp = self.equ(*_to_compute, normalize=True)
+
+        tmp = list()
+        for ii in _to_compute:
+            try:
+                tmp.append(self.equ(ii, normalize=True))
+            except:
+                breakpoint()
 
         self.C11 = tmp[0]
-        self.C12_2 = tmp[1] / self.equ.hprof
+        self.C12_2 = tmp[1]
         self.C12_3 = tmp[2]
-        self.O = tmp[3] / self.equ.hprof
+        self.O = tmp[3]
         self.C22 = tmp[4]
-        self.D11 = tmp[5] / self.equ.hprof
+        self.D11 = tmp[5]
         self.D21_1 = tmp[6]
         self.D21_2 = self.cont.M # = h(\psi)
         self.F11_2 = tmp[7]
         self.F12_1 = tmp[8]
         self.F12_2 = tmp[9]
-        self.F21 = tmp[10] * self.equ.hprof
-        self.F22 = tmp[11] * self.equ.hprof
+        self.F21 = tmp[10]
+        self.F22 = tmp[11]
         self.inv_gpsi_psi = tmp[12]
         self.gpsi_theta_over_gpsi_psi = tmp[13]
         self.gpsi_zeta_over_gpsi_psi = tmp[14]
@@ -206,23 +212,18 @@ class superSolver:
         self.K.data = self.K.data.interp(x=self.unique_points)
 
         # We keep too a copy of the density, pressure and the derivative.
-        self.density = self.equ.density.copy()
-        self.pressure = self.equ.pressure.copy()
-        self.pressure_deriv = self.equ.pressure.copy()
-        self.density.data = self.equ.density.data.interp(x=self.unique_points)
-        self.pressure.data = self.equ.pressure.data.interp(x=self.unique_points)
-        self.pressure_deriv.data = self.equ.pressure.data.differentiate('x').interp(x=self.unique_points)
+        self.density = self.equ('density', normalized=True)
+        self.pressure = self.equ('pressure', normalized=True)
+        self.pressure_deriv = self.equ('pressure', normalized=True)
+        self.density.data = self.density.data.interp(x=self.unique_points)
+        self.pressure.data = self.pressure.data.interp(x=self.unique_points)
+        self.pressure_deriv.data = self.pressure.data.differentiate('x').interp(x=self.unique_points)
 
         # We evaluate as well hprof, qprof, Iprof and gprof at the solver points for later use in the integrals.
-        self.hprof = self.equ.hprof.copy()
-        self.qprof = self.equ.qprof.copy()
-        self.Iprof = self.equ.Iprof.copy()
-        gprof_source = getattr(self.equ, "gprof", self.equ.Fprof)
-        self.gprof = gprof_source.copy()
-        self.hprof.data = self.equ.hprof.data.interp(x=self.unique_points)
-        self.qprof.data = self.equ.qprof.data.interp(x=self.unique_points)
-        self.Iprof.data = self.equ.Iprof.data.interp(x=self.unique_points)
-        self.gprof.data = gprof_source.data.interp(x=self.unique_points)
+        self.hprof = self.equ('h', normalized=True).data.real.squeeze().interp(x=self.unique_points)
+        self.qprof = self.equ('q', normalized=True).data.real.squeeze().interp(x=self.unique_points)
+        self.Iprof = self.equ('I', normalized=True).data.real.squeeze().interp(x=self.unique_points)
+        self.gprof = self.equ('g', normalized=True).data.real.squeeze().interp(x=self.unique_points)
 
     def _solver_mmax(self, mmax: int=None) -> int:
         """
