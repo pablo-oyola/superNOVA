@@ -141,14 +141,14 @@ class superSolver:
         
         # We only build the elements at the collocation nodes
         # and using the user-provided FE basis.
-        # tmp = self.equ(*_to_compute, normalize=True)
+        tmp = self.equ(*_to_compute, normalize=True)
 
-        tmp = list()
-        for ii in _to_compute:
-            try:
-                tmp.append(self.equ(ii, normalize=True))
-            except:
-                breakpoint()
+        # tmp = list()
+        # for ii in _to_compute:
+        #     try:
+        #         tmp.append(self.equ(ii, normalize=True))
+        #     except:
+        #         breakpoint()
 
         self.C11 = tmp[0]
         self.C12_2 = tmp[1]
@@ -211,19 +211,33 @@ class superSolver:
         self.M.data = self.M.data.interp(x=self.unique_points)
         self.K.data = self.K.data.interp(x=self.unique_points)
 
+        # We need to get for the radial derivative the underlying unit and scale
+        # of the flux. For the absolute value of the flux at the edge, psiN, we
+        # need to inquire the boozer coordinates.
+        psiN = np.abs(self.equ.boozer.coords.psi0).max() * unyt.Unit('Wb', registry=self.equ.registry)
+        psiN = psiN.data.in_base(self.equ.my_norm).to('psi0').v
+
+        # We need also to divide the density by the maximum density.
+        n0 = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")
+
         # We keep too a copy of the density, pressure and the derivative.
-        self.density = self.equ('density', normalized=True)
-        self.pressure = self.equ('pressure', normalized=True)
-        self.pressure_deriv = self.equ('pressure', normalized=True)
-        self.density.data = self.density.data.interp(x=self.unique_points)
+        self.density = self.equ('density', normalize=True)
+        self.pressure = self.equ('pressure', normalize=True)
+        self.pressure_deriv = self.equ('pressure', normalize=True)
+        self.density.data = self.density.data.interp(x=self.unique_points) / n0.v
         self.pressure.data = self.pressure.data.interp(x=self.unique_points)
-        self.pressure_deriv.data = self.pressure.data.differentiate('x').interp(x=self.unique_points)
+        self.pressure_deriv.data = self.pressure.data.differentiate('x').interp(x=self.unique_points) / psiN
 
         # We evaluate as well hprof, qprof, Iprof and gprof at the solver points for later use in the integrals.
-        self.hprof = self.equ('h', normalized=True).data.real.squeeze().interp(x=self.unique_points)
-        self.qprof = self.equ('q', normalized=True).data.real.squeeze().interp(x=self.unique_points)
-        self.Iprof = self.equ('I', normalized=True).data.real.squeeze().interp(x=self.unique_points)
-        self.gprof = self.equ('g', normalized=True).data.real.squeeze().interp(x=self.unique_points)
+        self.hprof = self.equ('h', normalize=True)
+        self.qprof = self.equ('q', normalize=True)
+        self.Iprof = self.equ('I', normalize=True)
+        self.gprof = self.equ('g', normalize=True)
+
+        self.hprof.data = self.hprof.data.interp(x=self.unique_points)
+        self.qprof.data = self.qprof.data.interp(x=self.unique_points)
+        self.Iprof.data = self.Iprof.data.interp(x=self.unique_points)
+        self.gprof.data = self.gprof.data.interp(x=self.unique_points)
 
     def _solver_mmax(self, mmax: int=None) -> int:
         """
@@ -289,7 +303,7 @@ class superSolver:
 
         H = self._profile_harmonics
         S = self._profile_scalar
-        mass_density = S(self.density) * self.cont.mass
+        mass_density = S(self.density)# * self.cont.mass
 
         self.solver_blocks = build_solver_blocks(H(self.C11, mmax_eff, nmax_eff),
                                                  H(self.O, mmax_eff, nmax_eff),
