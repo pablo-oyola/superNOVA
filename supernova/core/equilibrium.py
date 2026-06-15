@@ -20,14 +20,27 @@ from .._logger import get_logger
 from ..radial.profile import ProfileFactoryPsiThetaZeta
 from ..radial.base import RadialFE
 from scipy.constants import mu_0
+from sympy import Rational
 
 logger = get_logger(__name__)
 
 from typing import Optional, List, Any, Tuple
 import unyt
+from unyt.dimensions import (
+    length as u_length,
+    mass as u_mass,
+    time as u_time,
+    current_mks as u_current_mks,
+    magnetic_field as u_magnetic_field,
+    magnetic_flux as u_magnetic_flux,
+    pressure as u_pressure,
+    density as u_mass_density,
+)
 
 # --- Used to interprete user-provided operations.
 import ast
+import operator
+
 _ALLOWED_EXPRESSION_FUNCTIONS = {
     "abs": np.abs,
     "arccos": np.arccos,
@@ -47,7 +60,137 @@ _ALLOWED_EXPRESSION_FUNCTIONS = {
     "tan": np.tan,
     "tanh": np.tanh,
 }
-_ALLOWED_EXPRESSION_CONSTANTS = {"pi": np.pi, "e": np.e, "mu_0": mu_0}
+_ALLOWED_EXPRESSION_CONSTANTS = {"pi": np.pi, "e": np.e, "mu_0": 1*unyt.mu_0}
+
+
+def _has_unyt_units(x: Any) -> bool:
+    """
+    Return True for unyt arrays/quantities without depending on exact subclasses.
+    """
+    return hasattr(x, "units") and hasattr(x, "in_base")
+
+
+def _rebind_unyt_registry(x: Any, reg: unyt.UnitRegistry=None):
+    """
+    Recreate a unyt value in the local registry.
+    """
+    if reg is None or not _has_unyt_units(x):
+        return x
+    return x.value * unyt.Unit(str(x.units), registry=reg)
+
+
+def _sync_xarray_units_attr(x: xr.DataArray) -> xr.DataArray:
+    """
+    Make the xarray units attribute follow the actual unyt data units.
+    """
+    if _has_unyt_units(x.data):
+        x.attrs["units"] = str(x.data.units)
+    elif "units" not in x.attrs:
+        x.attrs["units"] = "dimensionless"
+    return x
+
+
+def _unytfy_my_xarray(x: xr.DataArray, reg: unyt.UnitRegistry=None) -> xr.DataArray:
+    """
+    Using unyt, we attach the units.
+    """
+    x = x.copy(deep=True)
+
+    if _has_unyt_units(x.data):
+        x.data = _rebind_unyt_registry(x.data, reg=reg)
+        return _sync_xarray_units_attr(x)
+
+    if 'units' not in x.attrs:
+        x.attrs['units'] = 'dimensionless'
+        x.data = x.data * unyt.Unit('dimensionless', registry=reg)
+        return x
+
+    try:
+        x.data = x.data * unyt.Unit(x.attrs['units'], registry=reg)
+    except KeyError as e:
+        print(f"Cannot find the units of {x.name} "
+              f"with units {x.attrs['units']}. Following the exception {e}")
+        raise e
+    return _sync_xarray_units_attr(x)
+
+
+def _in_unit_system(x: Any, unit_system, reg: unyt.UnitRegistry=None):
+    """
+    Convert xarray fields, unyt constants, or plain scalars to a unit system.
+    """
+    if isinstance(x, xr.DataArray):
+        out = _unytfy_my_xarray(x, reg=reg)
+        out.data = out.data.in_base(unit_system)
+        return _sync_xarray_units_attr(out)
+
+    if _has_unyt_units(x):
+        return _rebind_unyt_registry(x, reg=reg).in_base(unit_system)
+
+    if isinstance(x, (int, float, complex, np.number)):
+        return x
+
+    raise TypeError(f"Cannot convert object of type {type(x).__name__} to a unit system.")
+
+
+def _deunytfy_my_xarray(x: xr.DataArray, reg: unyt.UnitRegistry=None) -> xr.DataArray:
+    """
+    Using unyt, we dequantify the units.
+    """
+    x = x.copy(deep=True)
+
+    if _has_unyt_units(x.data):
+        x.attrs['units'] = str(x.data.units)
+        x.data = x.data.value
+    elif 'units' not in x.attrs:
+        x.attrs['units'] = 'dimensionless'
+    return x
+
+
+def _to_normalized_expression_units(name: str, x: Any, reg: unyt.UnitRegistry):
+    """
+    Recast operands into normalized MHD-stress algebra.
+
+    In normalized expressions:
+        pressure means μ0 p, scaled by Baxis**2.
+        B0 remains a magnetic field.
+        kappa_s remains B**2-like.
+    """
+    if name == "mu_0":
+        return 1.0
+
+    B2_unit = unyt.Unit("Baxis", registry=reg)**2
+    p0_unit = unyt.Unit("p0", registry=reg)
+
+    if name == "pressure":
+        if isinstance(x, xr.DataArray):
+            out = x.copy(deep=True)
+            # x is already in the normalized unit system, so its value is p/p0.
+            out.data = out.data.to(p0_unit).value * B2_unit
+            return _sync_xarray_units_attr(out)
+
+        if _has_unyt_units(x):
+            return x.to(p0_unit).value * B2_unit
+
+    return x
+
+def _expression_binary_op(left: Any, right: Any, op):
+    """
+    Apply a binary expression operation while preserving xarray coordinates.
+    """
+    if isinstance(left, xr.DataArray) and isinstance(right, xr.DataArray):
+        return _sync_xarray_units_attr(op(left, right))
+
+    if isinstance(left, xr.DataArray):
+        out = left.copy(deep=True)
+        out.data = op(left.data, right)
+        return _sync_xarray_units_attr(out)
+
+    if isinstance(right, xr.DataArray):
+        out = right.copy(deep=True)
+        out.data = op(left, right.data)
+        return _sync_xarray_units_attr(out)
+
+    return op(left, right)
 
 class superEquilibrium:
     """
@@ -119,7 +262,7 @@ class superEquilibrium:
                 np.array_equal(self.density.x, self.vpol.x) and
                 np.array_equal(self.density.x, self.eta.x)):
             raise ValueError("All profiles need to be defined in the same x grid.")
-        
+
 
         # -----
         # Building the Boozer coordinates and metric.
@@ -137,12 +280,24 @@ class superEquilibrium:
             raise ValueError(f"Invalid rhodomain_boozer. Should be in the range [0, 1] and a < b ({a}, {b}).")
         if npsi < 2 or ntheta < 2:
             raise ValueError(f"Invalid res_boozer. Should be at least [2, 2], got instead {npsi}, {ntheta}.")
-        
+
+        # Lets get some notable values from the equilibrium, that will be useful
+        # for normalization and sanity checks later.
+        # We will compute: major radius at the axis, minor radius,
+        # magnetic field at the axis.
+        self.Rmajor = self.equ.fluxdata.Raxis
+        self.aminor = self.equ.fluxdata.aminor
+        self.Baxis  = self.equ.Bdata.Baxis.values
+
+        # Preparing the normalization.
+        self._prepare_unit_system()
+
         self.boozer = self.equ.compute_coordinates(coordinate_system="boozer",
                                                    lpsi=npsi, ltheta=ntheta, 
                                                    rhopol_min=a, rhopol_max=b)
-        
         self._eval_boozer_profiles()
+
+        # We prepare some pre-calculated quantities.
         self._prepare_quantities()
 
         # We will establish here a simple af cache.
@@ -151,14 +306,6 @@ class superEquilibrium:
         # Saving the maximum poloidal mode number for the profiles, which will be useful later.
         self.m_max = abs(m_max)
         self.n_max = 0 # Current limitations: tokamaks.
-
-        # Lets get some notable values from the equilibrium, that will be useful
-        # for normalization and sanity checks later.
-        # We will compute: major radius at the axis, minor radius, 
-        # magnetic field at the axis.
-        self.Rmajor = self.equ.fluxdata.Raxis
-        self.aminor = self.equ.fluxdata.aminor
-        self.Baxis  = self.equ.Bdata.Baxis.values
 
     def _eval_boozer_profiles(self):
         r"""
@@ -202,10 +349,10 @@ class superEquilibrium:
         I = np.abs(I.interp(psi0=psigrid, method='cubic').values)
 
 
-        self.hprof = Profile(F_nm=h, x=self.density.x, attrs={'units': '?', 'name': 'h'})
+        self.hprof = Profile(F_nm=h, x=self.density.x, attrs={'units': 'T*m', 'name': 'h'})
         self.qprof = Profile(F_nm=q, x=self.density.x, attrs={'units': '1', 'name': 'q'})
         self.Fprof = Profile(F_nm=F, x=self.density.x, attrs={'units': 'T*m', 'name': 'F'})
-        self.Iprof = Profile(F_nm=I, x=self.density.x, attrs={'units': '?', 'name': 'I'})
+        self.Iprof = Profile(F_nm=I, x=self.density.x, attrs={'units': 'T*m', 'name': 'I'})
 
     def _prepare_quantities(self):
         r"""
@@ -312,12 +459,12 @@ class superEquilibrium:
         
         JB = np.sum(Jvec*B0, axis=0) # Parallel component of the current
         Jdiag = np.sum(Jvec*s, axis=0) # Diamagnetic component of the current
-        self.realspace['J_B'] = xr.DataArray(mu_0*JB, dims = ('R', 'z'), 
-                                             attrs={'description': r'$\mu_0\vec{J}\cdot\vec{B}$',
-                                                    'units': 'T**2/m'})
-        self.realspace['J_diag'] = xr.DataArray(mu_0*Jdiag, dims = ('R', 'z'),
-                                                attrs={'description': r'$\mu_0\vec{J}\cdot\hat{s}$',
-                                                       'units': 'T**3'})
+        self.realspace['J_B'] = xr.DataArray(JB, dims = ('R', 'z'),
+                                             attrs={'description': r'$\vec{J}\cdot\vec{B}$',
+                                                    'units': 'A*T/m**2'})
+        self.realspace['J_diag'] = xr.DataArray(Jdiag, dims = ('R', 'z'),
+                                                attrs={'description': r'$\vec{J}\cdot\hat{s}$',
+                                                       'units': 'A*T**2/m'})
 
         # Computing the magnetic shear.
         # The shear appearing in the equations is the following:
@@ -350,14 +497,16 @@ class superEquilibrium:
         self.magspace = self.boozer.cyl2mag_scalar(field=self.realspace, return_psi_norm=True)
 
         # We will add to the magnetic space the h, pressure, density, q, I and the flows.
-        prof = [self.hprof, self.qprof, self.Fprof, self.Iprof, self.density, self.pressure, self.vtor, self.vpol, self.eta]
+        prof = [self.hprof, self.qprof, self.Fprof, self.Iprof,
+                self.density, self.pressure,
+                self.vtor, self.vpol, self.eta]
         names = ['h', 'q', 'F', 'I', 'density', 'pressure', 'vtor', 'vpol', 'eta']
         desc = ['h profile', 'q profile', 'F profile', 'I profile', 
                 'Density profile', 'Pressure profile', 
                 'Toroidal flow velocity profile', 
                 'Poloidal flow velocity profile', 
                 'Resistivity profile']
-        units = ['?', '1', 'T*m', 'A', 'm**-3', 'Pa', 'm/s', 'm/s', 'Ohm*m']
+        units = ['T*m', '1', 'T*m', 'T*m', 'm**-3', 'Pa', 'm/s', 'm/s', 'ohm*m']
         
         # We interpolate all profiles to the same grid as the magnetic space.
         for iprof in prof:
@@ -370,11 +519,155 @@ class superEquilibrium:
                                                 dims = ['psi'],
                                                 attrs = {'description': idesc,
                                                          'units': units[names.index(iname)]})
+        self.magspace['g'] = self.magspace['F'].copy()
+        self.magspace['g'].attrs.update({'description': 'g profile', 'units': 'T*m'})
+
+    def _prepare_unit_system(self):
+        """
+        This will prepare the system of units for the normalization of the problem.
+
+        The normalization table that we will follow is.
+        | Quantity | Symbol | Normalization |
+        |------------------------|------------------|----------------------------|
+        | Length                 | L                | Minor radius               |
+        | Magnetic field         | B0               | Magnetic field at the axis |
+        | Density                | n0               | Density at the axis        |
+        | Pressure               | 1/(Baxis^2/mu_0) | On-axis magnetic pressure  |
+        """
+        # We need to create our own registry first:
+        reg = unyt.UnitRegistry()
+
+        aminor = self.aminor * unyt.m
+        B0 = self.Baxis * unyt.T
+        n0 = self.density.data.real.interp(x=0.0, method='cubic').values[0] * unyt.m**(-3)
+        mass_ion = 1*unyt.amu
+        rho0 = (n0 * mass_ion).to('kg/m**3')
+        mu0 = unyt.mu_0
+        vA = (B0 / np.sqrt(mu0 * rho0)).to('m/s')
+        tauA = (aminor / vA).to('s')
+
+        M0 = rho0 * aminor**3
+        I0 = B0 * aminor / mu0
+        p0 = (B0**2 / mu0).to("Pa")
+        psi0 = (B0 * aminor**2).to("Wb")
+
+        # We will create new symbols to store the normalization factors.
+        # All base_value entries must be in MKS values for the given dimension.
+        reg.add(
+            "aminor",
+            base_value=float(aminor.to("m").value),
+            dimensions=u_length,
+            tex_repr=r"a",
+        )
+
+        reg.add(
+            "M0",
+            base_value=float(M0.to("kg").value),
+            dimensions=u_mass,
+            tex_repr=r"M_0",
+        )
+
+        reg.add(
+            "tauA",
+            base_value=float(tauA.to("s").value),
+            dimensions=u_time,
+            tex_repr=r"\tau_A",
+        )
+
+        reg.add(
+            "I0",
+            base_value=float(I0.to("A").value),
+            dimensions=u_current_mks,
+            tex_repr=r"I_0",
+        )
+
+        # Useful derived named units.
+        reg.add(
+            "Baxis",
+            base_value=float(B0.to("T").value),
+            dimensions=u_magnetic_field,
+            tex_repr=r"B_{\rm axis}",
+        )
+
+        reg.add(
+            "rhoaxis",
+            base_value=float(rho0.to("kg/m**3").value),
+            dimensions=u_mass_density,
+            tex_repr=r"\rho_\rm{axis}",
+        )
+
+        reg.add(
+            "p0",
+            base_value=float(p0.to("Pa").value),
+            dimensions=u_pressure,
+            tex_repr=r"\frac{B_{\rm axis}^2}{\mu_0}",
+        )
+
+        reg.add(
+            "sqrt_p0",
+            base_value=np.sqrt(float(p0.to("Pa").value)),
+            dimensions=u_pressure**Rational(1, 2),
+            tex_repr=r"\sqrt{p_0}",
+        )
+
+        reg.add(
+            "psi0",
+            base_value=float(psi0.to("Wb").value),
+            dimensions=u_magnetic_flux,
+            tex_repr=r"\psi_\rm{wall}",
+        )
+
+        # Optional but useful.
+        reg.add(
+            "vA",
+            base_value=float(vA.to("m/s").value),
+            dimensions=u_length / u_time,
+            tex_repr=r"v_A^\rm{axis}",
+        )
+
+        reg.add(
+            "omegaA",
+            base_value=float((1.0 / tauA).to("Hz").value),
+            dimensions=1 / u_time,
+            tex_repr=r"\omega_A",
+        )
+
+        reg.add(
+            "naxis",
+            base_value=float(n0.to("m**-3").value),
+            dimensions=1 / u_length**3,
+            tex_repr=r"n_{\rm axis}",
+        )
+
+        self.registry = reg
+        self.my_norm_name = f"nova_{id(self)}"
+        self.my_norm = unyt.UnitSystem(
+                                        self.my_norm_name,
+                                        length_unit=unyt.Unit("aminor", registry=reg),
+                                        mass_unit=unyt.Unit("M0", registry=reg),
+                                        time_unit=unyt.Unit("tauA", registry=reg),
+                                        temperature_unit="K",
+                                        angle_unit="rad",
+                                        current_mks_unit=unyt.Unit("I0", registry=reg),
+                                        luminous_intensity_unit="cd",
+                                        registry=reg,
+                                    )
+        self.my_norm["magnetic_field"] = unyt.Unit("Baxis", registry=reg)
+        self.my_norm["pressure"] = unyt.Unit("p0", registry=reg)
+        self.my_norm["magnetic_flux"] = unyt.Unit("psi0", registry=reg)
+
+        # Depending on unyt version, this may or may not be accepted as a string
+        # dimension key. If it fails, you can simply normalize rho_mass explicitly
+        # with .to("rhoaxis") instead of relying on .in_base().
+        try:
+            self.my_norm["density"] = unyt.Unit("rhoaxis", registry=reg)
+        except Exception:
+            pass
 
     # --------------------
     # Handling new additions to the real space and magnetic space databases.
     # --------------------
-    def add_real(self, name: str, data: xr.DataArray, units: Optional[str] = '', 
+    def add_real(self, name: str, data: xr.DataArray, units: str,
                  description: Optional[str] = None):
         """
         Adds a new quantity to the real space database.
@@ -397,13 +690,13 @@ class superEquilibrium:
                                             coords={'R': self.equ.B.R, 'z': self.equ.B.z},
                                             dims=['R', 'z'],
                                             attrs={'description': description if description is not None else '',
-                                                   'units': units if units is not None else ''})
+                                                   'units': units})
         
         # Transforming the new quantity to magnetic coordinates and adding it to the magspace database.
         mag_data = self.magspace.cyl2mag_scalar(field=self.realspace[name], return_psi_norm=True)
         self.magspace[name] = mag_data
     
-    def add_mag(self, name: str, data: xr.DataArray, units: Optional[str] = '', description: Optional[str] = None):
+    def add_mag(self, name: str, data: xr.DataArray, units: str, description: Optional[str] = None):
         """
         Adds a new quantity to the magnetic space database.
 
@@ -427,13 +720,13 @@ class superEquilibrium:
                                             coords={'Psi': self.magspace.Psi, 'Theta': self.magspace.Theta},
                                             dims=['Psi', 'Theta'],
                                             attrs={'description': description if description is not None else '',
-                                                   'units': units if units is not None else ''})
+                                                   'units': units})
         logger.debug("Added {name} in the magnetic database, not in the real space database.")
 
     # --------------------
     # Internal equilibrium interpreter.
     # ---------------------
-    def _resolve_symbol(self, name: str, expression: str):
+    def _resolve_symbol(self, name: str, expression: str, normalize: bool=False):
         """
         Locates and returns the object.
 
@@ -443,41 +736,47 @@ class superEquilibrium:
         3. Stuff in valid operations.
         """
         if name in self.magspace:
-            return self.magspace[name]
+            out = _unytfy_my_xarray(self.magspace[name], reg=self.registry)
         elif name in self.realspace:
             # We need to transform it to magnetic coordinates.
             mag_data = self.magspace.cyl2mag_scalar(field=self.realspace[name], return_psi_norm=True)
             self.magspace[name] = mag_data
-            return mag_data
+            out =  _unytfy_my_xarray(mag_data, reg=self.registry)
         elif name in _ALLOWED_EXPRESSION_CONSTANTS:
-            return _ALLOWED_EXPRESSION_CONSTANTS[name]
-        
-        available = ", ".join(list(self._cache.keys()) + list(self.magspace.data_vars) + list(self.realspace.data_vars) + list(_ALLOWED_EXPRESSION_CONSTANTS.keys()))
-        raise ValueError(f"Symbol {name} not found in the cache, magnetic space, or real space databases. "+
-                         "Available symbols are: {available}. Expression was: {expression}.")
+            out =  _ALLOWED_EXPRESSION_CONSTANTS[name]
+        else:
+            available = ", ".join(list(self._cache.keys()) + list(self.magspace.data_vars) + list(self.realspace.data_vars) + list(_ALLOWED_EXPRESSION_CONSTANTS.keys()))
+            raise ValueError(f"Symbol {name} not found in the cache, magnetic space, or real space databases. "+
+                             f"Available symbols are: {available}. Expression was: {expression}.")
+
+        unit_system = self.my_norm if normalize else "mks"
+        out = _in_unit_system(out, unit_system, reg=self.registry)
+        if normalize:
+            out = _to_normalized_expression_units(name, out, self.registry)
+        return out
     
-    def _evaluate_ast_node(self, node: ast.AST, expression: str):
+    def _evaluate_ast_node(self, node: ast.AST, expression: str, normalize: bool=False):
         if isinstance(node, ast.BinOp):
-            left = self._evaluate_ast_node(node.left, expression)
-            right = self._evaluate_ast_node(node.right, expression)
+            left = self._evaluate_ast_node(node.left, expression, normalize)
+            right = self._evaluate_ast_node(node.right, expression, normalize)
 
             if isinstance(node.op, ast.Add):
-                return left + right
+                return _expression_binary_op(left, right, operator.add)
             if isinstance(node.op, ast.Sub):
-                return left - right
+                return _expression_binary_op(left, right, operator.sub)
             if isinstance(node.op, ast.Mult):
-                return left * right
+                return _expression_binary_op(left, right, operator.mul)
             if isinstance(node.op, ast.Div):
-                return left / right
+                return _expression_binary_op(left, right, operator.truediv)
             if isinstance(node.op, ast.Pow):
-                return left**right
+                return _expression_binary_op(left, right, operator.pow)
 
             raise ValueError(
                 f"Operator '{type(node.op).__name__}' is not allowed in expression '{expression}'."
             )
 
         if isinstance(node, ast.UnaryOp):
-            operand = self._evaluate_ast_node(node.operand, expression)
+            operand = self._evaluate_ast_node(node.operand, expression, normalize)
             if isinstance(node.op, ast.UAdd):
                 return +operand
             if isinstance(node.op, ast.USub):
@@ -502,7 +801,7 @@ class superEquilibrium:
                     f"Function '{func_name}' is not allowed in expression '{expression}'."
                 )
             func = _ALLOWED_EXPRESSION_FUNCTIONS[func_name]
-            args = [self._evaluate_ast_node(arg, expression) for arg in node.args]
+            args = [self._evaluate_ast_node(arg, expression, normalize) for arg in node.args]
             try:
                 return func(*args)
             except Exception as exc:
@@ -511,7 +810,7 @@ class superEquilibrium:
                 ) from exc
 
         if isinstance(node, ast.Name):
-            return self._resolve_symbol(node.id, expression)
+            return self._resolve_symbol(node.id, expression, normalize)
 
         if isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float, complex)):
@@ -532,7 +831,7 @@ class superEquilibrium:
             f"{ast.dump(node, include_attributes=False)}"
         )
     
-    def _evaluate_expression(self, expression: str) -> xr.DataArray:
+    def _evaluate_expression(self, expression: str, normalize: bool=False) -> xr.DataArray:
         expression = expression.strip()
         if not expression:
             raise ValueError("Empty expressions are not allowed.")
@@ -544,9 +843,9 @@ class superEquilibrium:
                 f"Invalid expression '{expression}': {exc.msg}."
             ) from exc
 
-        result = self._evaluate_ast_node(parsed.body, expression)
+        result = self._evaluate_ast_node(parsed.body, expression, normalize)
         if isinstance(result, xr.DataArray):
-            return result
+            return _sync_xarray_units_attr(result)
 
         if not self.magspace.data_vars:
             raise ValueError(
@@ -554,10 +853,27 @@ class superEquilibrium:
             )
         template_name = next(iter(self.magspace.data_vars))
         template = self.magspace[template_name]
-        scalar_field = xr.full_like(template, fill_value=result)
+        if _has_unyt_units(result):
+            scalar_field = xr.full_like(template, fill_value=result.value)
+            scalar_field.attrs["units"] = str(result.units)
+        else:
+            scalar_field = xr.full_like(template, fill_value=result)
+            scalar_field.attrs["units"] = "dimensionless"
         return scalar_field
 
-    def __call__(self, *args, which: Optional[str] = 'magnetic', **kwargs) -> List[Profile]:
+    def _profile_in_unit_system(self, prof: Profile, normalize: bool=False) -> Profile:
+        """
+        Return a copy of a Profile converted to the requested unit system.
+        """
+        out = prof.copy()
+        unit_system = self.my_norm if normalize else "mks"
+        out.data = _deunytfy_my_xarray(
+            _in_unit_system(out.data, unit_system, reg=self.registry),
+            reg=self.registry,
+        )
+        return out
+
+    def __call__(self, *args, which: Optional[str] = 'magnetic', normalize: bool=False, **kwargs) -> List[Profile]:
         """
         This will allow to call the class to get the equilibrium quantities in a more direct way.
 
@@ -565,13 +881,34 @@ class superEquilibrium:
         eq('kappa_s', which='magnetic') to get the curvature in magnetic coordinates.
         eq('kappa_s', which='profile') to get the curvature as a profile in the radial coordinate
         with a decomposition in (n, m) Fourier modes.
+
+        Parameters
+        ----------
+        args : str
+            The names of the quantities to be retrieved, or expressions to be evaluated.
+        which : str, optional
+            The space in which the quantities should be retrieved. Allowed values are 'magnetic' and
+            'profile'. The default is 'magnetic'.
+        normalize : bool, optional
+            Whether to normalize the quantities using the normalization table defined in the class.
+            The default is False
+        **kwargs
+            Additional keyword arguments for future extensions.
+
+        Returns
+        -------
+        List[Profile]
+            A list of profiles corresponding to the requested quantities.
+            If only one quantity is requested, a single Profile is returned
+            instead of a list.
         """
+
         if len(args) < 1:
             raise ValueError("At least one argument is required, which is the name of the quantity to be retrieved.")
         if which.lower() not in ['magnetic', 'profile']:
             raise ValueError("Invalid value for 'which'. Allowed values are: 'magnetic', 'profile', " \
                             f"got instead {which}.")
-        
+
         normalized_args: list[str] = []
         for arg in args:
             if not isinstance(arg, str):
@@ -590,9 +927,11 @@ class superEquilibrium:
         mag2prof: List[Tuple[int, Any]] = list() # Things we need to transform from magnetic space to profiles.
         to_evaluate: List[Tuple[int, Any]] = list() # Things we need to evaluate from expressions.
         for ii, arg in enumerate(normalized_args):
-            if arg in self._cache:
-                outputs[ii] = self._cache[arg]
-            elif arg in self.magspace:
+            # if arg in self._cache:
+            #     outputs[ii] = self._profile_in_unit_system(self._cache[arg], normalize=normalize)
+                
+            # el
+            if arg in self.magspace:
                 mag2prof.append((ii, arg))
             elif arg in self.realspace:
                 real2mag.append((ii, arg))
@@ -607,25 +946,120 @@ class superEquilibrium:
 
         # We need evaluate the expressions now to get the (Psi, Theta) fields of the operations.
         for ii, arg in to_evaluate:
-            mag_data = self._evaluate_expression(arg)
+            mag_data = self._evaluate_expression(arg, normalize=normalize)
             name = f"_expr_{arg}"
             self.magspace[name] = mag_data
             mag2prof.append((ii, name))
 
-
         # We transform from the magnetic space to profiles.
         # To make a bulk transformation we build a xr.Dataset.
         if mag2prof:
-            mag_dataset = xr.Dataset({name: self.magspace[name] for _, name in mag2prof})
+            # We transform the xarray.Dataset into a non-quantity dataset set.
+            unit_system = self.my_norm if normalize else "mks"
+            mag_dataset = xr.Dataset({
+                name: _deunytfy_my_xarray(
+                    _in_unit_system(self.magspace[name], unit_system, reg=self.registry),
+                    reg=self.registry,
+                )
+                for _, name in mag2prof
+            })
+
+            # mag_dataset = xr.Dataset({name: self.magspace[name] for _, name in mag2prof})
             prof_data = ProfileFactoryPsiThetaZeta(mag_dataset, ntormax=0,
                                                    mpolmax=self.m_max)
-            
+        for idx, (ii, name) in enumerate(mag2prof):
+            prof_data[idx].data.attrs.update(mag_dataset[name].attrs)
+            outputs[ii] = prof_data[idx]
+
         # We add the stuff to the outputs and cache the profiles.
         for idx, (ii, name) in enumerate(mag2prof):
-            outputs[ii] = prof_data[idx]
-            self._cache[name] = prof_data[idx] # We cache the profile for later.
+            if not name.startswith("_expr_"):
+                self._cache[name] = self._profile_in_unit_system(prof_data[idx], normalize=False)
 
         return outputs if len(outputs) > 1 else outputs[0]
 
+    def normalize(self, *args):
+        """
+        Transforms the requested inputs into the NOVA normalized unit system.
 
+        Parameters
+        ----------
+        args : List[Union[xr.DataArray, unyt.unyt_array]]
+            The quantities to be normalized: either a unyt.unyt_array
+             or an xarray.DataArray with unyt units or units in the
+             attributes.
+        """
+        # Checking all elements are valid.
+        if len(args) < 1:
+            raise ValueError("At least one argument is required, which is the quantity to be normalized.")
         
+        for iargs in args:
+            if not isinstance(iargs, (xr.DataArray, unyt.unyt_array)):
+                raise TypeError(
+                    "All arguments must be either xarray.DataArray or unyt.unyt_array."
+                )
+            
+            # In the case of xarray.DataArray, we use the routines to enforce the 
+            # units in the xarray.
+            iargs = _unytfy_my_xarray(iargs, reg=self.registry)
+        
+        # We normalize all the arguments and return them.
+        normalized_args = []
+        for iargs in args:
+            if isinstance(iargs, xr.DataArray):
+                normalized = _in_unit_system(iargs, self.my_norm, reg=self.registry)
+                normalized = _to_normalized_expression_units(iargs.name, normalized, self.registry)
+                normalized_args.append(normalized)
+            else:
+                normalized = _in_unit_system(iargs, self.my_norm, reg=self.registry)
+                normalized = _to_normalized_expression_units("", normalized, self.registry)
+                normalized_args.append(normalized)
+
+        # We detach the units if the input was an xarray, to avoid issues with the profiles.
+        normalized_args = [
+            _deunytfy_my_xarray(arg, reg=self.registry) if isinstance(arg, xr.DataArray) else arg
+            for arg in normalized_args
+        ]
+        return normalized_args if len(normalized_args) > 1 else normalized_args[0]
+    
+    def to_mks(self, *args):
+        """
+        Transforms the requested inputs into the MKS unit system.
+
+        Parameters
+        ----------
+        args : List[Union[xr.DataArray, unyt.unyt_array]]
+            The quantities to be transformed: either a unyt.unyt_array
+             or an xarray.DataArray with unyt units or units in the
+             attributes.
+        """
+        # Checking all elements are valid.
+        if len(args) < 1:
+            raise ValueError("At least one argument is required, which is the quantity to be transformed.")
+        
+        for iargs in args:
+            if not isinstance(iargs, (xr.DataArray, unyt.unyt_array)):
+                raise TypeError(
+                    "All arguments must be either xarray.DataArray or unyt.unyt_array."
+                )
+            
+            # In the case of xarray.DataArray, we use the routines to enforce the 
+            # units in the xarray.
+            if isinstance(iargs, xr.DataArray):
+                iargs = _unytfy_my_xarray(iargs, reg=self.registry)
+        
+        # We transform all the arguments and return them.
+        transformed_args = []
+        for iargs in args:
+            if isinstance(iargs, xr.DataArray):
+                transformed = _in_unit_system(iargs, "mks", reg=self.registry)
+                transformed_args.append(transformed)
+            else:
+                transformed = _in_unit_system(iargs, "mks", reg=self.registry)
+                transformed_args.append(transformed)
+        # We detach the units if the input was an xarray, to avoid issues with the profiles.
+        transformed_args = [
+            _deunytfy_my_xarray(arg, reg=self.registry) if isinstance(arg, xr.DataArray) else arg
+            for arg in transformed_args
+        ]
+        return transformed_args if len(transformed_args) > 1 else transformed_args[0]
