@@ -15,6 +15,8 @@ from .isotopes import isotopes_mass
 from scipy.linalg import eig, eigh
 from scipy.constants import mu_0
 
+from tqdm import tqdm
+
 
 def _biorthogonal_normalizations(vl: np.ndarray, B: np.ndarray,
                                  vr: np.ndarray) -> np.ndarray:
@@ -100,6 +102,10 @@ class superContinuum:
         self.M = tmp[5]
         self.p0 = tmp[6].data.squeeze().real
         self.n0 = tmp[7].data.squeeze().real
+
+        # Normalization density, which we take as the density at the axis.
+        densitynorm = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")
+        self.n0 /= densitynorm.v
 
         # We will pad all the profiles to have the same (n, m)-range.
         mpol = np.empty(0, dtype=np.int32)
@@ -232,7 +238,7 @@ class superContinuum:
             return w, vl, vr
 
         # Solving for the x-points.
-        for ii, _ in enumerate(psi_vals):
+        for ii, _ in enumerate(tqdm(psi_vals)):
             iH_mn = H_nm.isel(x=ii).values
             iJ_mn = J_nm.isel(x=ii).values
             iqval = qval.isel(x=ii).values.item()
@@ -258,8 +264,7 @@ class superContinuum:
                 normalizations[ii] = _biorthogonal_normalizations(vl, B, vr)
 
         if normalize_eigvals:
-            densitynorm = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3") # Normalization density, which we take as the density at the axis.
-            normfrequency = n0.data / densitynorm.v
+            normfrequency = n0.data
             eigenvalues /= normfrequency[..., None]
             eigenvalues *= 1 * self.mass * unyt.Unit("omegaA/sqrt(amu)", registry=self.equ.registry)**2 # Omega^2.
             
