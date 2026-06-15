@@ -47,6 +47,50 @@ def ProfileFactoryPsiThetaZeta(
         else:
             for var in arg.data_vars:
                 data[f'{var}_{i}'] = arg[var]
+
+
+    # Some equilibrium quantities are flux functions and only live on psi.
+    # Those already are Profiles with the (m, n) = (0, 0) harmonic, so avoid
+    # broadcasting them over angular grids just to decompose a constant field.
+    allowed_dims = {"psi", "theta", "nu"}
+    profiles: list[Optional["Profile"]] = [None] * len(data.data_vars)
+    angular_indices: list[int] = []
+    angular_data = xr.Dataset()
+
+    for out_idx, var in enumerate(data.data_vars):
+        field = data[var]
+        extra_dims = set(field.dims) - allowed_dims
+        if extra_dims:
+            raise ValueError(
+                f"Input field '{var}' has unsupported dimensions {sorted(extra_dims)}. "
+                "Expected only 'psi', 'theta', and/or 'nu'."
+            )
+        if "psi" not in field.dims:
+            raise ValueError(f"Input field '{var}' must include a 'psi' dimension.")
+
+        if "theta" not in field.dims and "nu" not in field.dims:
+            field_psi = field.transpose("psi")
+            profiles[out_idx] = Profile(
+                x=field_psi.coords["psi"].values,
+                F_nm=field_psi.values,
+                ntor=[0],
+                mpol=[0],
+                attrs=dict(field_psi.attrs),
+            )
+            continue
+
+        field_ang = field
+        if "theta" not in field_ang.dims:
+            field_ang = field_ang.expand_dims(theta=[0.0])
+        if "nu" not in field_ang.dims:
+            field_ang = field_ang.expand_dims(nu=[0.0])
+        angular_data[var] = field_ang.transpose("psi", "theta", "nu")
+        angular_indices.append(out_idx)
+
+    if not angular_indices:
+        return profiles
+
+    data = angular_data
     
     # We stack all the data into a single array with (nfield*nPsi, nTheta, nZeta) shape,
     # where nfield is the number of input fields.
@@ -59,7 +103,7 @@ def ProfileFactoryPsiThetaZeta(
     sine_sign = -1.0
     if data.theta.size == 1 and data.nu.size == 1:
         # If both Theta and Zeta have only one point, we are in the axisymmetric case and we only have the (n=0, m=0) mode.
-        coeffs_cos = stacked.squeeze()[:, None, None]
+        coeffs_cos = stacked[:, 0, 0][:, None, None]
         coeffs_sin = np.zeros_like(coeffs_cos)
         ntormax = 0
         mpolmax = 0
@@ -74,7 +118,7 @@ def ProfileFactoryPsiThetaZeta(
             )
             ntormax = nyquist_ntor
 
-        coeffs_cos, coeffs_sin = decompose2d(stacked.squeeze(), ntormax, angle=zeta)
+        coeffs_cos, coeffs_sin = decompose2d(stacked[:, 0, :], ntormax, angle=zeta)
         coeffs_cos = coeffs_cos[:, None, :]
         coeffs_sin = coeffs_sin[:, None, :]
         # decompose2d returns the coefficient of sin(n*zeta), while the paper
@@ -92,7 +136,7 @@ def ProfileFactoryPsiThetaZeta(
             )
             mpolmax = nyquist_mpol
 
-        coeffs_cos, coeffs_sin = decompose2d(stacked.squeeze(), mpolmax, angle=theta)
+        coeffs_cos, coeffs_sin = decompose2d(stacked[:, :, 0], mpolmax, angle=theta)
         coeffs_cos = coeffs_cos[:, :, None]
         coeffs_sin = coeffs_sin[:, :, None]
         ntormax = 0
@@ -149,15 +193,14 @@ def ProfileFactoryPsiThetaZeta(
     # the Profile constructor for each field.
     coeffs_complex = coeffs_complex.reshape(nfields, data.coords['psi'].size, mpolmax+1, ntormax+1)
 
-    profiles = []
+    field_names = list(tmp.field.values)
     for i in range(nfields):
-        profiles.append(
-            Profile(
-                x=data.coords['psi'].values,
-                F_nm=coeffs_complex[i],
-                ntor=ntor,
-                mpol=mpol,
-            )
+        profiles[angular_indices[i]] = Profile(
+            x=data.coords['psi'].values,
+            F_nm=coeffs_complex[i],
+            ntor=ntor,
+            mpol=mpol,
+            attrs=dict(data[field_names[i]].attrs),
         )
     return profiles
 
