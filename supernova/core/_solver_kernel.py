@@ -386,6 +386,21 @@ def _build_inverse_E(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
     ``\lambda_k - \lambda - i eta``, which places the pole below the real
     omega axis. The regularizer is therefore a lambda-space broadening.
 
+    The A and B matrices actually correspond to the following problem
+
+    E' = A - lambda B,
+
+    but the E operator that we have in our problem is the following instead:
+
+
+    E' = (1         0)
+         (0   \lambda) @ E.
+
+    E^-1 = E'^-1 @ (1         0)
+                   (0   \lambda)
+
+    which is equivalent to scaling the whole block-column by lambda.
+
     Parameters
     ----------
     vr : ndarray
@@ -428,6 +443,9 @@ def _build_inverse_E(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
             denominator = lambda_cont[ipsi, k] - lambda_target[ipsi] - 1j * eta
             contribution = (1 / denominator) * np.outer(vr[ipsi, :, k], np.conj(vl[ipsi, :, k])) / norm[ipsi, k]
             E_inv[ipsi] += contribution
+
+        # We scale the second block-column by lambda, since E^-1 = E'^-1 @ (1 0; 0 lambda).
+        E_inv[ipsi][n_state:, n_state:] *= lambda_target[ipsi]
 
     return E_inv
 
