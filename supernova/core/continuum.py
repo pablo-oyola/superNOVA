@@ -3,6 +3,8 @@ Implementation of a solver for the ideal MHD continuum spectra for
 a tokamak equilibrium.
 """
 
+import unyt
+
 from .equilibrium import superEquilibrium
 from ._continuum_kernel import assemble_full_matrices, assembly_slow_sound, assembly_only_saw
 import numpy as np
@@ -62,7 +64,7 @@ class superContinuum:
             raise ValueError(f"Species {species} not recognized. Available species: {list(isotopes_mass.keys())}")
         
         self.species = species
-        self.mass = isotopes_mass[species].to('kg').value
+        self.mass = isotopes_mass[species].to('amu').value * unyt.Unit("amu", registry=self.equ.registry)
 
         # Building the internal profiles for the continuum solver.
         self._build_profiles()
@@ -80,19 +82,24 @@ class superContinuum:
         M = 1/(Jacobian * B0^2) = 1/h(\Psi)
         """
 
-        names = ['gpsi_psi',
-                 'gpsi_psi / B0**4',
-                 '2.0 * kappa_s/B0**4',
-                 f'{self.gamma_s} * mu_0 * pressure + B0**2',
-                 f'1/B0**4 * ({self.gamma_s}*mu_0*pressure*kappa_s**2)/({self.gamma_s}*mu_0*pressure + B0**2)']
+        names = ['gpsi_psi / h',
+                 'gpsi_psi / B0**4 * h',
+                 '2.0 * kappa_s/B0**4 * h',
+                 f'({self.gamma_s} * pressure + B0**2) / h',
+                 f'h/B0**4 * ({self.gamma_s}*pressure*kappa_s**2)/({self.gamma_s}*pressure + B0**2)',
+                 '1.0 / h',
+                 'pressure',
+                 'density']
         
-        tmp = self.equ(*names) # This will return profiles.
-        self.H = tmp[0] / self.equ.hprof
-        self.J = tmp[1] * self.equ.hprof
-        self.K = tmp[2] * self.equ.hprof
-        self.L = tmp[3] / self.equ.hprof
-        self.N = tmp[4] * self.equ.hprof
-        self.M = 1.0 / self.equ.hprof
+        tmp = self.equ(*names, normalize=True) # This will return profiles.
+        self.H = tmp[0]
+        self.J = tmp[1]
+        self.K = tmp[2]
+        self.L = tmp[3]
+        self.N = tmp[4]
+        self.M = tmp[5]
+        self.p0 = tmp[6].data.squeeze().real
+        self.n0 = tmp[7].data.squeeze().real
 
         # We will pad all the profiles to have the same (n, m)-range.
         mpol = np.empty(0, dtype=np.int32)
@@ -168,7 +175,8 @@ class superContinuum:
         K_nm = self.K.data.sel(mpol=m_range2sel).interp(x=psi_vals)
         L_nm = self.L.data.sel(mpol=m_range2sel).interp(x=psi_vals)
         M_nm = self.M.data.sel(mpol=m_range2sel).interp(x=psi_vals)
-        p0 = self.equ.pressure.data.squeeze().interp(x=psi_vals).real
+        p0 = self.p0.interp(x=psi_vals)
+        n0 = self.n0.interp(x=psi_vals)
 
         # We create a short-cut for the solver.
         if which.lower() == 'full':
@@ -250,9 +258,10 @@ class superContinuum:
                 normalizations[ii] = _biorthogonal_normalizations(vl, B, vr)
 
         if normalize_eigvals:
-            idens0 = self.equ.density.data.squeeze().interp(x=psi_vals).real.values
-            normfrequency = mu_0 * idens0 * self.mass
+            densitynorm = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3") # Normalization density, which we take as the density at the axis.
+            normfrequency = n0.data / densitynorm.v
             eigenvalues /= normfrequency[..., None]
+            eigenvalues *= 1 * self.mass * unyt.Unit("omegaA/sqrt(amu)", registry=self.equ.registry)**2 # Omega^2.
             
         if return_eigvecs:
             eigvecs = {
