@@ -124,7 +124,7 @@ class superSolver:
 
         _to_compute = ['kappa_Psi/gpsi_psi',             # C11, also for D12                      - 0
                        'B0**2/h',   # C12 - second part                                           - 1
-                       '(mu_0*J_B - shear*gpsi_psi) * shear / B0**2',  # C12 - third part              - 2
+                       '(J_B - shear*gpsi_psi) * shear / B0**2',  # C12 - third part              - 2
                        'B0**2/gpsi_psi/h',    # The O operator                                    - 3
                        '- divPsiVec', # C22 - Precomputed.                                        - 4
                        '(shear*gpsi_psi - J_B)/h',  # D11                                         - 5
@@ -349,7 +349,7 @@ class superSolver:
         self.solver_blocks.weights_q = self.weights
         self.solver_blocks.points_q = self.points
         self.solver_blocks.phi_q = self.radialfe.eval_basis(self.points).T
-        self.solver_blocks.WD = self.radialfe.weak_derivative_matrix.T
+        self.solver_blocks.WD = self.radialfe.weak_derivative_matrix.T.toarray()
 
         return self.solver_blocks
 
