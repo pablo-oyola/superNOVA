@@ -14,6 +14,7 @@ from typing import Optional
 from .isotopes import isotopes_mass
 from scipy.linalg import eig, eigh
 from scipy.constants import mu_0
+from ._classify_mode import ContinuumClassifier
 
 from tqdm import tqdm
 
@@ -87,8 +88,8 @@ class superContinuum:
         names = ['gpsi_psi / h',
                  'gpsi_psi / B0**4 * h',
                  '2.0 * kappa_s/B0**4 * h',
-                 f'({self.gamma_s} * pressure + B0**2) / h',
-                 f'h/B0**4 * ({self.gamma_s}*pressure*kappa_s**2)/({self.gamma_s}*pressure + B0**2)',
+                 f'({self.gamma_s} * pressure + B0**2) * h / B0**4',
+                 f'h/B0**4 * (4 * {self.gamma_s} * pressure * kappa_s**2)/({self.gamma_s} * pressure + B0**2)',
                  '1.0 / h',
                  'pressure',
                  'density']
@@ -117,7 +118,7 @@ class superContinuum:
 
     def solve(self, ntor: int, mmax: int=None, psi_vals: np.ndarray=None, 
               which: str='full', return_eigvecs: bool=False,
-              normalize_eigvals: bool=False):
+              normalize_eigvals: bool=False, classify: bool=False, **classify_kwargs):
         """
         Solves the continuum spectrum for the given equilibrium and parameters.
 
@@ -133,6 +134,10 @@ class superContinuum:
             Whether to return the eigenvectors along with the eigenvectors (left, right and normalizations).
         normalize_eigvals: bool
             Whether to normalize the eigenvalues.
+        classify: bool
+            Whether to classify the modes.
+        **classify_kwargs
+            Additional keyword arguments for the classification.
 
         Returns:
         --------
@@ -144,6 +149,15 @@ class superContinuum:
         # Setting the defaults
         if psi_vals is None:
             psi_vals = self.H.data.x
+
+        if classify and not return_eigvecs:
+            return_eigvecs = True # We enforce this.
+
+        if classify and not normalize_eigvals:
+            normalize_eigvals = True # We enforce this, as the classification relies on the normalized eigenvalues.
+
+        if classify and which.lower() != 'full':
+            raise ValueError("Mode classification is currently only implemented for the full spectrum. Please set which='full' to use the classification.")
 
         # If the user provides no mode limit, we will take the maximum poloidal mode
         # number from the H profile.
@@ -274,6 +288,13 @@ class superContinuum:
                 'left': left_eigenvectors,
                 'normalizations': normalizations
             }
+
+            # We need to return the classification if requested.
+            if classify:
+                classifier = ContinuumClassifier(vr=right_eigenvectors, vl=left_eigenvectors, w=eigenvalues.to('Hz**2').v,
+                                                 J=J_nm.values, L=L_nm.values, m_range=m_range, **classify_kwargs)
+                return eigenvalues, eigvecs, classifier
+
             return eigenvalues, eigvecs
         else:             
             return eigenvalues
