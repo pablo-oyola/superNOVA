@@ -214,9 +214,9 @@ def assemble_full_matrices(
                       m_range)  # Apply G^H * A11 * G scaling
     
     # A12 (Top-Right)
-    # A12 = gamma_s * (pressure_mn * K_mn)
+    # A12 = - gamma_s * (pressure_mn * K_mn)
     fill_block_kernel(K_mn, m_range, n_range, A_out[:nmode, nmode:], conjugate_mode=False)
-    A_out[:nmode, nmode:] *= (gammas * mu_0 * p0)
+    A_out[:nmode, nmode:] *= - (gammas * mu_0 * p0)
     
     # A22 (Bottom-Right)
     fill_block_kernel(M_mn, m_range, n_range, A_out[nmode:, nmode:])
