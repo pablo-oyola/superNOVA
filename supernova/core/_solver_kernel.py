@@ -13,6 +13,7 @@ from .._utils import njit, prange
 # from scipy.constants import mu_0
 mu_0 = 1.0 # Normalized units.
 from dataclasses import dataclass
+import xarray as xr
 
 # Some of the kernels are already implemented.
 from ._continuum_kernel import (_fill_block_kernel, 
@@ -69,6 +70,220 @@ class solver_blocks:
     points_q: np.ndarray # Quadrature points.
     phi_q: np.ndarray # Radial basis functions evaluated at the quadrature points.
     WD: np.ndarray # Weak derivative matrix evaluated at the quadrature points.
+
+    def to_xarray(self):
+        """
+        Builds an xarray dataset with the blocks and profiles, that can be used for
+        analysis and plotting, and maybe for loading.
+        """
+
+        n_x = self.C0.shape[0]
+        n_harm = self.m_range.size
+        n_full = 2 * n_harm
+        m_range = np.asarray(self.m_range)
+        full_state_m = np.concatenate([m_range, m_range])
+        full_state_component = np.array(["p1"] * n_harm + ["xi"] * n_harm)
+        full_state = np.array(
+            [f"{component}_m={m}" for component, m in zip(full_state_component, full_state_m)]
+        )
+
+        x = np.arange(n_x, dtype=np.int64)
+        point_kind = np.array(["operator"] * n_x)
+        if self.points_q is not None:
+            points_q = np.asarray(self.points_q)
+            if points_q.ndim != 1:
+                raise ValueError("points_q must be a one-dimensional array.")
+            if points_q.size == n_x:
+                x = points_q
+                point_kind = np.array(["quadrature"] * n_x)
+            elif points_q.size + 1 == n_x:
+                x = np.concatenate([points_q, np.array([1.0], dtype=points_q.dtype)])
+                point_kind = np.array(["quadrature"] * points_q.size + ["boundary"])
+
+        coords = {
+            "x": ("x", x),
+            "point_kind": ("x", point_kind),
+            "m_pol": ("m_pol", m_range),
+            "m_pol_row": ("m_pol_row", m_range),
+            "m_pol_col": ("m_pol_col", m_range),
+            "full_state": ("full_state", full_state),
+            "full_state_row": ("full_state_row", full_state),
+            "full_state_col": ("full_state_col", full_state),
+            "full_state_m": ("full_state", full_state_m),
+            "full_state_component": ("full_state", full_state_component),
+            "full_state_row_m": ("full_state_row", full_state_m),
+            "full_state_row_component": ("full_state_row", full_state_component),
+            "full_state_col_m": ("full_state_col", full_state_m),
+            "full_state_col_component": ("full_state_col", full_state_component),
+            "continuum_mode": ("continuum_mode", np.arange(n_full, dtype=np.int64)),
+        }
+
+        if self.points_q is not None:
+            coords["x_quad"] = ("x_quad", np.asarray(self.points_q))
+        elif self.weights_q is not None:
+            coords["x_quad"] = ("x_quad", np.arange(np.asarray(self.weights_q).shape[0], dtype=np.int64))
+        elif self.phi_q is not None:
+            coords["x_quad"] = ("x_quad", np.arange(np.asarray(self.phi_q).shape[0], dtype=np.int64))
+
+        if self.phi_q is not None:
+            n_radial = np.asarray(self.phi_q).shape[1]
+        elif self.WD is not None:
+            n_radial = np.asarray(self.WD).shape[0]
+        else:
+            n_radial = None
+        if n_radial is not None:
+            radial_dof = np.arange(n_radial, dtype=np.int64)
+            coords["radial_dof"] = ("radial_dof", radial_dof)
+            coords["radial_dof_row"] = ("radial_dof_row", radial_dof)
+            coords["radial_dof_col"] = ("radial_dof_col", radial_dof)
+
+        sizes = {
+            "x": n_x,
+            "m_pol": n_harm,
+            "m_pol_row": n_harm,
+            "m_pol_col": n_harm,
+            "full_state": n_full,
+            "full_state_row": n_full,
+            "full_state_col": n_full,
+            "continuum_mode": n_full,
+        }
+        if "x_quad" in coords:
+            sizes["x_quad"] = coords["x_quad"][1].size
+        if n_radial is not None:
+            sizes["radial_dof"] = n_radial
+            sizes["radial_dof_row"] = n_radial
+            sizes["radial_dof_col"] = n_radial
+
+        data_vars = {}
+
+        def add_var(name, value, dims, attrs=None):
+            if value is None:
+                return
+            data = np.asarray(value)
+            expected_shape = tuple(sizes[dim] for dim in dims)
+            if data.shape != expected_shape:
+                raise ValueError(f"{name} must have shape {expected_shape}, got {data.shape}.")
+            data_vars[name] = (dims, data, attrs or {})
+
+        block_attrs = {"description": "Frequency-independent local solver block."}
+        add_var("C0", self.C0, ("x", "full_state_row", "full_state_col"), block_attrs)
+        add_var("D0", self.D0, ("x", "full_state_row", "full_state_col"), block_attrs)
+        add_var("F", self.F, ("x", "full_state_row", "full_state_col"), block_attrs)
+        add_var("C1", self.C1, ("x", "m_pol_row", "m_pol_col"),
+                {"description": "Lambda-dependent C12 harmonic block."})
+        add_var("D1", self.D1, ("x", "m_pol_row", "m_pol_col"),
+                {"description": "Inverse-lambda-dependent D22 harmonic block."})
+        add_var("gtp_over_gpp", self.gtp_over_gpp, ("x", "m_pol_row", "m_pol_col"))
+        add_var("gpz_over_gpp", self.gpz_over_gpp, ("x", "m_pol_row", "m_pol_col"))
+
+        profile_dims = ("x",)
+        add_var("hprof", self.hprof, profile_dims)
+        add_var("Iprof", self.Iprof, profile_dims)
+        add_var("gprof", self.gprof, profile_dims)
+        add_var("qprof", self.qprof, profile_dims)
+        add_var("pressure", self.pressure, profile_dims)
+        add_var("pressure_deriv", self.pressure_deriv, profile_dims)
+        add_var("density", self.density, profile_dims,
+                {"description": "Mass density used in lambda = mu_0 * rho_mass * omega**2."})
+
+        add_var("vr", self.vr, ("x", "full_state", "continuum_mode"),
+                {"description": "Right continuum eigenvectors, stored by column/mode."})
+        add_var("vl", self.vl, ("x", "full_state", "continuum_mode"),
+                {"description": "Left continuum eigenvectors, stored by column/mode."})
+        add_var("norm", self.norm, ("x", "continuum_mode"),
+                {"description": "Biorthogonal normalization vl^H B vr per continuum mode."})
+        add_var("cont_eigvals", self.cont_eigvals, ("x", "continuum_mode"),
+                {"description": "Unnormalized continuum generalized eigenvalues."})
+
+        add_var("weights_q", self.weights_q, ("x_quad",),
+                {"description": "Quadrature weights for radial integrals."})
+        add_var("phi_q", self.phi_q, ("x_quad", "radial_dof"),
+                {"description": "Radial basis functions evaluated at quadrature points."})
+        add_var("WD", self.WD, ("radial_dof_row", "radial_dof_col"),
+                {"description": "Weak derivative matrix."})
+        add_var("points_q", self.points_q, ("x_quad",),
+                {"description": "Quadrature points for radial integrals."})
+
+        return xr.Dataset(
+            data_vars=data_vars,
+            coords=coords,
+            attrs={
+                "ntor": int(self.ntor),
+                "mmax": int(getattr(self, "mmax", np.max(np.abs(m_range)))),
+                "state_order": "full_state is ordered as p1(m_range) followed by xi(m_range).",
+                "description": "Serialized solver_blocks data for solver debugging and persistence.",
+            },
+        )
+    
+    @staticmethod
+    def from_xarray(dataset: xr.Dataset) -> "solver_blocks":
+        """
+        Reconstructs a solver_blocks instance from an xarray dataset created by to_xarray.
+
+        Parameters
+        ----------
+        dataset : xr.Dataset
+            The xarray dataset containing the serialized solver_blocks data.
+
+        Returns
+        -------
+        solver_blocks
+            The reconstructed solver_blocks instance.
+        """
+        # We will extract the variables and coordinates from the dataset and use them to construct the solver_blocks instance.
+        C0 = dataset["C0"].values if "C0" in dataset else None
+        D0 = dataset["D0"].values if "D0" in dataset else None
+        F = dataset["F"].values if "F" in dataset else None
+        C1 = dataset["C1"].values if "C1" in dataset else None
+        D1 = dataset["D1"].values if "D1" in dataset else None
+        gtp_over_gpp = dataset["gtp_over_gpp"].values if "gtp_over_gpp" in dataset else None
+        gpz_over_gpp = dataset["gpz_over_gpp"].values if "gpz_over_gpp" in dataset else None
+
+        hprof = dataset["hprof"].values if "hprof" in dataset else None
+        Iprof = dataset["Iprof"].values if "Iprof" in dataset else None
+        gprof = dataset["gprof"].values if "gprof" in dataset else None
+        qprof = dataset["qprof"].values if "qprof" in dataset else None
+        pressure = dataset["pressure"].values if "pressure" in dataset else None
+        pressure_deriv = dataset["pressure_deriv"].values if "pressure_deriv" in dataset else None
+        density = dataset["density"].values if "density" in dataset else None
+
+        vr = dataset["vr"].values if "vr" in dataset else None
+        vl = dataset["vl"].values if "vl" in dataset else None
+        norm = dataset["norm"].values if "norm" in dataset else None
+        cont_eigvals = dataset["cont_eigvals"].values if "cont_eigvals" in dataset else None
+
+        weights_q = dataset["weights_q"].values if "weights_q" in dataset else None
+        phi_q = dataset["phi_q"].values if "phi_q" in dataset else None
+        WD = dataset["WD"].values if "WD" in dataset else None
+        m_range = dataset.coords["m_pol"].values if "m_pol" in dataset.coords else None
+        ntor = int(dataset.attrs["ntor"]) if "ntor" in dataset.attrs else None
+
+        return solver_blocks(
+            C0=C0,
+            D0=D0,
+            F=F,
+            C1=C1,
+            D1=D1,
+            gtp_over_gpp=gtp_over_gpp,
+            gpz_over_gpp=gpz_over_gpp,
+            hprof=hprof,
+            Iprof=Iprof,
+            gprof=gprof,
+            qprof=qprof,
+            pressure=pressure,
+            pressure_deriv=pressure_deriv,
+            density=density,
+            vr=vr,
+            vl=vl,
+            norm=norm,
+            cont_eigvals=cont_eigvals,
+            weights_q=weights_q,
+            phi_q=phi_q,
+            WD=WD,
+            m_range=m_range,
+            ntor=ntor,
+            points_q=dataset.coords["x_quad"].values if "x_quad" in dataset.coords else None,
+        )
 
 # -----------------------------------------------------------------------------
 # General blocks building kernels.
@@ -427,6 +642,7 @@ def _build_inverse_E(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
     assert density.shape[0] == vr.shape[0], "The first dimension of density and vr must match"
 
     n_psi, n_state, _ = vr.shape
+    n_harm = n_state // 2
     E_inv = np.zeros((n_psi, n_state, n_state), dtype=np.complex128)
 
     lambda_cont = np.asarray(omega_cont, dtype=np.complex128)
@@ -445,9 +661,86 @@ def _build_inverse_E(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
             E_inv[ipsi] += contribution
 
         # We scale the second block-column by lambda, since E^-1 = E'^-1 @ (1 0; 0 lambda).
-        E_inv[ipsi][n_state:, n_state:] *= lambda_target[ipsi]
+        E_inv[ipsi, :, n_harm:] *= lambda_target[ipsi]
 
     return E_inv
+
+@njit(parallel=True, cache=True, nogil=True)
+def _apply_E_inv(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
+                 omega_cont: np.ndarray, omega: float, density: np.ndarray,
+                 D: np.ndarray, F: np.ndarray,
+                 regularizer: float = None):
+    """
+    Compute
+
+        D @ E^{-1} @ F
+
+    without explicitly building E^{-1}.
+
+    This preserves the convention
+
+        denominator = lambda_k - lambda_target - i eta
+
+    and applies
+
+        E^{-1} = E'^{-1} @ diag(I, lambda I)
+
+    by scaling the second block rows of F before applying E'^{-1}.
+    """
+    n_psi = vr.shape[0]
+    n_state = vr.shape[1]
+    n_mode = vr.shape[2]
+
+    n_harm = n_state // 2
+
+    eta = 0.0
+    if regularizer is not None:
+        eta = abs(regularizer)
+
+    out = np.zeros((n_psi, n_state, n_state), dtype=np.complex128)
+
+    for ipsi in prange(n_psi):
+        lambda_target = mu_0 * density[ipsi] * omega * omega
+
+        D_vr_k = np.empty(n_state, dtype=np.complex128)
+        vlh_TF_k = np.empty(n_state, dtype=np.complex128)
+
+        for k in range(n_mode):
+            # D_vr_k = D @ vr_k
+            for i in range(n_state):
+                acc = 0.0 + 0.0j
+                for a in range(n_state):
+                    acc += D[ipsi, i, a] * vr[ipsi, a, k]
+                D_vr_k[i] = acc
+
+            # vlh_TF_k = vl_k^H @ T @ F
+            #
+            # Since T @ F scales the second block rows of F by lambda_target.
+            for j in range(n_state):
+                acc = 0.0 + 0.0j
+                for b in range(n_state):
+                    factor = 1.0
+                    if b >= n_harm:
+                        factor = lambda_target
+
+                    acc += np.conj(vl[ipsi, b, k]) * factor * F[ipsi, b, j]
+
+                vlh_TF_k[j] = acc
+
+            denominator = (
+                omega_cont[ipsi, k]
+                - lambda_target
+                - 1j * eta
+            )
+
+            coeff = 1.0 / (denominator * norm[ipsi, k])
+
+            for i in range(n_state):
+                left = coeff * D_vr_k[i]
+                for j in range(n_state):
+                    out[ipsi, i, j] += left * vlh_TF_k[j]
+
+    return out
 
 # -----------------------------------------------------------------------------
 # Evaluating the matrix blocks at a given frequency.
@@ -480,20 +773,33 @@ def eval_M_at(sb: solver_blocks, omega: float, regularizer: float=None):
         raise ValueError("gpz_over_gpp must have shape (n_psi, n_harm, n_harm).")
 
     # We first obtain the inversion of the continuum operator at the target frequency.
-    E_inv = _build_inverse_E(vr=sb.vr, vl=sb.vl, norm=sb.norm, 
-                             omega_cont=sb.cont_eigvals, omega=omega,
-                             density=sb.density, regularizer=regularizer)
+    # E_inv = _build_inverse_E(vr=sb.vr, vl=sb.vl, norm=sb.norm, 
+    #                          omega_cont=sb.cont_eigvals, omega=omega,
+    #                          density=sb.density, regularizer=regularizer)
     
     # We will build now the E^-1 @ F blocks.
-    M = np.einsum('ilm,imk->ilk', E_inv, sb.F) # E^-1 @ F, shape (n_psi, n_full, n_full)
+    # M = np.einsum('ilm,imk->ilk', E_inv, sb.F) # E^-1 @ F, shape (n_psi, n_full, n_full)
+    D = sb.D0.astype(np.complex128).copy()
+    D[:, n_harm:, n_harm:] += sb.D1 / lambda_target[:, None, None]
+    M = _apply_E_inv(
+                        vr=sb.vr,
+                        vl=sb.vl,
+                        norm=sb.norm,
+                        omega_cont=sb.cont_eigvals,
+                        omega=omega,
+                        density=sb.density,
+                        D=D,
+                        F=sb.F,
+                        regularizer=regularizer,
+                    )
 
     # We add D0 @ E^-1 @ F to M, since D0 is the part of D that is not 
     # dependent on the eigenvalue.
     for ipsi in range(n_psi):
-        # D1 is the lambda-dependent D22 block, not a full-state matrix.
-        D = sb.D0[ipsi].copy()
-        D[n_harm:, n_harm:] += sb.D1[ipsi] / lambda_target[ipsi] # D = D0 + D1/lambda
-        M[ipsi] = D @ M[ipsi] # D @ E^-1 @ F
+        # # D1 is the lambda-dependent D22 block, not a full-state matrix.
+        # D = sb.D0[ipsi].copy()
+        # D[n_harm:, n_harm:] += sb.D1[ipsi] / lambda_target[ipsi] # D = D0 + D1/lambda
+        # M[ipsi] = D @ M[ipsi] # D @ E^-1 @ F
 
         # C1 is the lambda-dependent C12 block, not a full-state matrix.
         C = sb.C0[ipsi].copy()
