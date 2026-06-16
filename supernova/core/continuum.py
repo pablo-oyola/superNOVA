@@ -230,7 +230,7 @@ class superContinuum:
                     vl = vl[:, order]
                     vr = vr[:, order]
                 else:
-                    w = eig(A, B)
+                    w = eig(A, B, left=False, right=False)
                     order = np.argsort(np.real(w))
                     w = w[order]
                     vl = None
