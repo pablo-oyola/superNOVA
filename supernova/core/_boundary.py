@@ -140,7 +140,9 @@ class BoundaryCondition:
         """
         Returns the number of actually free degress of freedom.
         """
-        return self.C.shape[1] - self.C.shape[0] 
+        if self.Z is None:
+            self.make_subspace()
+        return self.Z.shape[1]
     
 class regularityAxisBC(BoundaryCondition):
     r"""
