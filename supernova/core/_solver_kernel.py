@@ -477,8 +477,8 @@ def _build_static_blocks(
         g_diag = np.zeros(nstate, dtype=np.complex128)
         sigma_diag = np.zeros(nstate, dtype=np.complex128)
         for i in range(nstate):
-            g_diag[i] = i*(qprof[ipsi] * n_range[i] - m_range[i])
-            sigma_diag[i] = i * (Iprof[ipsi] * n_range[i] - gprof[ipsi] * m_range[i])
+            g_diag[i] = 1j*(qprof[ipsi] * n_range[i] - m_range[i])
+            sigma_diag[i] = 1j * (Iprof[ipsi] * n_range[i] - gprof[ipsi] * m_range[i])
 
         # Now we create and fill other matrices.
         c12_2mat = np.zeros((nstate, nstate), dtype=np.complex128)
