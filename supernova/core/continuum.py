@@ -299,4 +299,85 @@ class superContinuum:
         else:             
             return eigenvalues
 
+    def build_AB(self, ntor: int, mmax: int=None, psi_vals: np.ndarray=None):
+        """
+        Constructs the A and B matrices without solving the eigenvalue problem.
+
+        Parameters:
+        -----------
+        ntor: int
+            The toroidal mode number to consider for the continuum spectrum.
+        psi_vals: np.ndarray, optional
+            The specific values of the poloidal flux to evaluate the continuum spectrum at. If None, it will be evaluated at all available radial points.
+
+        Returns:
+        --------
+        A: np.ndarray
+            The A matrix of the generalized eigenvalue problem.
+        B: np.ndarray
+            The B matrix of the generalized eigenvalue problem.
+        """
+        # Setting the defaults
+        if psi_vals is None:
+            psi_vals = self.H.data.x
+
+        # If the user provides no mode limit, we will take the maximum poloidal mode
+        # number from the H profile.
+        H_mmax = np.abs(self.H.m_pol).max()
+        if mmax is None:
+            mmax = int(H_mmax)
+        else:
+            mmax = min(mmax, int(H_mmax))
+
+
+        psi_vals = np.asarray(psi_vals, dtype=np.float64).reshape(-1)
+        m_range = np.arange(-mmax, mmax + 1)
+        m_range2sel = np.arange(mmax+1)
+        nstate = 2 * m_range.size
+
+        A = np.zeros((psi_vals.size, nstate, nstate), dtype=np.complex128)
+        B = np.zeros((psi_vals.size, nstate, nstate), dtype=np.complex128)
+
+        # We interpolate the profiles at the position we are requested.
+        H_nm = self.H.data.sel(mpol=m_range2sel).interp(x=psi_vals)
+        J_nm = self.J.data.sel(mpol=m_range2sel).interp(x=psi_vals)
+        qval = self.equ.qprof.data.squeeze().interp(x=psi_vals).real
+        N_nm = self.N.data.sel(mpol=m_range2sel).interp(x=psi_vals)
+        K_nm = self.K.data.sel(mpol=m_range2sel).interp(x=psi_vals)
+        L_nm = self.L.data.sel(mpol=m_range2sel).interp(x=psi_vals)
+        M_nm = self.M.data.sel(mpol=m_range2sel).interp(x=psi_vals)
+        p0 = self.p0.interp(x=psi_vals)
+        n0 = self.n0.interp(x=psi_vals)
+
+        # We create a short-cut for the solver.
+        fun = lambda **kwargs: assemble_full_matrices(H_mn=kwargs['H_nm'], 
+                                                        K_mn=kwargs['K_mn'],
+                                                        J_mn=kwargs['J_nm'], 
+                                                        L_mn=kwargs['L_mn'],
+                                                        M_mn=kwargs['M_mn'],
+                                                        p0=kwargs['p0'],
+                                                        q=kwargs['q'], 
+                                                        m_range=kwargs['m_range'], 
+                                                        ntor=kwargs['ntor'],
+                                                        gammas=self.gamma_s)
             
+
+        # Solving for the x-points.
+        for ii, _ in enumerate(tqdm(psi_vals)):
+            iH_mn = H_nm.isel(x=ii).values
+            iJ_mn = J_nm.isel(x=ii).values
+            iqval = qval.isel(x=ii).values.item()
+            iK_mn = K_nm.isel(x=ii).values
+            iL_mn = L_nm.isel(x=ii).values
+            iM_mn = M_nm.isel(x=ii).values
+            iN_mn = N_nm.isel(x=ii).values
+            ip0 = p0.isel(x=ii).values.item()
+
+            Aii, Bii = fun(H_nm=iH_mn, J_nm=iJ_mn, 
+                       K_mn=iK_mn, L_mn=iL_mn, M_mn=iM_mn, N_mn=iN_mn,
+                       q=iqval, m_range=m_range, ntor=ntor, p0=ip0)
+            
+            A[ii] = Aii
+            B[ii] = Bii
+
+        return A, B
