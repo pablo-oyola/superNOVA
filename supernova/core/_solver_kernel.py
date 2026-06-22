@@ -647,16 +647,16 @@ def _build_inverse_E(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
 
     lambda_cont = np.asarray(omega_cont, dtype=np.complex128)
     lambda_target = mu_0 * density * omega**2
-
-    if regularizer is None:
-        eta = 0.0
+    
+    if regularizer is not None:
+        eta = (1.0 - regularizer**2 - 2.0 * 1j * regularizer)
     else:
-        eta = np.abs(np.real(regularizer))
+        eta = 1.0
 
     for ipsi in prange(n_psi):
         for k in range(n_state):
             # We compute the contribution of the k-th eigenmode to E^-1.
-            denominator = lambda_cont[ipsi, k] - lambda_target[ipsi] - 1j * eta
+            denominator = lambda_cont[ipsi, k] * eta - lambda_target[ipsi]
             contribution = (1 / denominator) * np.outer(vr[ipsi, :, k], np.conj(vl[ipsi, :, k])) / norm[ipsi, k]
             E_inv[ipsi] += contribution
 
@@ -693,9 +693,10 @@ def _apply_E_inv(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
 
     n_harm = n_state // 2
 
-    eta = 0.0
     if regularizer is not None:
-        eta = abs(regularizer)
+        eta = (1.0 - regularizer**2 - 2.0 * 1j * regularizer)
+    else:
+        eta = 1.0
 
     out = np.zeros((n_psi, n_state, n_state), dtype=np.complex128)
 
@@ -728,9 +729,8 @@ def _apply_E_inv(vr: np.ndarray, vl: np.ndarray, norm: np.ndarray,
                 vlh_TF_k[j] = acc
 
             denominator = (
-                omega_cont[ipsi, k]
+                omega_cont[ipsi, k] * eta
                 - lambda_target
-                - 1j * eta
             )
 
             coeff = 1.0 / (denominator * norm[ipsi, k])
