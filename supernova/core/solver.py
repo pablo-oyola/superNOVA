@@ -133,7 +133,7 @@ class superSolver:
                        'gpsi_psi/B0**2 * shear', # F12 - first part                               - 8
                        '- J_B/B0**2', # F12 - second part                                         - 9
                        '-1/B0**4*h', # F21                                                        - 10
-                       '-kappa_Psi/(gpsi_psi*B0**2)*h', # F22                                     - 11
+                       '-2*kappa_Psi/(gpsi_psi*B0**2)*h', # F22                                     - 11
                        '1/gpsi_psi', # Harmonic operator needed by lambda/gpsi_psi.               - 12
                        'gpsi_theta/gpsi_psi', # Surface phase term for e^{i(m*theta-n*zeta)}.     - 13
                        'gpsi_zeta/gpsi_psi', # Surface phase term for e^{i(m*theta-n*zeta)}.      - 14
