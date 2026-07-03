@@ -36,10 +36,49 @@ NEV = int(os.environ.get("SUPERNOVA_ITPA_NEV", "10"))
 MAX_EIGENPAIRS = int(os.environ.get("SUPERNOVA_ITPA_MAX_EIGENPAIRS", str(NEV)))
 NFE = int(os.environ.get("SUPERNOVA_ITPA_NFE", "200"))
 REGULARIZER = float(os.environ.get("SUPERNOVA_ITPA_REGULARIZER", "1e-5"))
+WD_ORIENTATION = os.environ.get("SUPERNOVA_ITPA_WD_ORIENTATION", "stored").lower()
 
 
 def _psi_to_rho(equ, psi):
     return np.interp(np.asarray(psi, dtype=float), equ._psi, equ._rho)
+
+
+def _dense_matrix(matrix):
+    return matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+
+
+def apply_wd_orientation_override(solver, sb, orientation):
+    """
+    Optionally override the weak-derivative matrix for orientation experiments.
+
+    The BSplineFE object stores ``weak_derivative_matrix[i, j] = int dphi_i phi_j``.
+    Solver blocks normally use its transpose, ``int phi_i dphi_j``.
+    """
+    orientation = str(orientation).strip().lower()
+    if orientation in {"", "stored", "solver", "current"}:
+        print("WD orientation: stored solver block orientation (int phi_i dphi_j)")
+        return "stored"
+
+    raw_wd = solver.radialfe.weak_derivative_matrix
+    if orientation in {"raw", "basis", "untransposed"}:
+        sb.WD = raw_wd.copy()
+        print("WD orientation override: raw radialfe orientation (int dphi_i phi_j)")
+        return "raw"
+
+    if orientation in {"transposed", "transpose"}:
+        sb.WD = raw_wd.T.tocsr() if hasattr(raw_wd.T, "tocsr") else raw_wd.T.copy()
+        print("WD orientation override: explicit transpose (int phi_i dphi_j)")
+        return "transposed"
+
+    if orientation in {"negative", "neg", "minus"}:
+        sb.WD = -sb.WD
+        print("WD orientation override: negative of stored solver block orientation")
+        return "negative"
+
+    raise ValueError(
+        "SUPERNOVA_ITPA_WD_ORIENTATION must be one of "
+        "'stored', 'raw', 'transposed', or 'negative'."
+    )
 
 
 def _solver3_xipsi_coeffs(result, solver, sb, eigenpair_index):
@@ -238,26 +277,45 @@ def plot_solver3_xipsi_summary(rows):
 
 def check_radial_derivative_matrix(solver, sb):
     """
-    Verify that sb.WD represents the weak radial derivative in test/trial order.
+    Verify radial quadrature and weak-derivative matrix orientations.
     """
     phi_q = np.asarray(sb.phi_q)
     dphi_q = solver.radialfe.eval_basis_derivative(sb.points_q).T
     weights_q = np.asarray(sb.weights_q, dtype=float)
+    direct_mass = np.einsum("q,qi,qj->ij", weights_q, phi_q, phi_q, optimize=True)
     direct_wd = np.einsum("q,qi,qj->ij", weights_q, phi_q, dphi_q, optimize=True)
-    stored_wd = sb.WD.toarray() if hasattr(sb.WD, "toarray") else np.asarray(sb.WD)
+    direct_stiffness = np.einsum("q,qi,qj->ij", weights_q, dphi_q, dphi_q, optimize=True)
+
+    stored_mass = _dense_matrix(solver.radialfe.mass_matrix)
+    stored_wd = _dense_matrix(sb.WD)
+    raw_wd = _dense_matrix(solver.radialfe.weak_derivative_matrix)
+    stored_stiffness = _dense_matrix(solver.radialfe.stiffness_matrix)
 
     phi_left = solver.radialfe.eval_basis([solver.radialfe.get_mesh()[0]]).reshape(-1)
     phi_right = solver.radialfe.eval_basis([solver.radialfe.get_mesh()[-1]]).reshape(-1)
     boundary_trace = np.outer(phi_right, phi_right) - np.outer(phi_left, phi_left)
 
     out = {
+        "points_shape": np.asarray(sb.points_q).shape,
+        "weights_shape": weights_q.shape,
+        "weights_sum": float(np.sum(weights_q)),
+        "weights_min": float(np.min(weights_q)),
+        "weights_max": float(np.max(weights_q)),
+        "phi_q_shape": phi_q.shape,
+        "dphi_q_shape": dphi_q.shape,
         "shape": stored_wd.shape,
-        "max_abs_error": float(np.max(np.abs(stored_wd - direct_wd))),
+        "mass_max_abs_error": float(np.max(np.abs(stored_mass - direct_mass))),
+        "stiffness_max_abs_error": float(np.max(np.abs(stored_stiffness - direct_stiffness))),
+        "wd_vs_int_phi_dphi_max_abs_error": float(np.max(np.abs(stored_wd - direct_wd))),
+        "wd_vs_raw_int_dphi_phi_max_abs_error": float(np.max(np.abs(stored_wd - raw_wd))),
         "integration_by_parts_error": float(
             np.max(np.abs(stored_wd + stored_wd.T - boundary_trace))
         ),
+        "raw_plus_stored_boundary_error": float(
+            np.max(np.abs(raw_wd + stored_wd - boundary_trace))
+        ),
     }
-    print("radial weak-derivative matrix check:")
+    print("radial quadrature and weak-derivative matrix check:")
     for key, value in out.items():
         print(f"  {key}: {value}")
     return out
@@ -717,6 +775,7 @@ region = {
 bc_kind = BC_KIND  # Try "edge", "axis", "full", or "none".
 
 sb = solver.build_solver_blocks(ntor=ntor, mmax=mmax)
+wd_orientation = apply_wd_orientation_override(solver, sb, WD_ORIENTATION)
 radial_derivative_check = check_radial_derivative_matrix(solver, sb)
 if WRITE_SOLVER_BLOCKS:
     try:
@@ -769,8 +828,13 @@ fig_quality, ax_quality = plot_solver3_xipsi_summary(quality_rows)
 
 smoothest_eigenpair = min(quality_rows, key=lambda row: row["roughness"])["eigenpair"]
 best_residual_eigenpair = min(quality_rows, key=lambda row: row["residual"])["eigenpair"]
+lowest_radial_derivative_eigenpair = min(
+    quality_rows,
+    key=lambda row: row["radial_derivative_ratio"],
+)["eigenpair"]
 print("smoothest eigenpair:", smoothest_eigenpair)
 print("best-residual eigenpair:", best_residual_eigenpair)
+print("lowest-radial-derivative eigenpair:", lowest_radial_derivative_eigenpair)
 
 fig_cont_nep, ax_cont_nep = plot_slow_sound_with_eigenmode_extensions(
     tmp,
@@ -782,7 +846,14 @@ fig_cont_nep, ax_cont_nep = plot_slow_sound_with_eigenmode_extensions(
     extension_threshold=0.67,
 )
 
-fig_xipsi, ax_xipsi = plot_xipsi_eigenpair(tmp, solver, sb, eigenpair_index=9, mpol=None)
+reference_eigenpair = min(9, tmp.sizes["eigenpair"] - 1)
+fig_xipsi, ax_xipsi = plot_xipsi_eigenpair(
+    tmp,
+    solver,
+    sb,
+    eigenpair_index=reference_eigenpair,
+    mpol=None,
+)
 fig_xipsi_smooth, ax_xipsi_smooth = plot_xipsi_eigenpair(
     tmp,
     solver,
@@ -795,6 +866,13 @@ fig_xipsi_residual, ax_xipsi_residual = plot_xipsi_eigenpair(
     solver,
     sb,
     eigenpair_index=best_residual_eigenpair,
+    mpol=None,
+)
+fig_xipsi_low_derivative, ax_xipsi_low_derivative = plot_xipsi_eigenpair(
+    tmp,
+    solver,
+    sb,
+    eigenpair_index=lowest_radial_derivative_eigenpair,
     mpol=None,
 )
 
