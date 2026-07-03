@@ -557,7 +557,7 @@ def _build_static_blocks(
         g_diag = np.zeros(nstate, dtype=np.complex128)
         sigma_diag = np.zeros(nstate, dtype=np.complex128)
         for i in range(nstate):
-            g_diag[i] = 1j*(qprof[ipsi] * n_range[i] - m_range[i])
+            g_diag[i] = -1j*(qprof[ipsi] * n_range[i] - m_range[i])
             sigma_diag[i] = 1j * (Iprof[ipsi] * n_range[i] - gprof[ipsi] * m_range[i])
 
         # Now we create and fill other matrices.
@@ -573,7 +573,7 @@ def _build_static_blocks(
         # before adding it to C0.
         c12_conv = c12_2mat @ omat
         apply_dm_cutoff(c12_conv, m_range, dm_max)
-        C0[ipsi, :nstate, nstate:] += c12_conv # C12 is done!.
+        C0[ipsi, :nstate, nstate:] -= c12_conv # C12 is done!.
 
         # D11 is the D11 input convoluted with the G operator on the right.
         # D11 = D11 @ G. Since G is a diagonal operator, we can just scale
@@ -610,7 +610,7 @@ def _build_static_blocks(
         fill_block_kernel(one_gpp[ipsi], m_range, n_range, C1[ipsi], max_dm=dm_max, max_dn=dn_max)
         fill_block_kernel(M[ipsi], m_range, n_range, D1[ipsi], max_dm=dm_max, max_dn=dn_max)
         apply_ghg_scaling(D1[ipsi], qprof[ipsi], n_range, m_range) # D1 = G^H @ M @ G.
-        D1[ipsi] *= mu_0 * gamma_s * pressure[ipsi] # We scale D1 by the 2\mu_0\gamma_s p_0 factor.
+        D1[ipsi] *= -mu_0 * gamma_s * pressure[ipsi] # We scale D1 by the 2\mu_0\gamma_s p_0 factor.
 
         # And finally we fill the gpt_over_gpp and gpz_over_gpp matrices, that will be used to apply the convolution with the G operator in the solver.+
         fill_block_kernel(gtp_over_gpp[ipsi], m_range, n_range, gtp_over_gpp_mat[ipsi], max_dm=dm_max, max_dn=dn_max)
