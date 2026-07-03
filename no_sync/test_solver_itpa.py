@@ -65,6 +65,7 @@ def summarize_solver3_xipsi_eigenpairs(
     sb,
     bc_kind=None,
     n_plot=512,
+    edge_derivative_rho=0.9,
 ):
     """
     Compute residual, boundary, roughness, and localization diagnostics.
@@ -79,6 +80,11 @@ def summarize_solver3_xipsi_eigenpairs(
     psi_plot = np.linspace(mesh[0], mesh[-1], n_plot)
     rho_plot = _psi_to_rho(solver.equ, psi_plot)
     phi_plot = solver.radialfe.eval_basis(psi_plot)
+    phi_q = np.asarray(sb.phi_q)
+    dphi_q = solver.radialfe.eval_basis_derivative(sb.points_q).T
+    weights_q = np.asarray(sb.weights_q, dtype=float)
+    rho_q = _psi_to_rho(solver.equ, sb.points_q)
+    edge_derivative_mask = rho_q >= edge_derivative_rho
     eps = np.finfo(float).eps
 
     bc = None
@@ -109,6 +115,27 @@ def summarize_solver3_xipsi_eigenpairs(
         axis_ratio = float(envelope[0] / max(peak, eps))
         dominance = float(mode_norms[dominant_index] / max(total_mode_norm, eps))
 
+        xipsi_q = phi_q @ xipsi_coeffs
+        dxipsi_q = dphi_q @ xipsi_coeffs
+        xipsi_q_norm2 = float(np.sum(weights_q[:, None] * np.abs(xipsi_q) ** 2))
+        dxipsi_q_norm2 = float(np.sum(weights_q[:, None] * np.abs(dxipsi_q) ** 2))
+        radial_derivative_ratio = float(
+            np.sqrt(max(dxipsi_q_norm2, 0.0))
+            / max(np.sqrt(max(xipsi_q_norm2, 0.0)), eps)
+        )
+        derivative_envelope = np.linalg.norm(dxipsi_q, axis=1)
+        derivative_peak_rho = float(rho_q[int(np.argmax(derivative_envelope))])
+        if dxipsi_q_norm2 > 0.0 and np.any(edge_derivative_mask):
+            edge_derivative_norm2 = float(
+                np.sum(
+                    weights_q[edge_derivative_mask, None]
+                    * np.abs(dxipsi_q[edge_derivative_mask]) ** 2
+                )
+            )
+            edge_derivative_fraction = edge_derivative_norm2 / dxipsi_q_norm2
+        else:
+            edge_derivative_fraction = np.nan
+
         bc_residual = np.nan
         if bc is not None:
             bc_residual = float(
@@ -133,6 +160,9 @@ def summarize_solver3_xipsi_eigenpairs(
                 "peak_rho": float(rho_plot[peak_index]),
                 "edge_ratio": edge_ratio,
                 "axis_ratio": axis_ratio,
+                "radial_derivative_ratio": radial_derivative_ratio,
+                "derivative_peak_rho": derivative_peak_rho,
+                "edge_derivative_fraction": edge_derivative_fraction,
             }
         )
 
@@ -149,7 +179,7 @@ def print_solver3_xipsi_summary(rows):
 
     header = (
         "eig  dom_m  residual    bc_res      rough      TV         "
-        "peak_rho  edge/peak  axis/peak  dominance"
+        "peak_rho  edge/peak  dxi/xi    dxi_peak  edge_dxi  dominance"
     )
     print(header)
     print("-" * len(header))
@@ -163,7 +193,9 @@ def print_solver3_xipsi_summary(rows):
             f"{row['total_variation']:.3e}  "
             f"{row['peak_rho']:.3f}     "
             f"{row['edge_ratio']:.3e}   "
-            f"{row['axis_ratio']:.3e}   "
+            f"{row['radial_derivative_ratio']:.3e}  "
+            f"{row['derivative_peak_rho']:.3f}     "
+            f"{row['edge_derivative_fraction']:.3e}  "
             f"{row['dominance']:.3f}"
         )
 
@@ -180,8 +212,10 @@ def plot_solver3_xipsi_summary(rows):
     roughness = np.array([row["roughness"] for row in rows])
     peak_rho = np.array([row["peak_rho"] for row in rows])
     dominant_m = np.array([row["dominant_m"] for row in rows])
+    radial_derivative_ratio = np.array([row["radial_derivative_ratio"] for row in rows])
+    edge_derivative_fraction = np.array([row["edge_derivative_fraction"] for row in rows])
 
-    fig, ax = plt.subplots(nrows=2, ncols=2, sharex=True)
+    fig, ax = plt.subplots(nrows=3, ncols=2, sharex=True)
     ax = ax.ravel()
     ax[0].semilogy(eigenpair, residual, "o-")
     ax[0].set_ylabel("reduced residual")
@@ -191,11 +225,42 @@ def plot_solver3_xipsi_summary(rows):
     ax[2].set_ylabel("peak r/a")
     ax[3].plot(eigenpair, dominant_m, "o-")
     ax[3].set_ylabel("dominant m")
+    ax[4].semilogy(eigenpair, radial_derivative_ratio, "o-")
+    ax[4].set_ylabel(r"$||\partial_\psi\xi^\psi||/||\xi^\psi||$")
+    ax[5].plot(eigenpair, edge_derivative_fraction, "o-")
+    ax[5].set_ylabel("edge derivative fraction")
     for axis in ax:
         axis.grid(True, alpha=0.3)
         axis.set_xlabel("eigenpair")
     fig.tight_layout()
     return fig, ax
+
+
+def check_radial_derivative_matrix(solver, sb):
+    """
+    Verify that sb.WD represents the weak radial derivative in test/trial order.
+    """
+    phi_q = np.asarray(sb.phi_q)
+    dphi_q = solver.radialfe.eval_basis_derivative(sb.points_q).T
+    weights_q = np.asarray(sb.weights_q, dtype=float)
+    direct_wd = np.einsum("q,qi,qj->ij", weights_q, phi_q, dphi_q, optimize=True)
+    stored_wd = sb.WD.toarray() if hasattr(sb.WD, "toarray") else np.asarray(sb.WD)
+
+    phi_left = solver.radialfe.eval_basis([solver.radialfe.get_mesh()[0]]).reshape(-1)
+    phi_right = solver.radialfe.eval_basis([solver.radialfe.get_mesh()[-1]]).reshape(-1)
+    boundary_trace = np.outer(phi_right, phi_right) - np.outer(phi_left, phi_left)
+
+    out = {
+        "shape": stored_wd.shape,
+        "max_abs_error": float(np.max(np.abs(stored_wd - direct_wd))),
+        "integration_by_parts_error": float(
+            np.max(np.abs(stored_wd + stored_wd.T - boundary_trace))
+        ),
+    }
+    print("radial weak-derivative matrix check:")
+    for key, value in out.items():
+        print(f"  {key}: {value}")
+    return out
 
 
 def check_solver3_split_operator_consistency(
@@ -652,6 +717,7 @@ region = {
 bc_kind = BC_KIND  # Try "edge", "axis", "full", or "none".
 
 sb = solver.build_solver_blocks(ntor=ntor, mmax=mmax)
+radial_derivative_check = check_radial_derivative_matrix(solver, sb)
 if WRITE_SOLVER_BLOCKS:
     try:
         sbdat = sb.to_xarray()
