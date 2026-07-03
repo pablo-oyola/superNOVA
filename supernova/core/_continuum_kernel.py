@@ -26,15 +26,20 @@ def _fill_block_kernel(
     mode_m: np.ndarray,
     mode_n: np.ndarray,
     out_view: np.ndarray,
-    conjugate_mode: bool = False
+    conjugate_mode: bool = False,
+    max_dm: int = 1000,
+    max_dn: int = 1000
 ):
-    """
+    r"""
     Core kernel to fill a specific block of the result matrix.
     Calculates differences on-the-fly to save memory.
 
     With the paper basis ``exp(i*(m*theta - n*zeta))`` and the Galerkin
     bracket ``<row|A|col>``, entry ``(i, j)`` uses the stored coefficient at
     ``(m_i - m_j, n_i - n_j)``.
+
+    Only the \Delta m < max_dm and \Delta n < max_dn are filled, to reduce
+    the memory footprint of the result matrix. The rest of the entries are left as zero.
     """
     n_i = mode_m.size
     n_j = mode_m.size
@@ -47,6 +52,8 @@ def _fill_block_kernel(
             # dm[i, j] = m_i - m_j
             dmi = mi - mode_m[j]
             dni = ni - mode_n[j]
+            if abs(dmi) > max_dm or abs(dni) > max_dn:
+                continue # Skip if the difference exceeds the maximum allowed.
             
             val = 0.0 + 0.0j
             if dmi >= 0 and dni >= 0:
@@ -173,7 +180,9 @@ def assemble_full_matrices(
     ntor: int,
     gammas: float,
     q: float,
-    p0: float
+    p0: float,
+    max_dm: int = 1000,
+    max_dn: int = 1000
 ):
     """
     Builds the full A and B matrices by filling sub-blocks directly.
@@ -209,27 +218,33 @@ def assemble_full_matrices(
 
     # 3. Fill A blocks via views (no copies made)
     # A11 (Top-Left)
-    fill_block_kernel(H_mn, m_range, n_range, A_out[:nmode, :nmode])
+    fill_block_kernel(H_mn, m_range, n_range, A_out[:nmode, :nmode], 
+                      max_dm=max_dm, max_dn=max_dn)
     apply_ghg_scaling(A_out[:nmode, :nmode], q, n_range, 
                       m_range)  # Apply G^H * A11 * G scaling
     
     # A12 (Top-Right)
     # A12 = - gamma_s * (pressure_mn * K_mn)
-    fill_block_kernel(K_mn, m_range, n_range, A_out[:nmode, nmode:], conjugate_mode=False)
+    fill_block_kernel(K_mn, m_range, n_range, A_out[:nmode, nmode:], conjugate_mode=False,
+                      max_dm=max_dm, max_dn=max_dn)
     A_out[:nmode, nmode:] *= - (gammas * mu_0 * p0)
     
     # A22 (Bottom-Right)
-    fill_block_kernel(M_mn, m_range, n_range, A_out[nmode:, nmode:])
+    fill_block_kernel(M_mn, m_range, n_range, A_out[nmode:, nmode:], 
+                      max_dm=max_dm, max_dn=max_dn)
     apply_ghg_scaling(A_out[nmode:, nmode:], q, n_range,
                       m_range, scale=p0*gammas*mu_0)  # Apply G^H * M * G scaling
 
     # 4. Fill B blocks via views
     # B11 (Top-Left)
-    fill_block_kernel(J_mn, m_range, n_range, B_out[:nmode, :nmode])
+    fill_block_kernel(J_mn, m_range, n_range, B_out[:nmode, :nmode], 
+                      max_dm=max_dm, max_dn=max_dn)
     # B21 (Bottom-Left)
-    fill_block_kernel(K_mn, m_range, n_range, B_out[nmode:, :nmode])
+    fill_block_kernel(K_mn, m_range, n_range, B_out[nmode:, :nmode], 
+                      max_dm=max_dm, max_dn=max_dn)
     # B22 (Bottom-Right)
-    fill_block_kernel(L_mn, m_range, n_range, B_out[nmode:, nmode:])
+    fill_block_kernel(L_mn, m_range, n_range, B_out[nmode:, nmode:], 
+                      max_dm=max_dm, max_dn=max_dn)
 
     return A_out, B_out
 

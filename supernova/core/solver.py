@@ -10,13 +10,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 import xarray as xr
 import unyt
+from scipy.sparse.linalg import splu
 from .equilibrium import superEquilibrium
 from .continuum import superContinuum
+from .continuum import continuum_crossings, get_knots_clustered_at
 from ..radial.base import RadialFE
 from ..radial.profile import Profile
 
 # Let's import the kernels
-from ._solver_kernel import apply_to_reduced, solver_blocks, eval_M_at, build_solver_blocks
+from ._solver_kernel import apply_to_reduced, solver_blocks, eval_M_at, build_solver_blocks, get_T_sparse
 from ._antenna import Antenna
 from ._boundary import idealSeparatrixBC, couplingPressureDisplacementBC, regularityAxisBC
 from ._petsc_helpers import KrylovSolver
@@ -171,7 +173,7 @@ class superSolver:
         self.M = self.cont.M
         self.K = self.cont.K
 
-    def _setup_radial_points(self):
+    def _setup_radial_points2(self):
         """
         From a given prepared Radial finite element basis, we
         get the points where the whole problem needs to be evaluated
@@ -188,6 +190,69 @@ class superSolver:
         self.edge_points = np.asarray([self.radialfe.get_mesh()[-1]], dtype=np.float64)
         self.operator_points = np.concatenate([self.points, self.edge_points])
         self.unique_points = self.operator_points
+
+        # Re-evaluating the profiles.
+        self.C11.data = self.C11.data.interp(x=self.unique_points)
+        self.C12_2.data = self.C12_2.data.interp(x=self.unique_points)
+        self.C12_3.data = self.C12_3.data.interp(x=self.unique_points)
+        self.O.data = self.O.data.interp(x=self.unique_points)
+        self.C22.data = self.C22.data.interp(x=self.unique_points)
+        self.D11.data = self.D11.data.interp(x=self.unique_points)
+        self.D21_1.data = self.D21_1.data.interp(x=self.unique_points)
+        self.D21_2.data = self.D21_2.data.interp(x=self.unique_points)
+        self.F11_2.data = self.F11_2.data.interp(x=self.unique_points)
+        self.F12_1.data = self.F12_1.data.interp(x=self.unique_points)
+        self.F12_2.data = self.F12_2.data.interp(x=self.unique_points)
+        self.F21.data = self.F21.data.interp(x=self.unique_points)
+        self.F22.data = self.F22.data.interp(x=self.unique_points)
+        self.inv_gpsi_psi.data = self.inv_gpsi_psi.data.interp(x=self.unique_points)
+        self.gpsi_theta_over_gpsi_psi.data = self.gpsi_theta_over_gpsi_psi.data.interp(x=self.unique_points)
+        self.gpsi_zeta_over_gpsi_psi.data = self.gpsi_zeta_over_gpsi_psi.data.interp(x=self.unique_points)
+
+        # The rest of the operators come from the continuum:
+        self.M.data = self.M.data.interp(x=self.unique_points)
+        self.K.data = self.K.data.interp(x=self.unique_points)
+
+        # We need to get for the radial derivative the underlying unit and scale
+        # of the flux. For the absolute value of the flux at the edge, psiN, we
+        # need to inquire the boozer coordinates.
+        psiN = np.abs(self.equ.boozer.coords.psi0).max() * unyt.Unit('Wb', registry=self.equ.registry)
+        psiN = psiN.data.in_base(self.equ.my_norm).to('psi0').v
+
+        # We need also to divide the density by the maximum density.
+        n0 = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")
+
+        # We keep too a copy of the density, pressure and the derivative.
+        self.density = self.equ('density', normalize=True)
+        self.pressure = self.equ('pressure', normalize=True)
+        self.pressure_deriv = self.equ('pressure', normalize=True)
+        self.density.data = self.density.data.interp(x=self.unique_points) / n0.v
+        self.pressure.data = self.pressure.data.interp(x=self.unique_points)
+        self.pressure_deriv.data = self.pressure.data.differentiate('x').interp(x=self.unique_points) / psiN
+
+        # We evaluate as well hprof, qprof, Iprof and gprof at the solver points for later use in the integrals.
+        self.hprof = self.equ('h', normalize=True)
+        self.qprof = self.equ('q', normalize=True)
+        self.Iprof = self.equ('I', normalize=True)
+        self.gprof = self.equ('g', normalize=True)
+
+        self.hprof.data = self.hprof.data.interp(x=self.unique_points)
+        self.qprof.data = self.qprof.data.interp(x=self.unique_points)
+        self.Iprof.data = self.Iprof.data.interp(x=self.unique_points)
+        self.gprof.data = self.gprof.data.interp(x=self.unique_points)
+
+    def _setup_radial_points(self):
+        """
+        Temporal patch.
+        """
+        self.points, self.weights = self.radialfe.get_quadrature_points()
+
+        # Solver quadrature points are physical radial points. The local MHD
+        # operator also needs an edge value for the boundary condition, but that
+        # edge point is not part of the quadrature rule.
+        self.edge_points = np.asarray([self.radialfe.get_mesh()[-1]], dtype=np.float64)
+        self.operator_points = np.concatenate([self.points, self.edge_points])
+        self.unique_points = np.linspace(0, 1, 1000)
 
         # Re-evaluating the profiles.
         self.C11.data = self.C11.data.interp(x=self.unique_points)
@@ -284,14 +349,34 @@ class superSolver:
 
         return np.ascontiguousarray(data.values[:, 0, 0], dtype=np.complex128)
 
-    def build_solver_blocks(self, ntor: int, mmax: int=None):
+    def build_solver_blocks(self, ntor: int, mmax: int=None) -> solver_blocks:
         """
         We build the solver blocks using the pre-evaluated profiles already
         evaluated at the radial points and fill the class to be used later 
         in a faster assembly.
         """
-        mmax_eff = self._solver_mmax(mmax)
+        # If the user provides no mode limit, we will take the maximum poloidal mode
+        # number from the H profile.
+        H_mmax = np.abs(self.M.m_pol).max()
+        if mmax is None:
+            mmax = int(H_mmax)
+        else:
+            mmax = min(mmax, int(H_mmax))
+
+        # From the internal q-profile, we can determine for the given ntor the maximum
+        # and minimum poloidal mode numbers that can be excited at all.
+        qmin = self.equ.qprof.data.squeeze().real.min()
+        qmax = self.equ.qprof.data.squeeze().real.max()
+
+        mmin_q = int(np.floor(ntor * qmin)) - 3
+        mmax_q = min(mmax, int(np.ceil(ntor * qmax)) + 3)
+
+        mmax = min(mmax, mmax_q)
+
+        mmax_eff = mmax#self._solver_mmax(mmax)
         nmax_eff = 0
+
+        m_range = np.arange(mmin_q, mmax + 1)
 
         # Let's check if we can reuse the previous solver blocks.
         if hasattr(self, 'solver_blocks'):
@@ -331,7 +416,8 @@ class superSolver:
                                                  H(self.inv_gpsi_psi, mmax_eff, nmax_eff),
                                                  H(self.gpsi_theta_over_gpsi_psi, mmax_eff, nmax_eff), 
                                                  H(self.gpsi_zeta_over_gpsi_psi, mmax_eff, nmax_eff),
-                                                 ntor=ntor)
+                                                 ntor=ntor,
+                                                 m_range=m_range)
         self.solver_blocks.mmax = mmax_eff
         
         # We will now solve the continuum problem for the first time to 
@@ -345,11 +431,11 @@ class superSolver:
         self.solver_blocks.norm = vdict['normalizations']
         self.solver_blocks.cont_eigvals = w
 
-        # We fill the elements related to the radial operations.
-        self.solver_blocks.weights_q = self.weights
-        self.solver_blocks.points_q = self.points
-        self.solver_blocks.phi_q = self.radialfe.eval_basis(self.points).T
-        self.solver_blocks.WD = self.radialfe.weak_derivative_matrix.T.toarray()
+        # # We fill the elements related to the radial operations.
+        # self.solver_blocks.weights_q = self.weights
+        # self.solver_blocks.points_q = self.points
+        # self.solver_blocks.phi_q = self.radialfe.eval_basis(self.points).T
+        # self.solver_blocks.WD = self.radialfe.weak_derivative_matrix.T.toarray()
 
         return self.solver_blocks
 
@@ -387,8 +473,8 @@ class superSolver:
             raise ValueError("Antenna profile must be only m=0, n=0 for the response solver.")
         
         # Generating the mpol range.
-        mmax = self._solver_mmax(mmax)
-        m_range = np.arange(-mmax, mmax+1)
+        # mmax = self._solver_mmax(mmax)
+        m_range = self.solver_blocks.m_range
         n_range = np.ones_like(m_range) * ntor
         nmpol = len(m_range)
         nstates = 2 * nmpol # p1 and xi for each mpol.
@@ -445,10 +531,10 @@ class superSolver:
                             profile=antenna_profile.data.values, 
                             radial_fe=self.radialfe,
                             bc=bc3, which='xi', parity='odd')
-        b_elements = [antP1_even.get_full_pattern(mmax=mmax),
-                      antP1_odd.get_full_pattern(mmax=mmax),
-                      antXi_even.get_full_pattern(mmax=mmax),
-                      antXi_odd.get_full_pattern(mmax=mmax)]
+        b_elements = [antP1_even.get_full_pattern(m_range=m_range),
+                      antP1_odd.get_full_pattern(m_range=m_range),
+                      antXi_even.get_full_pattern(m_range=m_range),
+                      antXi_odd.get_full_pattern(m_range=m_range)]
         
         krylov = None # Dummy.
 
@@ -482,7 +568,8 @@ class superSolver:
             if krylov is None:
                 krylov = KrylovSolver(size=bc.get_free_dofs(), 
                                       operator=apply_to_reduced,
-                                      context=context, rtol=1e-3, atol=1e-5, maxit=100)
+                                      context=context, rtol=1e-2, 
+                                      atol=1e-4, maxit=5000)
             else:
                 krylov.swap_context(operator=apply_to_reduced, 
                                     context=context,
@@ -491,7 +578,11 @@ class superSolver:
             # We will now solve the linear system for each of the four independent antenna drives.
             for jj, bre in enumerate(b_reduced):
                 print("  Solving for antenna drive {jj}: {drive}".format(jj=jj, drive=['p1_even', 'p1_odd', 'xi_even', 'xi_odd'][jj]))
-                response_reduced = krylov.solve(bre)
+                try:
+                    response_reduced = krylov.solve(bre)
+                except RuntimeError as e:
+                    print(f"  Krylov solver failed for antenna drive {jj}: {e}")
+                    response_reduced = np.zeros(bc.get_free_dofs(), dtype=np.complex128)
                 response_full = bc.expand(response_reduced)
                 response_coeff = response_full.reshape((nq, nstates))
                 response_x[ii, :, :, jj] = sb.phi_q @ response_coeff
@@ -529,4 +620,78 @@ class superSolver:
                                                 'quantity': ['xi_response', 'p1_response']},
                                         attrs={'units': 'arbitrary',
                                                'description': 'Integrated response of the system to the antenna drive at each frequency.'})
+        return dset
+
+    def get_sigma_min(self, frequency: np.ndarray[float],
+                     ntor: int,  mmax: int=None, m_coupling: int=10,
+                     regularizer: float=None) -> xr.DataArray:
+        r"""
+        Using sparse LU decomposition, we will compute the minimum singular value of the operator
+        T(\omega^2) that is the ideal MHD operator for a given frequency.
+        """
+        omega = np.asarray(frequency) * 2 * np.pi * unyt.Unit('Hz', registry=self.equ.registry)
+        if np.any(np.isclose(frequency, 0)):
+            raise ValueError("Frequency cannot be zero for the response solver.")
+        if np.any(np.iscomplex(frequency)):
+            raise ValueError("Frequency cannot be complex for the response solver.")
+  
+        # Generating the mpol range.
+        # mmax = self._solver_mmax(mmax)
+        m_range = self.solver_blocks.m_range
+        nmpol = len(m_range)
+
+        # Preparing the results arrays.
+        sigmamin = np.zeros((len(omega),), dtype=np.float64)
+
+        # We also prebuild the frequency-independent boundary conditions.
+        bc1 = regularityAxisBC(self.radialfe, m_range)
+        bc2 = idealSeparatrixBC(self.radialfe, m_range.size)
+        bc3 = bc1 * bc2
+
+        # Let's generate the solver_blocks for our ntor and mmax.
+        sb = self.build_solver_blocks(ntor=ntor, mmax=mmax)
+        M_all = eval_M_at(sb=sb, omega=iomega.to('omegaA').v, regularizer=regularizer)
+
+        for ii, iomega in enumerate(omega):
+            print("Solving for {ii} frequency: {freq:.3f} Hz".format(ii=ii, freq=frequency[ii]))
+
+            # Let's get from the slow-sound continuum.
+            wsaw = self.cont.solve(ntor=ntor, which='slow_sound', normalize_eigvals=True,
+                  psi_vals=x, classify=False, mmax=mmax)
+
+
+            # We build the pressure coupling operator for the given frequency.
+            nq_operator = sb.weights_q.shape[0]
+            if M.shape[0] != nq_operator + 1:
+                raise ValueError(
+                    "M must be evaluated at the quadrature points plus one edge point "
+                    f"for the boundary condition. Got {M.shape[0]} points and "
+                    f"{nq_operator} quadrature weights."
+                )
+            M_q = M[:nq_operator]
+            M_edge = M[-1]
+
+
+            # From the local M matrix at the edge, we build the last boundary condition.
+            bc4 = couplingPressureDisplacementBC(self.radialfe, m_range.size, M=M_edge)
+            bc = bc3 * bc4 # Total boundary condition.
+
+            # Generating the sparse representation of the operator T(\omega^2) for the given frequency.
+            T = get_T_sparse(sb=sb, M=M_q, m_coupling=m_coupling)
+
+            # We will now reduce the matrix T to the free degrees of freedom of the boundary condition.
+            T_reduced = bc.reduce_sparse_matrix(T)
+
+            # We apply the LU decomposition.
+            lu = splu(T_reduced.tocsc())
+
+            # The minimum singular value of T is the minimum value of the 
+            # L matrix diagonal.
+            sigmamin[ii] = np.min(np.abs(lu.U.diagonal()))
+
+        # We will return a dataset with all the relevant information.
+        dset = xr.DataArray(sigmamin, dims=['frequency'],
+                                        coords={'frequency': frequency},
+                                        attrs={'units': 'arbitrary',
+                                               'description': 'Minimum singular value of the ideal MHD operator T(omega^2) at each frequency.'})
         return dset

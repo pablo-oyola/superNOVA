@@ -51,7 +51,7 @@ class Antenna:
         self.full_antenna = None
         
 
-    def get_full_pattern(self, mmax: int, force_gen: bool=False) -> np.ndarray:
+    def get_full_pattern(self, m_range: np.ndarray, force_gen: bool=False) -> np.ndarray:
         r"""
         Get the full antenna pattern on the finite element space, without reducing to the
         non-deficient degrees of freedom.
@@ -59,8 +59,9 @@ class Antenna:
         if self.full_antenna is not None and not force_gen:
             return self.full_antenna
 
-        nstates = (2*mmax + 1)
-        m_range = np.arange(-mmax, mmax+1)
+        # nstates = (2*mmax + 1)
+        # m_range = np.arange(-mmax, mmax+1)
+        nstates = m_range.size
 
         out = np.zeros((self.radial_fe.get_ndofs(), 2*nstates), dtype=complex)
 
@@ -76,20 +77,30 @@ class Antenna:
         else:
             slice_size = 2*nstates
             antenna_slice = slice(0, 2*nstates)
-        
-        if self.parity == 'even':
-            # We will generate modes that are even, we will only generate the 
-            # modes with m >= 0 and use the same ones for the m < 0.
-            phases = np.random.random(size=m_range[m_range >= 0].shape) * 2.0 - 1.0
-            phases = np.concatenate([phases[:0:-1]/2.0, [phases[0], ], phases[1:]/2.0])
-        elif self.parity == 'odd':
-            # We will generate modes that are odd, we will only generate the 
-            # modes with m >= 0 and use the opposite ones for the m < 0.
-            phases = np.random.random(size=m_range[m_range >= 0].shape) * 2.0 - 1.0
-            phases = np.concatenate([-phases[:0:-1]/(2.0j), [0.0,], phases[1:]/(2.0j)])
-        else: # self.parity == 'none'
-            # We will generate modes with no particular parity, we will generate
-            # all the modes independently.
+
+        # Generate phases taking into account possible asymmetric m_range
+        phases = np.empty(m_range.shape, dtype=complex)
+        if self.parity in ('even', 'odd'):
+            # build a lookup for non-negative m phases
+            m_nonneg = np.unique(m_range[m_range >= 0])
+            phases_nonneg = np.random.random(size=m_nonneg.shape) * 2.0 - 1.0
+            phase_map = {int(m): ph for m, ph in zip(m_nonneg, phases_nonneg)}
+
+            for idx, m in enumerate(m_range):
+                if m >= 0:
+                    phases[idx] = phase_map[int(m)]
+                else:
+                    abs_m = int(abs(m))
+                    if abs_m in phase_map:
+                        if self.parity == 'even':
+                            phases[idx] = phase_map[abs_m]
+                        else:  # odd
+                            phases[idx] = 1j*phase_map[abs_m]
+                    else:
+                        # fallback: generate independent phase when counterpart missing
+                        phases[idx] = np.random.random() * 2.0 - 1.0
+        else:
+            # no parity constraint: independent phases for all m
             phases = np.random.random(size=m_range.shape) * 2.0 - 1.0
 
         # Now we will fill the antenna pattern with the coefficients of the antenna
@@ -101,13 +112,13 @@ class Antenna:
         return self.full_antenna
     
 
-    def get_reduced_antenna(self, mmax: int) -> np.ndarray:
+    def get_reduced_antenna(self, m_range: np.ndarray) -> np.ndarray:
         r"""
         Get the antenna pattern projected on the finite element space, reduced to the
         non-deficient degrees of freedom.
         """
         # Get the full antenna pattern on the finite element space
-        full_pattern = self.get_full_pattern(mmax)
+        full_pattern = self.get_full_pattern(m_range)
 
         # Reduce to the non-deficient degrees of freedom
         reduced_pattern = self.bc.restrict(full_pattern)

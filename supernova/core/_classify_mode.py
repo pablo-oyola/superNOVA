@@ -1024,6 +1024,7 @@ class ContinuumClassifier:
         self,
         ax=None,
         y: str = "sqrt_real",
+        x: np.ndarray | None = None,
         scale: float = 1.0,
         xlabel: str = "Radial coordinate",
         ylabel: Optional[str] = None,
@@ -1047,7 +1048,16 @@ class ContinuumClassifier:
         dset = self.to_xarray()
         eigenvalues = dset["eigenvalue"].values
         yvals = self._plot_values(eigenvalues, y) * scale
-        xvals = np.broadcast_to(dset["x"].values[:, None], yvals.shape)
+        if x is not None:
+            xvals = np.asarray(x)
+            if xvals.ndim != 1 or xvals.size != yvals.shape[0]:
+                raise ValueError(
+                    f"x must be one-dimensional with length {yvals.shape[0]}, "
+                    f"got {xvals.shape}."
+                )
+            xvals = np.broadcast_to(xvals[:, None], yvals.shape)
+        else:
+            xvals = np.broadcast_to(dset["x"].values[:, None], yvals.shape)
         family = dset["family_code"].values
         dominant_m = dset["dominant_m"].values
         color_m = np.abs(dominant_m)

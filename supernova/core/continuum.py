@@ -15,6 +15,8 @@ from .isotopes import isotopes_mass
 from scipy.linalg import eig, eigh
 from scipy.constants import mu_0
 from ._classify_mode import ContinuumClassifier
+from scipy.sparse import coo_matrix
+from scipy.sparse import linalg as spla
 
 from tqdm import tqdm
 
@@ -59,8 +61,8 @@ class superContinuum:
         if not dense:
             raise NotImplementedError("Currently, only the dense option is implemented. The sparse option will be added in future releases.")
 
-        if gamma_s <= 1:
-            raise ValueError("The adiabatic index gamma_s should be greater than 1.")
+        if gamma_s < 0.0:
+            raise ValueError("The adiabatic index gamma_s should be greater than 0.")
         self.gamma_s = gamma_s
 
         if species not in isotopes_mass:
@@ -118,7 +120,9 @@ class superContinuum:
 
     def solve(self, ntor: int, mmax: int=None, psi_vals: np.ndarray=None, 
               which: str='full', return_eigvecs: bool=False,
-              normalize_eigvals: bool=False, classify: bool=False, **classify_kwargs):
+              normalize_eigvals: bool=False, classify: bool=False, 
+              max_dm: int=1000, max_dn: int=1000,
+              **classify_kwargs):
         """
         Solves the continuum spectrum for the given equilibrium and parameters.
 
@@ -167,6 +171,14 @@ class superContinuum:
         else:
             mmax = min(mmax, int(H_mmax))
 
+        # From the internal q-profile, we can determine for the given ntor the maximum
+        # and minimum poloidal mode numbers that can be excited at all.
+        qmin = self.equ.qprof.data.squeeze().real.min()
+        qmax = self.equ.qprof.data.squeeze().real.max()
+
+        mmin_q = int(np.floor(ntor * qmin)) - 3
+        mmax_q = min(mmax, int(np.ceil(ntor * qmax)) + 3)
+
         if which.lower() not in ['full', 'alfven', 'slow_sound']:
             raise ValueError(f"Invalid option for 'which': {which}. Valid options are 'full', 'alfven', 'slow_sound'.")
         
@@ -176,8 +188,8 @@ class superContinuum:
             slow_sound = True
 
         psi_vals = np.asarray(psi_vals, dtype=np.float64).reshape(-1)
-        m_range = np.arange(-mmax, mmax + 1)
-        m_range2sel = np.arange(mmax+1)
+        m_range = np.arange(mmin_q, mmax_q + 1)
+        m_range2sel = np.arange(mmax_q+1)
         nstate = m_range.size if slow_sound else 2 * m_range.size
 
         eigenvalues = np.zeros((psi_vals.size, nstate), dtype=np.complex128)
@@ -209,7 +221,9 @@ class superContinuum:
                                                             q=kwargs['q'], 
                                                             m_range=kwargs['m_range'], 
                                                             ntor=kwargs['ntor'],
-                                                            gammas=self.gamma_s)
+                                                            gammas=self.gamma_s,
+                                                            max_dm=kwargs.get('max_dm', 1000),
+                                                            max_dn=kwargs.get('max_dn', 1000))
         elif which.lower() == 'slow_sound':
             fun = lambda **kwargs: assembly_slow_sound(H_mn=kwargs['H_nm'], 
                                                         J_mn=kwargs['J_nm'], 
@@ -266,7 +280,6 @@ class superContinuum:
                        K_mn=iK_mn, L_mn=iL_mn, M_mn=iM_mn, N_mn=iN_mn,
                        q=iqval, m_range=m_range, ntor=ntor, p0=ip0)
             
-
             # We obtain the eigenvalues and eigenvectors of the generalized eigenvalue problem A v = lambda B v.
             w, vl, vr = _solve_(A, B)
 
@@ -280,7 +293,8 @@ class superContinuum:
         if normalize_eigvals:
             normfrequency = n0.data
             eigenvalues /= normfrequency[..., None]
-            eigenvalues *= 1 * self.mass * unyt.Unit("omegaA/sqrt(amu)", registry=self.equ.registry)**2 # Omega^2.
+            mass_scale = (1 * unyt.Unit("amu", registry=self.equ.registry) / self.mass)
+            eigenvalues *= mass_scale * unyt.Unit("omegaA", registry=self.equ.registry)**2
             
         if return_eigvecs:
             eigvecs = {
@@ -381,3 +395,87 @@ class superContinuum:
             B[ii] = Bii
 
         return A, B
+
+def continuum_crossings(x: float, w: np.ndarray, freq: float) -> np.ndarray:
+    """
+    Returns the points where the continuum crosses a given frequency.
+
+    Parameters:
+    -----------
+    x: np.ndarray
+        The radial positions (normalized poloidal flux).
+    w: np.ndarray
+        The continuum frequencies at the given x positions.
+    freq: float
+        The frequency to find crossings with.
+
+    Returns:
+    --------
+    crossings: np.ndarray
+        The x positions where the continuum crosses the given frequency.
+    """
+    dwsaw_si = np.sqrt(w.real).to('kHz').v/(2*np.pi) - freq
+    dwsaw_si = np.sign(dwsaw_si[1:, :] * dwsaw_si[:-1, :])
+
+    # We mark with an 'x' the points where the continuum is cut by the frequency.
+    # aka, those points where dwsaw_si is negative.
+    crossings = []
+    crossing_branches = []
+    
+    for ibranch in range(w.shape[1]):
+        cut_points = np.where(dwsaw_si[:, ibranch] < 0)[0]
+
+        # These crossings are brute-force approximation. We take a line that goes from the x to the following point and
+        # evaluate where they cross by zero.
+        for cut in cut_points:
+            x1, x2 = x[cut], x[cut+1]
+            y1= np.sqrt(w.real).to('kHz').v[cut, ibranch]/(2*np.pi) - freq
+            y2 = np.sqrt(w.real).to('kHz').v[cut+1, ibranch]/(2*np.pi) - freq
+            # Linearly interpolate to find the crossing point.
+            if y2 != y1:  # Avoid division by zero
+                x_cross = x1 - y1 * (x2 - x1) / (y2 - y1)
+                crossings.append(x_cross)
+                crossing_branches.append(ibranch*np.ones_like(x_cross, dtype=np.int16))
+    
+    return np.array(crossings), np.array(crossing_branches)
+
+def get_knots_clustered_at(x: np.ndarray, nknots: int, eta: float=1e-5,
+                           threshold: float=None) -> np.ndarray:
+    """
+    Returns a set of knots clustered at the points in x.
+
+    Parameters:
+    -----------
+    x: np.ndarray
+        The points to cluster the knots around.
+    nknots: int
+        The number of knots to generate.
+    threshold: int, optional
+        If provided, this will provide a way to distribute better the 
+        knots.
+
+    Returns:
+    --------
+    knots: np.ndarray
+        The generated knots clustered around the points in x.
+    """
+    if threshold is None:
+        threshold = 0.01 # Default threshold.
+
+    eta = np.minimum(1e-5, eta)
+
+    # We compute the cumulative distribution for the resonant layer.
+    xnew = np.linspace(0.0, 1.0, 10000) # Midpoints between the original x points, where dwsaw_si is defined.
+    singular_layer = np.zeros(xnew.shape, dtype=np.float64)
+    eta = 1e-3 # Regularizer. We will use a Lorentzian to approximate the delta function at the singular layer.
+    for x_cross in x:
+        singular_layer += eta / ((xnew - x_cross)**2 + eta**2)
+
+    cumulative = np.cumsum(np.maximum(threshold*singular_layer.max(), singular_layer))
+    cumulative -= cumulative[0]  # Start from zero
+    cumulative /= cumulative[-1]  # Normalize to [0, 1]
+
+    new_knots = np.interp(np.linspace(0.0, 1.0, nknots), cumulative, xnew)
+
+    return new_knots
+    
