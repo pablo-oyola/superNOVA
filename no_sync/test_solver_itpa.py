@@ -470,11 +470,20 @@ def plot_xipsi_eigenpair(
             alpha = 1.0 if ii == dominant_index else 0.75
             ax.plot(
                 rho_plot,
-                np.abs(xipsi_all[:, ii]),
+                xipsi_all[:, ii].real,
                 color=cmap(norm(float(m_value))),
                 lw=linewidth,
                 alpha=alpha,
             )
+            ax.plot(
+                rho_plot,
+                xipsi_all[:, ii].imag,
+                color=cmap(norm(float(m_value))),
+                lw=linewidth,
+                ls='--',
+                alpha=alpha,
+            )
+
 
         sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
         sm.set_array([])
@@ -512,9 +521,17 @@ def plot_xipsi_eigenpair(
             alpha = 1.0 if mode_index == dominant_index else 0.75
             ax.plot(
                 rho_plot,
-                np.abs(xipsi_all[:, mode_index]),
+                xipsi_all[:, mode_index].real,
                 color=cmap(norm(float(m_value))),
                 lw=linewidth,
+                alpha=alpha,
+            )
+            ax.plot(
+                rho_plot,
+                xipsi_all[:, mode_index].imag,
+                color=cmap(norm(float(m_value))),
+                lw=linewidth,
+                ls='--',
                 alpha=alpha,
             )
         sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
@@ -701,15 +718,15 @@ cont = sn.superContinuum(equ, gamma_s=gamma_s, species=species, dense=True)
 # %% Continuum guide for radial knots.
 x = np.linspace(0.0, 1.0, 1000)
 rho = _psi_to_rho(equ, x)
-# w = cont.solve(
-#     ntor=ntor,
-#     which="full",
-#     normalize_eigvals=True,
-#     return_eigvecs=True,
-#     psi_vals=x,
-#     classify=True,
-#     mmax=mmax,
-# )
+w = cont.solve(
+    ntor=ntor,
+    which="full",
+    normalize_eigvals=True,
+    return_eigvecs=True,
+    psi_vals=x,
+    classify=True,
+    mmax=mmax,
+)
 wsaw = cont.solve(
     ntor=ntor,
     which="slow_sound",
@@ -719,9 +736,9 @@ wsaw = cont.solve(
     mmax=mmax,
 )
 
-# fig, ax = w[-1].plot(x=x)
-fig, ax = plt.subplots()
-ax.plot(rho, np.sqrt(wsaw.real).to("kHz").v / (2 * np.pi), "-")
+fig, ax = w[-1].plot(x=x, scale=1e-3/(2 * np.pi))
+# fig, ax = plt.subplots()
+ax.plot(x, np.sqrt(wsaw.real).to("kHz").v / (2 * np.pi), "-")
 ax.set_xlabel("$r/a$")
 ax.set_ylabel("Frequency (kHz)")
 ax.set_ylim([0, 100])
@@ -806,35 +823,35 @@ split_check = check_solver3_split_operator_consistency(
 tmp = solver.solve_nep_split(
     ntor=ntor,
     target_omega=target_omega,
-    max_dm=MAX_DM,
-    regularizer=REGULARIZER,
+    max_dm=10,
+    regularizer=0.0,
     apply_bcs=True,
     bc_kind=bc_kind,
     region=region,
     verbose=True,
-    nev=NEV,
-    max_eigenpairs=MAX_EIGENPAIRS,
+    nev=6,
+    max_eigenpairs=6,
     compute_residuals=True,
 )
 
-quality_rows = summarize_solver3_xipsi_eigenpairs(
-    tmp,
-    solver,
-    sb,
-    bc_kind=bc_kind,
-)
-print_solver3_xipsi_summary(quality_rows)
-fig_quality, ax_quality = plot_solver3_xipsi_summary(quality_rows)
+# quality_rows = summarize_solver3_xipsi_eigenpairs(
+#     tmp,
+#     solver,
+#     sb,
+#     bc_kind=bc_kind,
+# )
+# print_solver3_xipsi_summary(quality_rows)
+# fig_quality, ax_quality = plot_solver3_xipsi_summary(quality_rows)
 
-smoothest_eigenpair = min(quality_rows, key=lambda row: row["roughness"])["eigenpair"]
-best_residual_eigenpair = min(quality_rows, key=lambda row: row["residual"])["eigenpair"]
-lowest_radial_derivative_eigenpair = min(
-    quality_rows,
-    key=lambda row: row["radial_derivative_ratio"],
-)["eigenpair"]
-print("smoothest eigenpair:", smoothest_eigenpair)
-print("best-residual eigenpair:", best_residual_eigenpair)
-print("lowest-radial-derivative eigenpair:", lowest_radial_derivative_eigenpair)
+# smoothest_eigenpair = min(quality_rows, key=lambda row: row["roughness"])["eigenpair"]
+# best_residual_eigenpair = min(quality_rows, key=lambda row: row["residual"])["eigenpair"]
+# lowest_radial_derivative_eigenpair = min(
+#     quality_rows,
+#     key=lambda row: row["radial_derivative_ratio"],
+# )["eigenpair"]
+# print("smoothest eigenpair:", smoothest_eigenpair)
+# print("best-residual eigenpair:", best_residual_eigenpair)
+# print("lowest-radial-derivative eigenpair:", lowest_radial_derivative_eigenpair)
 
 fig_cont_nep, ax_cont_nep = plot_slow_sound_with_eigenmode_extensions(
     tmp,
@@ -847,32 +864,12 @@ fig_cont_nep, ax_cont_nep = plot_slow_sound_with_eigenmode_extensions(
 )
 
 reference_eigenpair = min(9, tmp.sizes["eigenpair"] - 1)
+# %%
 fig_xipsi, ax_xipsi = plot_xipsi_eigenpair(
     tmp,
     solver,
     sb,
-    eigenpair_index=reference_eigenpair,
-    mpol=None,
-)
-fig_xipsi_smooth, ax_xipsi_smooth = plot_xipsi_eigenpair(
-    tmp,
-    solver,
-    sb,
-    eigenpair_index=smoothest_eigenpair,
-    mpol=None,
-)
-fig_xipsi_residual, ax_xipsi_residual = plot_xipsi_eigenpair(
-    tmp,
-    solver,
-    sb,
-    eigenpair_index=best_residual_eigenpair,
-    mpol=None,
-)
-fig_xipsi_low_derivative, ax_xipsi_low_derivative = plot_xipsi_eigenpair(
-    tmp,
-    solver,
-    sb,
-    eigenpair_index=lowest_radial_derivative_eigenpair,
+    eigenpair_index=0,
     mpol=None,
 )
 
