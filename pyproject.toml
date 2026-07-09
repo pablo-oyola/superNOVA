@@ -19,6 +19,7 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 plot = ["matplotlib"]
+desc = ["desc-opt"]
 
 [tool.setuptools.packages.find]
 where = ["."]
