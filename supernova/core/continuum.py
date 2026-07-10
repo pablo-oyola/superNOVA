@@ -106,6 +106,11 @@ class superContinuum:
         self.p0 = tmp[6].data.squeeze().real
         self.n0 = tmp[7].data.squeeze().real
 
+        # Use the first finite-radius operator as the temporary axis limit.
+        for profile in [self.H, self.J, self.N]:
+            if profile.x.size > 1 and np.isclose(profile.x[0], 0.0):
+                profile.data.loc[dict(x=0.0)] = profile.data.isel(x=1).values
+
         # Normalization density, which we take as the density at the axis.
         densitynorm = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")
         self.n0 /= densitynorm.v
@@ -478,4 +483,3 @@ def get_knots_clustered_at(x: np.ndarray, nknots: int, eta: float=1e-5,
     new_knots = np.interp(np.linspace(0.0, 1.0, nknots), cumulative, xnew)
 
     return new_knots
-    
