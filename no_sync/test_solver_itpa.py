@@ -3,13 +3,15 @@ Minimal split-rational NEP experiment for superSolver3 with ITPAEq.
 """
 
 from pathlib import Path
+import csv
 import os
 import sys
 
 import numpy as np
-import matplotlib as mpl
 import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.sparse.linalg import norm as sparse_norm
+from scipy.spatial.distance import squareform
 import unyt
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import supernova as sn
 from supernova.core.continuum import continuum_crossings, get_knots_clustered_at
+from supernova.core.desc_helper import DESCSolver
 from supernova.core.itpa_benchmark import ITPAEq
 from supernova.core._solver_kernel2 import build_M_at, get_T_sparse
 from supernova.core.solver3 import (
@@ -25,6 +28,11 @@ from supernova.core.solver3 import (
     _project_local_tensor,
     _slice_to_quadrature,
 )
+from no_sync.solver3_plots import (
+    plot_slow_sound_with_eigenmode_extensions,
+    plot_xipsi_eigenpair,
+)
+from no_sync.solver3_analysis import xipsi_effective_kpsi
 
 plt.ion()
 
@@ -38,9 +46,29 @@ NFE = int(os.environ.get("SUPERNOVA_ITPA_NFE", "200"))
 REGULARIZER = float(os.environ.get("SUPERNOVA_ITPA_REGULARIZER", "1e-5"))
 WD_ORIENTATION = os.environ.get("SUPERNOVA_ITPA_WD_ORIENTATION", "stored").lower()
 
+itpa_eigenfunction_comparisons = [
+    {"eigenpair_index": 1, "panel": "A", "codes": None},
+]
+
 
 def _psi_to_rho(equ, psi):
     return np.interp(np.asarray(psi, dtype=float), equ._psi, equ._rho)
+
+
+def _psi_to_rhotor(equ, psi):
+    q_profile = equ("q")
+    q_data = q_profile.data.sel(mpol=0, ntor=0).real
+    psi_q = np.asarray(q_data.x, dtype=float)
+    q = np.asarray(q_data.values, dtype=float)
+    if not (np.all(q > 0.0) or np.all(q < 0.0)):
+        raise ValueError("q must be finite, non-zero, and keep one sign.")
+
+    s_tor = np.zeros_like(psi_q)
+    s_tor[1:] = np.cumsum(
+        0.5 * (q[1:] + q[:-1]) * np.diff(psi_q)
+    )
+    s_tor /= s_tor[-1]
+    return np.sqrt(np.interp(np.asarray(psi, dtype=float), psi_q, s_tor))
 
 
 def _dense_matrix(matrix):
@@ -96,6 +124,95 @@ def _solver3_xipsi_coeffs(result, solver, sb, eigenpair_index):
         )
     state = eigenvector.reshape((n_radial, n_state))
     return eigenvector, state[:, n_modes : 2 * n_modes]
+
+
+def xipsi_kinetic_energy(result, solver, sb, eigenpair_index=0):
+    """
+    Estimate the kinetic energy carried by xi^psi in the simplified limit.
+    """
+    _, xipsi_coeffs = _solver3_xipsi_coeffs(
+        result, solver, sb, eigenpair_index
+    )
+    psi = np.asarray(sb.points_q)
+    xipsi = np.asarray(sb.phi_q) @ xipsi_coeffs
+
+    density = solver.equ.density.data.sel(mpol=0, ntor=0).real.interp(x=psi).values
+    density *= solver.cont.mass.to("kg").v
+    h = solver.equ("h").data.sel(mpol=0, ntor=0).real.interp(x=psi).values
+    q = solver.equ.qprof.data.sel(mpol=0, ntor=0).real.interp(x=psi).values
+    radius = _psi_to_rho(solver.equ, psi) * solver.equ.aminor
+
+    integrand = (
+        density
+        * h
+        * q**2
+        / solver.equ.Baxis**2
+        / radius**2
+        * np.sum(np.abs(xipsi) ** 2, axis=1)
+    )
+    return float(np.sum(np.asarray(sb.weights_q) * integrand))
+
+
+def xipsi_normalized_overlap(result, solver, sb, eigenpair_a, eigenpair_b):
+    """
+    Compute the normalized xi^psi overlap between two eigenpairs.
+    """
+    _, coeffs_a = _solver3_xipsi_coeffs(result, solver, sb, eigenpair_a)
+    _, coeffs_b = _solver3_xipsi_coeffs(result, solver, sb, eigenpair_b)
+    psi = np.asarray(sb.points_q)
+    xipsi_a = np.asarray(sb.phi_q) @ coeffs_a
+    xipsi_b = np.asarray(sb.phi_q) @ coeffs_b
+
+    density = solver.equ.density.data.sel(mpol=0, ntor=0).real.interp(x=psi).values
+    density *= solver.cont.mass.to("kg").v
+    h = solver.equ("h").data.sel(mpol=0, ntor=0).real.interp(x=psi).values
+    q = solver.equ.qprof.data.sel(mpol=0, ntor=0).real.interp(x=psi).values
+    radius = _psi_to_rho(solver.equ, psi) * solver.equ.aminor
+    weight = density * h * q**2 / solver.equ.Baxis**2 / radius**2
+    radial_weight = np.asarray(sb.weights_q) * weight
+
+    overlap_m = np.sum(
+        radial_weight[:, None] * np.conj(xipsi_a) * xipsi_b,
+        axis=0,
+    )
+    integral_a = np.sum(radial_weight[:, None] * np.abs(xipsi_a) ** 2)
+    integral_b = np.sum(radial_weight[:, None] * np.abs(xipsi_b) ** 2)
+    return float(np.abs(np.sum(overlap_m)) / np.sqrt(integral_a * integral_b))
+
+
+def reduce_xipsi_eigenmodes(result, solver, sb, correlation_threshold=0.7):
+    """
+    Keep one representative xi^psi eigenmode from each correlated cluster.
+    """
+    if not 0.0 <= correlation_threshold <= 1.0:
+        raise ValueError("correlation_threshold must be between 0 and 1")
+
+    n_eigenpairs = result.sizes["eigenpair"]
+    if n_eigenpairs < 2:
+        return result
+
+    correlation = np.eye(n_eigenpairs)
+    for eigenpair_a in range(n_eigenpairs):
+        for eigenpair_b in range(eigenpair_a):
+            correlation[eigenpair_a, eigenpair_b] = xipsi_normalized_overlap(
+                result, solver, sb, eigenpair_a, eigenpair_b
+            )
+            correlation[eigenpair_b, eigenpair_a] = correlation[eigenpair_a, eigenpair_b]
+
+    distance = 1.0 - np.clip(correlation, 0.0, 1.0)
+    clusters = fcluster(
+        linkage(squareform(distance, checks=False), method="complete"),
+        t=1.0 - correlation_threshold,
+        criterion="distance",
+    )
+
+    representatives = []
+    for cluster in np.unique(clusters):
+        members = np.flatnonzero(clusters == cluster)
+        cluster_correlation = correlation[np.ix_(members, members)]
+        representatives.append(members[np.argmax(cluster_correlation.sum(axis=1))])
+
+    return result.isel(eigenpair=np.sort(representatives))
 
 
 def summarize_solver3_xipsi_eigenpairs(
@@ -392,305 +509,115 @@ def check_solver3_split_operator_consistency(
     return out
 
 
-def plot_xipsi_eigenpair(
+def plot_itpa_code_eigenfunctions(
     result,
     solver,
     sb,
+    csv_path,
     eigenpair_index=0,
-    mpol=None,
+    panel="A",
+    codes=None,
+    mpol=(9, 10, 11, 12),
     n_plot=512,
 ):
-    """
-    Plot xi^psi for one full-space solver3 eigenvector versus r/a.
+    """Compare one superNOVA eigenmode with the ITPA code eigenfunctions."""
+    rows = []
+    with open(csv_path, newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            if row["panel"] == panel and int(row["m"]) in mpol:
+                if codes is None or row["code"] in codes:
+                    rows.append(row)
 
-    The solver3 full state is ordered as [p1, xi^psi, xi^s, div_xi] for each
-    radial basis coefficient. ``solve_nep_split`` expands reduced BC solves
-    before returning the dataset.
+    if not rows:
+        raise ValueError(f"No CSV eigenfunctions found for panel {panel!r}.")
 
-    If ``mpol`` is None, plot ``|xi^psi_m|`` for every available poloidal
-    harmonic. If ``mpol`` is an integer, plot real/imag/absolute value only for
-    that harmonic. If ``mpol`` is an array, plot ``|xi^psi_m|`` for that subset.
-    """
-    if result.sizes.get("eigenpair", 0) == 0:
-        raise ValueError("No converged eigenpairs are available to plot.")
-
-    n_radial = solver.radialfe.get_ndofs()
-    n_modes = sb.m_range.size
-    n_state = 4 * n_modes
-    eigenvector = result["eigenvector"].isel(eigenpair=eigenpair_index).values
-    if eigenvector.size != n_radial * n_state:
-        raise ValueError(
-            "plot_xipsi_eigenpair expects a full-space eigenvector. "
-            "Check tmp.attrs['eigenvector_space'] and tmp.attrs['full_dofs']."
-        )
-
-    state = eigenvector.reshape((n_radial, n_state))
-    xipsi_coeffs = state[:, n_modes : 2 * n_modes]
-
-    mode_indices = None
-    if mpol is not None:
-        requested_mpol = np.atleast_1d(mpol).astype(int)
-        mode_indices = []
-        missing_mpol = []
-        for m_value in requested_mpol:
-            matches = np.flatnonzero(sb.m_range == m_value)
-            if matches.size == 0:
-                missing_mpol.append(int(m_value))
-            else:
-                mode_indices.append(int(matches[0]))
-        if missing_mpol:
-            raise ValueError(
-                f"Requested mpol={missing_mpol}, but available range is "
-                f"{sb.m_range[0]}..{sb.m_range[-1]}."
-            )
-        mode_indices = np.asarray(mode_indices, dtype=int)
-
-    mesh = solver.radialfe.get_mesh()
-    psi_plot = np.linspace(mesh[0], mesh[-1], n_plot)
-    rho_plot = _psi_to_rho(solver.equ, psi_plot)
-    phi_plot = solver.radialfe.eval_basis(psi_plot)
-    xipsi_all = phi_plot.T @ xipsi_coeffs
-
-    s_value = result["s"].isel(eigenpair=eigenpair_index).values.item()
-    omega_value = result["omega"].isel(eigenpair=eigenpair_index).values.item()
-    residual_value = None
-    if "residual_norm" in result:
-        residual_value = result["residual_norm"].isel(eigenpair=eigenpair_index).values.item()
-    residual_label = "" if residual_value is None else rf", res={residual_value:.1e}"
-
-    fig, ax = plt.subplots()
-
-    if mpol is None:
-        mode_norms = np.linalg.norm(xipsi_all, axis=0)
-        dominant_index = int(np.argmax(mode_norms))
-        norm = mpl.colors.Normalize(vmin=float(sb.m_range.min()), vmax=float(sb.m_range.max()))
-        cmap = plt.get_cmap("viridis")
-        for ii, m_value in enumerate(sb.m_range):
-            linewidth = 2.0 if ii == dominant_index else 0.9
-            alpha = 1.0 if ii == dominant_index else 0.75
-            ax.plot(
-                rho_plot,
-                xipsi_all[:, ii].real,
-                color=cmap(norm(float(m_value))),
-                lw=linewidth,
-                alpha=alpha,
-            )
-            ax.plot(
-                rho_plot,
-                xipsi_all[:, ii].imag,
-                color=cmap(norm(float(m_value))),
-                lw=linewidth,
-                ls='--',
-                alpha=alpha,
-            )
-
-
-        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax)
-        cbar.set_label(r"$m$")
-        ax.set_ylabel(r"$|\xi^\psi_m(r/a)|$")
-        ax.set_title(
-            rf"eigenpair {eigenpair_index}, all $m$; dominant $m={int(sb.m_range[dominant_index])}$, "
-            rf"$s={s_value:.4g}$, $\omega={omega_value:.4g}$"
-            rf"{residual_label}"
-        )
-    elif mode_indices.size == 1:
-        mode_index = int(mode_indices[0])
-        xipsi = xipsi_all[:, mode_index]
-        ax.plot(rho_plot, xipsi.real, label=r"$\Re\,\xi^\psi$")
-        ax.plot(rho_plot, xipsi.imag, "--", label=r"$\Im\,\xi^\psi$")
-        ax.plot(rho_plot, np.abs(xipsi), ":", label=r"$|\xi^\psi|$")
-        ax.set_ylabel(r"$\xi^\psi_m(r/a)$")
-        ax.set_title(
-            rf"eigenpair {eigenpair_index}, $m={int(sb.m_range[mode_index])}$, "
-            rf"$s={s_value:.4g}$, $\omega={omega_value:.4g}$"
-            rf"{residual_label}"
-        )
-        ax.legend()
-    else:
-        mode_norms = np.linalg.norm(xipsi_all[:, mode_indices], axis=0)
-        dominant_local = int(np.argmax(mode_norms))
-        dominant_index = int(mode_indices[dominant_local])
-        selected_m = sb.m_range[mode_indices]
-        norm = mpl.colors.Normalize(vmin=float(selected_m.min()), vmax=float(selected_m.max()))
-        cmap = plt.get_cmap("viridis")
-        for mode_index in mode_indices:
-            m_value = sb.m_range[mode_index]
-            linewidth = 2.0 if mode_index == dominant_index else 0.9
-            alpha = 1.0 if mode_index == dominant_index else 0.75
-            ax.plot(
-                rho_plot,
-                xipsi_all[:, mode_index].real,
-                color=cmap(norm(float(m_value))),
-                lw=linewidth,
-                alpha=alpha,
-            )
-            ax.plot(
-                rho_plot,
-                xipsi_all[:, mode_index].imag,
-                color=cmap(norm(float(m_value))),
-                lw=linewidth,
-                ls='--',
-                alpha=alpha,
-            )
-        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax)
-        cbar.set_label(r"$m$")
-        ax.set_ylabel(r"$|\xi^\psi_m(r/a)|$")
-        ax.set_title(
-            rf"eigenpair {eigenpair_index}, selected $m$; dominant $m={int(sb.m_range[dominant_index])}$, "
-            rf"$s={s_value:.4g}$, $\omega={omega_value:.4g}$"
-            rf"{residual_label}"
-        )
-
-    ax.set_xlabel(r"$r/a$")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    return fig, ax
-
-
-def _omega_norm_to_frequency_khz(omega_norm, solver):
-    """
-    Convert normalized angular frequency omega/omega_A to cyclic kHz.
-    """
-    omega_norm = np.asarray(omega_norm, dtype=np.complex128)
-    omega_unit = unyt.Unit("omegaA", registry=solver.equ.registry)
-    return (omega_norm.real * omega_unit).to("kHz").v / (2 * np.pi)
-
-
-def _search_frequency_band_khz(region, solver):
-    """
-    Project the real-axis part of an s=omega^2 ellipse to positive frequency.
-    """
-    center = complex(region["center"])
-    radius = float(region["radius"])
-    s_left = max(0.0, center.real - radius)
-    s_right = max(0.0, center.real + radius)
-    omega_band = np.sqrt([s_left, s_right])
-    return _omega_norm_to_frequency_khz(omega_band, solver)
-
-
-def _xipsi_envelope_for_eigenpair(result, solver, sb, eigenpair_index, psi_plot):
-    """
-    Return the radial xi^psi envelope summed over all poloidal harmonics.
-    """
-    n_radial = solver.radialfe.get_ndofs()
-    n_modes = sb.m_range.size
-    n_state = 4 * n_modes
-    eigenvector = result["eigenvector"].isel(eigenpair=eigenpair_index).values
-    if eigenvector.size != n_radial * n_state:
-        raise ValueError(
-            "The continuum/eigenmode overlay expects full-space eigenvectors. "
-            "Check tmp.attrs['eigenvector_space'] and tmp.attrs['full_dofs']."
-        )
-
-    state = eigenvector.reshape((n_radial, n_state))
-    xipsi_coeffs = state[:, n_modes : 2 * n_modes]
-    phi_plot = solver.radialfe.eval_basis(psi_plot)
-    xipsi_all = phi_plot.T @ xipsi_coeffs
-    return np.linalg.norm(xipsi_all, axis=1)
-
-
-def plot_slow_sound_with_eigenmode_extensions(
-    result,
-    solver,
-    sb,
-    psi_continuum,
-    slow_sound,
-    region=None,
-    extension_threshold=0.2,
-    n_plot=512,
-    max_eigenpairs=None,
-):
-    """
-    Plot the slow-sound continuum with NEP eigenmode frequencies and radial extent.
-
-    The mode extent is the interval where the all-m xi^psi envelope exceeds
-    ``extension_threshold`` times its peak.
-    """
-    if result.sizes.get("eigenpair", 0) == 0:
-        raise ValueError("No converged eigenpairs are available to plot.")
-
-    psi_continuum = np.asarray(psi_continuum, dtype=float)
-    rho_continuum = _psi_to_rho(solver.equ, psi_continuum)
-    slow_sound_khz = np.sqrt(slow_sound.real).to("kHz").v / (2 * np.pi)
-
-    fig, ax = plt.subplots()
-    continuum_label = "slow sound continuum"
-    for branch in range(slow_sound_khz.shape[1]):
-        ax.plot(
-            rho_continuum,
-            slow_sound_khz[:, branch],
-            color="0.65",
-            lw=0.8,
-            alpha=0.75,
-            label=continuum_label if branch == 0 else None,
-        )
-
-    if region is not None:
-        fmin, fmax = _search_frequency_band_khz(region, solver)
-        ax.axhspan(fmin, fmax, color="tab:orange", alpha=0.18, label="NEP search band")
-
-    mesh = solver.radialfe.get_mesh()
-    psi_plot = np.linspace(mesh[0], mesh[-1], n_plot)
-    rho_plot = _psi_to_rho(solver.equ, psi_plot)
-    n_eigenpairs = result.sizes["eigenpair"]
-    if max_eigenpairs is not None:
-        n_eigenpairs = min(n_eigenpairs, int(max_eigenpairs))
-
-    colors = plt.get_cmap("tab10")(np.linspace(0.0, 1.0, max(1, n_eigenpairs)))
-    for eigenpair_index in range(n_eigenpairs):
-        envelope = _xipsi_envelope_for_eigenpair(result, solver, sb, eigenpair_index, psi_plot)
-        peak = float(np.max(envelope))
-        if peak == 0.0:
-            continue
-
-        active = envelope >= extension_threshold * peak
-        if not np.any(active):
-            continue
-
-        active_rho = rho_plot[active]
-        peak_rho = rho_plot[int(np.argmax(envelope))]
-        omega_value = result["omega"].isel(eigenpair=eigenpair_index).values.item()
-        frequency_khz = float(_omega_norm_to_frequency_khz(omega_value, solver))
-        residual = result["residual_norm"].values[eigenpair_index] if "residual_norm" in result else np.nan
-        label = rf"NEP $k={eigenpair_index}$, res={residual:.1e}"
-        color = colors[eigenpair_index]
-
-        ax.hlines(
-            frequency_khz,
-            active_rho[0],
-            active_rho[-1],
-            color=color,
-            lw=2.5,
-            label=label,
-        )
-        ax.plot(peak_rho, frequency_khz, "o", color=color, ms=4)
-
-    ax.set_xlabel(r"$r/a$")
-    ax.set_ylabel("Frequency (kHz)")
-    extension_percent = 100 * extension_threshold
-    ax.set_title(
-        rf"Slow-sound continuum and NEP mode extensions "
-        rf"($|\xi^\psi|$ > {extension_percent:.0f}% peak)"
+    _, xipsi_coeffs = _solver3_xipsi_coeffs(
+        result, solver, sb, eigenpair_index
     )
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize="small")
+    mode_indices = []
+    for m_value in mpol:
+        matches = np.flatnonzero(sb.m_range == m_value)
+        if matches.size == 0:
+            raise ValueError(f"m={m_value} is outside the solver harmonic range.")
+        mode_indices.append(int(matches[0]))
+
+    mesh = solver.radialfe.get_mesh()
+    psi_plot = np.linspace(mesh[0], mesh[-1], n_plot)
+    rho_tor = _psi_to_rhotor(solver.equ, psi_plot)
+    xipsi = solver.radialfe.eval_basis(psi_plot).T @ xipsi_coeffs
+    psi_geometry = solver.equ.magspace.psi.values
+    R_geometry = solver.equ.magspace["R"].values
+    z_geometry = solver.equ.magspace["z"].values
+    z_axis = np.mean(z_geometry[0])
+    r_geometry = np.mean(
+        np.sqrt(
+            (R_geometry - solver.equ.Rmajor) ** 2
+            + (z_geometry - z_axis) ** 2
+        ),
+        axis=1,
+    )
+    r_minor = np.interp(psi_plot, psi_geometry, r_geometry)
+    xipsi_over_r = np.divide(
+        xipsi,
+        r_minor[:, None],
+        out=np.zeros_like(xipsi),
+        where=r_minor[:, None] != 0.0,
+    )
+    xipsi_over_r[0] = 0.0
+    xipsi_over_r = np.abs(xipsi_over_r[:, mode_indices])
+    xipsi_over_r /= np.max(xipsi_over_r)
+
+    code_names = list(dict.fromkeys(row["code"] for row in rows))
+    code_colors = dict(zip(code_names, plt.get_cmap("tab10").colors))
+    line_styles = {"solid": "-", "dashed": "--", "dotted": ":"}
+    fig, axes = plt.subplots(len(mpol), 1, sharex=True, figsize=(7, 8))
+    axes = np.atleast_1d(axes)
+
+    for mode_column, (ax, m_value) in enumerate(zip(axes, mpol)):
+        for code in code_names:
+            code_rows = [
+                row for row in rows
+                if row["code"] == code and int(row["m"]) == m_value
+            ]
+            if not code_rows:
+                continue
+            ax.plot(
+                [float(row["sqrt_s"]) for row in code_rows],
+                [float(row["normalized_amplitude"]) for row in code_rows],
+                line_styles.get(code_rows[0]["line_style"], "-"),
+                color=code_colors[code],
+                label=code,
+            )
+        ax.plot(
+            rho_tor,
+            xipsi_over_r[:, mode_column],
+            color="black",
+            lw=1.5,
+            ls=":",
+            label=f"superNOVA eigenpair {eigenpair_index}",
+        )
+        ax.set_ylabel(rf"$m={m_value}$")
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(True, alpha=0.25)
+
+    axes[0].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    axes[-1].set_xlabel(r"$\rho_{\rm tor}$")
+    fig.suptitle(
+        rf"ITPA eigenfunctions, panel {panel}: normalized $|\xi^\psi_m/r|$"
+    )
     fig.tight_layout()
-    return fig, ax
+    return fig, axes
 
 
 # %% Configuration.
-species = "D"
+species = "H"
 gamma_s = 5 / 3
 ntor = 6
 mmax = 50
-nfe = NFE
+nfe = 50
 order = 3
-antenna_freq = 47.5
-freq_window = [antenna_freq - 10., antenna_freq + 10-0]  # kHz
+antenna_freq = 68.0
+freq_window = [antenna_freq - 10., antenna_freq + 10]  # kHz
 
 aminor = 1.0 * unyt.m
 Rmajor = 10.0 * unyt.m
@@ -712,8 +639,52 @@ equ = ITPAEq(
     m_max=mmax,
 )
 
+theta = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
+equ_desc = DESCSolver(
+    LCFS={
+        "R": Rmajor + aminor * np.cos(theta),
+        "Z": aminor * np.sin(theta),
+        "theta": theta,
+    },
+    Baxis=B0,
+    q=equ.qprof,
+    density=equ.density,
+    pressure=equ.pressure,
+    m_max=mmax,
+    boundary_m_max=1,
+    desc_resolution=(10, 10),
+    mag_resolution=(ns, ntheta),
+).solve()
+
 fig_equ, ax_equ = equ.plot_summary()
-cont = sn.superContinuum(equ, gamma_s=gamma_s, species=species, dense=True)
+
+R_desc = equ_desc.magspace["R"].values
+z_desc = equ_desc.magspace["z"].values
+rho_desc = np.mean(
+    np.sqrt((R_desc - Rmajor.to("m").value) ** 2 + z_desc**2), axis=1
+) / aminor.to("m").value
+
+ax_equ[0, 0].plot(rho_desc, equ_desc.magspace["q"], "--", label="q DESC")
+ax_equ[0, 0].legend()
+ax_equ[0, 1].plot(
+    rho_desc,
+    equ_desc.magspace["pressure"] / 1.0e3,
+    "--",
+    color="tab:red",
+    label="pressure DESC",
+)
+ax_equ[0, 1].legend()
+for ii in np.linspace(0, R_desc.shape[0] - 1, 8, dtype=int):
+    ax_equ[1, 0].plot(
+        np.r_[R_desc[ii], R_desc[ii, 0]],
+        np.r_[z_desc[ii], z_desc[ii, 0]],
+        "--",
+        color="tab:blue",
+        lw=0.9,
+    )
+ax_equ[1, 0].set_title("magnetic-coordinate grid (DESC dashed)")
+
+cont = sn.superContinuum(equ_desc, gamma_s=gamma_s, species=species, dense=True)
 
 # %% Continuum guide for radial knots.
 x = np.linspace(0.0, 1.0, 1000)
@@ -767,7 +738,7 @@ ax.plot(_psi_to_rho(equ, xB0), omega_TAE.to("kHz").v, ":", color="0.5", lw=1.0, 
 # knots = get_knots_clustered_at(crossings, nfe, threshold=0.1)
 knots = np.linspace(0.0, 1.0, nfe + 1)  # Uniform knots for testing.
 radialfe = sn.BSplineFE(knots=knots, order=order, domain=[0, 1], quad_order=6)
-solver = sn.superSolver3(equ, cont, radialfe=radialfe)
+solver = sn.superSolver3(equ_desc, cont, radialfe=radialfe)
 
 freq_window = unyt.unyt_array(freq_window, "kHz", registry=solver.equ.registry)
 omega_window = freq_window.to("omegaA").v * 2 * np.pi
@@ -863,30 +834,63 @@ fig_cont_nep, ax_cont_nep = plot_slow_sound_with_eigenmode_extensions(
     extension_threshold=0.67,
 )
 
-reference_eigenpair = min(9, tmp.sizes["eigenpair"] - 1)
 # %%
 fig_xipsi, ax_xipsi = plot_xipsi_eigenpair(
     tmp,
     solver,
     sb,
-    eigenpair_index=0,
+    eigenpair_index=5,
     mpol=None,
+    field="xi^psi",
 )
 
-# %% Solving using the CISS pathway
-if RUN_CISS:
-    tmp = solver.solve_nep_split_ciss(
-        ntor=ntor,
-        target_omega=target_omega,
-        max_dm=5,
-        regularizer=1e-4,
-        apply_bcs=True,
-        bc_kind=bc_kind,
-        region=region,
-        verbose=True,
-        nev=20,
-        max_eigenpairs=20,
-        compute_residuals=True,
-        ciss_sizes={"ip": 32, "bs": 16, "ms": 4, "bsmax": 64},
-        ciss_extraction="RITZ",
-    )
+# xipsi_energy = xipsi_kinetic_energy(tmp, solver, sb, eigenpair_index=2)
+# print(f"xi^psi kinetic-energy diagnostic: {xipsi_energy:.6e}")
+
+# kpsieff = np.zeros(tmp.sizes["eigenpair"], dtype=float)
+# for eigenpair_index in range(tmp.sizes["eigenpair"]):
+#     kpsieff[eigenpair_index] = xipsi_effective_kpsi(tmp, solver, sb, eigenpair_index=eigenpair_index)
+
+# fig, ax = plt.subplots()
+# ax.semilogy(np.arange(tmp.sizes["eigenpair"]), kpsieff, "o-")
+# ax.axhline(2*np.pi*nfe*order, color='black', ls='--', lw=1.0, label=r"$2\pi N_\mathrm{fe}$")
+# ax.legend()
+
+# xipsi_overlap = xipsi_normalized_overlap(
+#     tmp, solver, sb, eigenpair_a=3, eigenpair_b=5
+# )
+# print(f"xi^psi normalized overlap (3, 5): {xipsi_overlap*100:.2f}%")
+
+# n_eigenpairs = tmp.sizes["eigenpair"]
+# overlap_matrix = np.full((n_eigenpairs, n_eigenpairs), np.nan)
+# for eigenpair_a in range(n_eigenpairs):
+#     for eigenpair_b in range(eigenpair_a + 1):
+#         overlap_matrix[eigenpair_a, eigenpair_b] = xipsi_normalized_overlap(
+#             tmp, solver, sb, eigenpair_a, eigenpair_b
+#         )
+
+# %% Discover self-similar modes.
+# Applying a mask to discover self-similar modes.
+# correlation_threshold = 1.
+# tmp_reduced = reduce_xipsi_eigenmodes(
+#     tmp, solver, sb, correlation_threshold=correlation_threshold
+# )
+# print("representative eigenpairs:", tmp_reduced["eigenpair"].values)
+
+# mask = np.abs(overlap_matrix) < correlation_threshold
+# overlap_matrix[mask] = np.nan
+# overlap_matrix[np.diag_indices(n_eigenpairs)] = np.nan  # Self-overlap is always 1.0.
+
+# fig_overlap, ax_overlap = plt.subplots()
+# overlap_image = ax_overlap.imshow(overlap_matrix, vmin=0.0, vmax=1.0, cmap="viridis")
+# fig_overlap.colorbar(overlap_image, ax=ax_overlap, label=r"normalized overlap")
+# ax_overlap.set_xlabel("eigenpair b")
+# ax_overlap.set_ylabel("eigenpair a")
+# ax_overlap.set_xticks(np.arange(n_eigenpairs))
+# ax_overlap.set_yticks(np.arange(n_eigenpairs))
+# fig_overlap.tight_layout()
+
+# %% Comparison to codes.
+plot_itpa_code_eigenfunctions(tmp, solver, sb,
+                              "/home/pablooyola/Desktop/Pablo/codes/superNOVA_2/no_sync/konies2018_figure5_eigenfunctions.csv",
+                              eigenpair_index=3, panel="A", codes=None)
