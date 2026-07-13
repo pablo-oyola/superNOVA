@@ -578,6 +578,21 @@ class SplitRationalNEPSolver:
         rg.setFromOptions()
         return rg
 
+    def destroy(self):
+        """Destroy SLEPc/PETSc objects in ownership order."""
+        if getattr(self, "nep", None) is not None:
+            self.nep.destroy()
+            self.nep = None
+        if getattr(self, "rg", None) is not None:
+            self.rg.destroy()
+            self.rg = None
+        for fn in getattr(self, "fns", []):
+            fn.destroy()
+        self.fns = []
+        for mat in getattr(self, "mats", []):
+            mat.destroy()
+        self.mats = []
+
     def solve(self, max_eigenpairs: int | None = None) -> NEPResult:
         """
         Solve the split NEP and return converged eigenpairs.
@@ -604,30 +619,35 @@ class SplitRationalNEPSolver:
         real_scalars = not np.issubdtype(np.dtype(petsc.ScalarType), np.complexfloating)
         vi = self.mats[0].createVecRight() if real_scalars else None
 
-        for ii in range(nout):
-            eigenvalues[ii] = self.nep.getEigenpair(ii, vr, vi) + self.spectral_shift
-            eigenvector = _vec_read_array(vr).astype(np.complex128, copy=True)
-            if vi is not None:
-                eigenvector += 1.0j * _vec_read_array(vi)
-            eigenvectors[ii] = eigenvector
+        try:
+            for ii in range(nout):
+                eigenvalues[ii] = self.nep.getEigenpair(ii, vr, vi) + self.spectral_shift
+                eigenvector = _vec_read_array(vr).astype(np.complex128, copy=True)
+                if vi is not None:
+                    eigenvector += 1.0j * _vec_read_array(vi)
+                eigenvectors[ii] = eigenvector
 
-            if self.compute_residuals:
-                abs_norm, rel_norm = _split_residual_norm(
-                    self.T0,
-                    self.T1,
-                    self.Tminus1,
-                    eigenvalues[ii],
-                    eigenvector,
+                if self.compute_residuals:
+                    abs_norm, rel_norm = _split_residual_norm(
+                        self.T0,
+                        self.T1,
+                        self.Tminus1,
+                        eigenvalues[ii],
+                        eigenvector,
+                    )
+                    self.last_absolute_residual_norms[ii] = abs_norm
+                    self.last_residual_norms[ii] = rel_norm
+
+                self._vprint(
+                    f"  eigenpair[{ii}]: "
+                    f"s={_format_complex(eigenvalues[ii])}, "
+                    f"omega={_format_complex(np.sqrt(eigenvalues[ii]))}, "
+                    f"residual={self.last_residual_norms[ii]:.3e}"
                 )
-                self.last_absolute_residual_norms[ii] = abs_norm
-                self.last_residual_norms[ii] = rel_norm
-
-            self._vprint(
-                f"  eigenpair[{ii}]: "
-                f"s={_format_complex(eigenvalues[ii])}, "
-                f"omega={_format_complex(np.sqrt(eigenvalues[ii]))}, "
-                f"residual={self.last_residual_norms[ii]:.3e}"
-            )
+        finally:
+            vr.destroy()
+            if vi is not None:
+                vi.destroy()
 
         return NEPResult(
             eigenvalues=eigenvalues,
@@ -1265,7 +1285,7 @@ class superSolver3(superSolver2):
             compute_residuals=compute_residuals,
         )
         result = nep.solve(max_eigenpairs=max_eigenpairs)
-        return self._split_result_dataset(
+        dataset = self._split_result_dataset(
             result=result,
             nep=nep,
             ntor=ntor,
@@ -1284,6 +1304,8 @@ class superSolver3(superSolver2):
             nep_type="NLEIGS",
             description="SLEPc NLEIGS split-rational NEP solution of sparse solver3 T(s) x = 0.",
         )
+        nep.destroy()
+        return dataset
 
     def solve_nep_split_ciss(
         self,
