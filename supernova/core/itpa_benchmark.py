@@ -5,6 +5,7 @@ import unyt
 import xarray as xr
 
 from supernova import Profile, superEquilibrium
+from .equilibrium import _axisymmetric_cylindrical_local_shear
 
 
 class ITPAEq(superEquilibrium):
@@ -528,7 +529,7 @@ class ITPAEq(superEquilibrium):
         d_r_btheta_dr = np.gradient(r_btheta, r_minor, axis=0, edge_order=2)
         mu0 = unyt.mu_0.to("N/A**2").value
         jR = np.zeros_like(R)
-        jphi = d_r_btheta_dr / (mu0 * r_safe)
+        jphi = -d_r_btheta_dr / (mu0 * r_safe)
         jZ = np.zeros_like(R)
         sR = Bphi * psi_prime * sin_theta
         sphi = psi_prime * Btheta
@@ -536,11 +537,25 @@ class ITPAEq(superEquilibrium):
         J_B = jR * BR + jphi * Bphi + jZ * BZ
         J_diag = jR * sR + jphi * sphi + jZ * sZ
 
-        Atheta = Bphi / psi_prime_safe
-        Aphi = 1.0 / R
-        r_Atheta = r * Atheta
-        d_r_Atheta_dr = np.gradient(r_Atheta, r_minor, axis=0, edge_order=2)
-        shear = Aphi * d_r_Atheta_dr / r_safe
+        A = np.array(
+            [
+                Bphi / psi_prime_safe * sin_theta,
+                1.0 / R,
+                -Bphi / psi_prime_safe * cos_theta,
+            ]
+        )
+
+        def d_dR(values):
+            d_dr = np.gradient(values, r_minor, axis=0, edge_order=2)
+            d_dtheta = self._periodic_theta_derivative(values, theta)
+            return cos_theta * d_dr - sin_theta / r_safe * d_dtheta
+
+        def d_dZ(values):
+            d_dr = np.gradient(values, r_minor, axis=0, edge_order=2)
+            d_dtheta = self._periodic_theta_derivative(values, theta)
+            return sin_theta * d_dr + cos_theta / r_safe * d_dtheta
+
+        shear = _axisymmetric_cylindrical_local_shear(A, R, d_dR, d_dZ)
 
         d_rR_over_psi_prime_dr = (
             (R + r * cos_theta) * psi_prime_safe - r * R * psi_second
