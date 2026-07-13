@@ -2,13 +2,14 @@
 Implements the B-Spline as a possible radial finite element.
 """
 
+from dataclasses import dataclass
 import numpy as np
 import matplotlib.pyplot as plt
 
 from typing import List, Optional, Tuple
 from .base import RadialFE
 from scipy.interpolate import BSpline
-from scipy.sparse import lil_matrix
+from scipy.sparse import coo_matrix, csr_matrix, lil_matrix
 from numpy.polynomial.legendre import leggauss
 # from scipy.sparse import linalg
 from scipy.sparse.linalg import spsolve
@@ -395,3 +396,81 @@ class BSplineFE(RadialFE):
 
     def get_ndofs(self) -> int:
         return self.dofs
+
+
+@dataclass(frozen=True)
+class CompatibleBSplinePair:
+    """Compatible high/low B-spline spaces for a first derivative.
+
+    The lower space has degree one below ``high`` and uses the trimmed knot
+    vector ``high.knots[1:-1]``.  ``derivative`` maps coefficients in the
+    high space to coefficients of their exact derivative in the low space.
+    """
+
+    high: BSplineFE
+    low: BSplineFE
+    derivative: csr_matrix
+
+    @classmethod
+    def from_high(cls, high: BSplineFE) -> "CompatibleBSplinePair":
+        """Construct the compatible lower space and coefficient derivative."""
+        if not isinstance(high, BSplineFE):
+            raise TypeError("high must be a BSplineFE instance")
+        if high.degree < 2:
+            raise ValueError("The high-order space must have degree >= 2.")
+
+        n_high = high.get_ndofs()
+        n_low_expected = n_high - 1
+        degree = high.degree
+        knots = high.knots
+        indices = np.arange(n_low_expected)
+        denominators = knots[indices + degree + 1] - knots[indices + 1]
+        if np.any(~np.isfinite(denominators)) or np.any(denominators <= 0.0):
+            raise ValueError(
+                "The high-space knots do not define positive derivative "
+                "denominators."
+            )
+
+        low = BSplineFE(
+            knots=knots[1:-1],
+            order=high.order - 1,
+            domain=(knots[0], knots[-1]),
+            quad_order=high.quadrature_order,
+        )
+
+        n_low = low.get_ndofs()
+        if n_low != n_low_expected:
+            raise RuntimeError(
+                "Expected n_low=n_high-1, got "
+                f"n_high={n_high}, n_low={n_low}."
+            )
+
+        alpha = degree / denominators
+        rows = np.repeat(np.arange(n_low), 2)
+        cols = np.column_stack(
+            (np.arange(n_low), np.arange(1, n_low + 1))
+        ).ravel()
+        data = np.column_stack((-alpha, alpha)).ravel()
+        derivative = coo_matrix(
+            (data, (rows, cols)),
+            shape=(n_low, n_high),
+        ).tocsr()
+
+        points, _ = high.get_quadrature_points()
+        high_derivative = high.eval_basis_derivative(points)
+        compatible_derivative = derivative.T @ low.eval_basis(points)
+        if not np.allclose(
+            high_derivative,
+            compatible_derivative,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            max_error = np.max(
+                np.abs(high_derivative - compatible_derivative)
+            )
+            raise RuntimeError(
+                "Compatible B-spline derivative identity failed: "
+                f"max error={max_error:.3e}."
+            )
+
+        return cls(high=high, low=low, derivative=derivative)
