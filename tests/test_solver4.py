@@ -407,3 +407,45 @@ def test_solver4_rejects_rectangular_nep_inputs_before_petsc(
 def test_supernova_exports_solver4_without_replacing_solver3():
     assert supernova.superSolver4 is superSolver4
     assert supernova.superSolver3 is not supernova.superSolver4
+
+
+def test_solver4_configures_qr_before_internal_nleigs_options():
+    events = []
+
+    class FakePC:
+        kind = "lu"
+
+        def setType(self, kind):
+            events.append(("pc.setType", kind))
+            self.kind = kind
+
+        def getType(self):
+            return self.kind
+
+    class FakeKSP:
+        pc = FakePC()
+
+        def getPC(self):
+            return self.pc
+
+        def setFromOptions(self):
+            events.append(("ksp.setFromOptions", None))
+            self.pc.kind = "mumps"
+
+        def getOptionsPrefix(self):
+            return "solver4_nep_nleigs_"
+
+        def getType(self):
+            return "preonly"
+
+    ksp = FakeKSP()
+    wrapper = SimpleNamespace(
+        nep=SimpleNamespace(getNLEIGSKSPs=lambda: [ksp]),
+        _vprint=lambda message: events.append(("verbose", message)),
+    )
+
+    superSolver4._configure_nleigs_shift_solvers(wrapper)
+
+    assert events[0] == ("pc.setType", "qr")
+    assert events[1] == ("ksp.setFromOptions", None)
+    assert ksp.pc.getType() == "mumps"

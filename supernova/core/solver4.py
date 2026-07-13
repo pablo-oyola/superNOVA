@@ -489,7 +489,7 @@ class superSolver4(superSolver3):
     ) -> SplitRationalNEPSolver:
         """Build NLEIGS only for the square full-BC mixed operator."""
         self._require_full_bc_nep(apply_bcs, bc_kind)
-        return super().build_split_nep_solver(
+        nep = super().build_split_nep_solver(
             ntor=ntor,
             target_omega=target_omega,
             region=region,
@@ -509,6 +509,28 @@ class superSolver4(superSolver3):
             verbose=verbose,
             compute_residuals=compute_residuals,
         )
+        self._configure_nleigs_shift_solvers(nep)
+        return nep
+
+    @staticmethod
+    def _configure_nleigs_shift_solvers(nep: SplitRationalNEPSolver) -> None:
+        """Use QR for NLEIGS shift solves unless PETSc options override it.
+
+        One-sided mixed reduction does not guarantee a nonzero in every
+        natural-order diagonal position even when the square matrix has a
+        valid structural matching.  PETSc's natural-order LU rejects that
+        pattern before numerical factorization, whereas QR supports the mixed
+        ordering directly.  Calling ``setFromOptions`` last preserves an
+        explicit user choice for the internal KSP/PC.
+        """
+        for ksp in nep.nep.getNLEIGSKSPs():
+            ksp.getPC().setType("qr")
+            ksp.setFromOptions()
+            nep._vprint(
+                "[superSolver4] configured NLEIGS mixed shift solve: "
+                f"prefix={ksp.getOptionsPrefix()!r}, ksp={ksp.getType()}, "
+                f"pc={ksp.getPC().getType()}"
+            )
 
     def build_split_ciss_solver(
         self,
