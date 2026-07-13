@@ -8,8 +8,9 @@ import xarray as xr
 from scipy.constants import mu_0
 from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import CubicSpline
+from scipy.optimize import least_squares
 
-from ..radial.profile import Profile, decompose2d
+from ..radial.profile import Profile
 from .desc_loader import *
 from .equilibrium import superEquilibrium
 
@@ -38,42 +39,157 @@ def _rho_tor_from_q(psipol, q):
     return np.sqrt(psitor)
 
 
-def _fit_lcfs(R, Z, theta, mmax=10):
-    """Fit the LCFS using DESC's clockwise poloidal angle."""
-    theta_desc = np.mod(-theta, 2 * np.pi)
+def _miller_angle(R, Z):
+    """Fit a nonlinear Miller angle to a closed R-Z contour."""
+    Rcenter = 0.5 * (R.max() + R.min())
+    Zcenter = 0.5 * (Z.max() + Z.min())
+    aminor = 0.5 * (R.max() - R.min())
+    bminor = 0.5 * (Z.max() - Z.min())
+    theta = np.mod(
+        np.arctan2((Z - Zcenter) / bminor, (R - Rcenter) / aminor),
+        2 * np.pi,
+    )
+    order = np.argsort(theta)
+    Rfit, Zfit, theta_fit = R[order], Z[order], theta[order]
+
+    def residual(values):
+        R0, Z0, a, kappa, delta = values[:5]
+        angle = values[5:]
+        alpha = np.arcsin(delta)
+        return np.r_[
+            R0 + a * np.cos(angle + alpha * np.sin(angle)) - Rfit,
+            Z0 + kappa * a * np.sin(angle) - Zfit,
+        ]
+
+    initial = np.r_[Rcenter, Zcenter, aminor, bminor / aminor, 0.3, theta_fit]
+    lower = np.r_[R.min(), Z.min(), 0.3 * aminor, 0.5, -0.9, theta_fit - 0.8]
+    upper = np.r_[R.max(), Z.max(), 1.7 * aminor, 3.0, 0.9, theta_fit + 0.8]
+    result = least_squares(
+        residual,
+        initial,
+        bounds=(lower, upper),
+        x_scale="jac",
+        max_nfev=3000,
+    )
+    angle = np.empty_like(theta)
+    angle[order] = result.x[5:]
+    return np.mod(angle, 2 * np.pi)
+
+
+def _spectral_condensation_angle(R, Z, theta, mmax, kmax):
+    """Minimize the boundary Fourier residual with a monotonic angle map."""
+    if kmax == 0:
+        return theta
+
+    def design(angle):
+        columns = [np.ones_like(angle)]
+        for m in range(1, mmax + 1):
+            columns.extend((np.cos(m * angle), np.sin(m * angle)))
+        return np.column_stack(columns)
+
+    dense_angle = np.linspace(0.0, 2 * np.pi, 2048, endpoint=False)
+
+    def corrected(coefficients, angle):
+        output = angle.copy()
+        for k in range(1, kmax + 1):
+            output += coefficients[2 * k - 2] * np.sin(k * angle)
+            output += coefficients[2 * k - 1] * np.cos(k * angle)
+        return output
+
+    def derivative(coefficients, angle):
+        output = np.ones_like(angle)
+        for k in range(1, kmax + 1):
+            output += k * coefficients[2 * k - 2] * np.cos(k * angle)
+            output -= k * coefficients[2 * k - 1] * np.sin(k * angle)
+        return output
+
+    def residual(coefficients):
+        angle = corrected(coefficients, theta)
+        matrix = design(angle)
+        Rfit = matrix @ np.linalg.lstsq(matrix, R, rcond=None)[0]
+        Zfit = matrix @ np.linalg.lstsq(matrix, Z, rcond=None)[0]
+        monotonicity = 10.0 * np.minimum(
+            derivative(coefficients, dense_angle) - 0.15,
+            0.0,
+        )
+        return np.r_[Rfit - R, Zfit - Z, monotonicity]
+
+    result = least_squares(
+        residual,
+        np.zeros(2 * kmax),
+        max_nfev=1500,
+    )
+    return np.mod(corrected(result.x, theta), 2 * np.pi)
+
+
+def _fit_lcfs(R, Z, theta, mmax=10, kmax=4):
+    """Fit the LCFS using a spectrally condensed clockwise angle."""
+    condensed_theta = _spectral_condensation_angle(
+        R,
+        Z,
+        _miller_angle(R, Z),
+        mmax,
+        kmax,
+    )
+    theta_origin = np.argmin(np.abs(np.angle(np.exp(1j * theta))))
+    condensed_theta = np.mod(
+        condensed_theta - condensed_theta[theta_origin],
+        2 * np.pi,
+    )
+    theta_desc = np.mod(-condensed_theta, 2 * np.pi)
     order = np.argsort(theta_desc)
     theta_desc = theta_desc[order]
-    Rcos, Rsin = decompose2d(R[order][None, :], m_max=mmax, angle=theta_desc)
-    Zcos, Zsin = decompose2d(Z[order][None, :], m_max=mmax, angle=theta_desc)
-
-    R_lmn = np.concatenate((Rcos[0], Rsin[0, 1:]))
-    Z_lmn = np.concatenate((Zcos[0], Zsin[0, 1:]))
-    modes = [(m, 0) for m in range(mmax + 1)]
-    modes += [(-m, 0) for m in range(1, mmax + 1)]
-    return FourierRZToroidalSurface(
-        R_lmn=R_lmn,
-        Z_lmn=Z_lmn,
-        modes_R=modes,
-        modes_Z=modes,
-        NFP=1,
-        sym=False,
+    coords = np.column_stack(
+        (R[order], np.zeros_like(R[order]), Z[order])
+    )
+    surface = FourierRZToroidalSurface.from_values(
+        coords=coords,
+        theta=theta_desc,
         M=mmax,
         N=0,
+        NFP=1,
+        sym=False,
     )
+    return surface, condensed_theta
 
 
-def _make_guesses(equ, psipol, rhotor):
+def _make_guesses(
+    equ,
+    psipol,
+    rhotor,
+    theta_lcfs,
+    theta_condensed,
+    psipol_scale=1.0,
+):
     """Use a few pyCOCOS surfaces as the DESC initial guess."""
     Raxis = float(equ.fluxdata.attrs.get("Raxis", equ.R_axis))
     Zaxis = float(equ.fluxdata.attrs.get("zaxis", equ.z_axis))
     nodes, R_values, Z_values = [], [], []
 
+    order = np.argsort(theta_lcfs)
+    theta_lcfs = theta_lcfs[order]
+    theta_condensed = np.unwrap(theta_condensed[order])
+    theta_lcfs = np.r_[theta_lcfs, theta_lcfs[0] + 2 * np.pi]
+    theta_condensed = np.r_[theta_condensed, theta_condensed[0] + 2 * np.pi]
+
     for x, rho in zip(psipol, rhotor):
-        R, Z = equ.flux_surface(np.sqrt(x))
-        R, Z = np.asarray(R), np.asarray(Z)
+        surface = equ.flux_surface(np.sqrt(psipol_scale * x))
+        R = np.asarray(surface["R"].values, dtype=np.float64)
+        Z = np.asarray(surface["z"].values, dtype=np.float64)
+        if R.size < 4 or Z.size < 4:
+            raise ValueError(f"Could not construct the flux surface at psi_pol={x}.")
         if np.allclose([R[0], Z[0]], [R[-1], Z[-1]]):
             R, Z = R[:-1], Z[:-1]
-        theta = np.mod(-np.unwrap(np.arctan2(Z - Zaxis, R - Raxis)), 2 * np.pi)
+        theta_geom = np.mod(np.arctan2(Z - Zaxis, R - Raxis), 2 * np.pi)
+        theta_geom = np.where(
+            theta_geom < theta_lcfs[0],
+            theta_geom + 2 * np.pi,
+            theta_geom,
+        )
+        theta = np.mod(
+            -np.interp(theta_geom, theta_lcfs, theta_condensed),
+            2 * np.pi,
+        )
         order = np.argsort(theta)
         theta, R, Z = theta[order], R[order], Z[order]
         nodes.append(np.column_stack((np.full_like(theta, rho), theta, np.zeros_like(theta))))
@@ -89,6 +205,27 @@ def _make_guesses(equ, psipol, rhotor):
 
 def _reshape(values, nrho, ntheta):
     return np.asarray(values, dtype=np.float64).reshape(nrho, ntheta)
+
+
+def _local_magnetic_shear_desc(eq, grid):
+    """Compute NOVA local shear using DESC poloidal flux chi in Webers."""
+    data = eq.compute(
+        ["B", "J", "e^rho", "g^rr", "(B*grad) grad(rho)", "chi_r"],
+        grid=grid,
+        basis="xyz",
+    )
+    geometric_part = (
+        mu_0 * np.einsum("...i,...i->...", data["B"], data["J"])
+        / data["g^rr"]
+        - 2.0
+        * np.einsum(
+            "...i,...i->...",
+            np.cross(data["B"], data["e^rho"]),
+            data["(B*grad) grad(rho)"],
+        )
+        / data["g^rr"] ** 2
+    )
+    return -geometric_part / data["chi_r"] ** 2
 
 
 def _to_boozer(values, theta_B, theta):
@@ -131,6 +268,7 @@ class DESCSolver(superEquilibrium):
         vpol: Optional[Profile] = None,
         m_max: int = 128,
         boundary_m_max: int = 10,
+        boundary_k_max: int = 4,
         desc_resolution: tuple[int, int] = (6, 6),
         mag_resolution: tuple[int, int] = (129, 256),
         psi_domain: tuple[float, float] = (0.005, 0.995),
@@ -198,12 +336,15 @@ class DESCSolver(superEquilibrium):
         # rho_tor = sqrt(normalized toroidal flux), obtained by integrating q.
         self.rho_tor_input = _rho_tor_from_q(x, _profile_values(self.qin))
         self.lcfs = {"R": self.Rlcfs, "Z": self.Zlcfs, "theta": self.theta_lcfs}
-        self.lcfs_fit = _fit_lcfs(
+        self.lcfs_fit, self.theta_lcfs_condensed = _fit_lcfs(
             self.Rlcfs,
             self.Zlcfs,
             self.theta_lcfs,
             boundary_m_max,
+            boundary_k_max,
         )
+        self.boundary_m_max = boundary_m_max
+        self.boundary_k_max = boundary_k_max
         self.desc_pressure = SplineProfile(
             _profile_values(self.pressure), knots=self.rho_tor_input, name="p"
         )
@@ -217,6 +358,9 @@ class DESCSolver(superEquilibrium):
         self.mag_resolution = mag_resolution
         self.psi_domain = psi_domain
         self.initial_guess = initial_guess
+        self.initial_guess_psipol_scale = 1.0
+        self.rhop_boundary = 1.0
+        self.psipol_boundary = 1.0
         self.solve_kwargs = solve_kwargs or {}
         self.m_max = abs(m_max)
         self.n_max = 0
@@ -224,10 +368,19 @@ class DESCSolver(superEquilibrium):
         self._cache = {}
 
     @classmethod
-    def from_eqdsk(cls, equ, density: Profile, use_surface_guess=True, **kwargs):
+    def from_eqdsk(
+        cls,
+        equ,
+        density: Profile,
+        use_surface_guess=True,
+        rhop_boundary=1.0,
+        **kwargs,
+    ):
         """Build the same solver from an EQDSK object."""
         if "q" not in equ.gs_profs or "pres" not in equ.gs_profs:
             raise ValueError("The EQDSK must contain q and pressure profiles.")
+        if not 0.0 < rhop_boundary <= 1.0:
+            raise ValueError("rhop_boundary must satisfy 0 < rhop_boundary <= 1.")
 
         # EQDSK profiles are tabulated on rho_pol. Profile.x is normalized
         # poloidal flux, so x = rho_pol**2 before the q-based rho_tor mapping.
@@ -238,36 +391,65 @@ class DESCSolver(superEquilibrium):
             pressure_eqdsk.coords["rhop"], dtype=np.float64
         ) ** 2
         x = density.x
+        psipol_boundary = rhop_boundary**2
+        x_eqdsk = psipol_boundary * x
         q = Profile(
             x=x,
-            F_nm=np.interp(x, q_psipol, q_eqdsk.values),
+            F_nm=np.interp(x_eqdsk, q_psipol, q_eqdsk.values),
             attrs={"name": "q", "units": "1"},
         )
         pressure = Profile(
             x=x,
-            F_nm=np.interp(x, pressure_psipol, pressure_eqdsk.values),
+            F_nm=np.interp(x_eqdsk, pressure_psipol, pressure_eqdsk.values),
             attrs={"name": "pressure", "units": "Pa"},
         )
-        R = np.asarray(equ.boundary.R)
-        Z = np.asarray(equ.boundary.z)
+
+        def truncate(profile):
+            if profile is None:
+                return None
+            return Profile(
+                x=x,
+                F_nm=np.interp(x_eqdsk, profile.x, _profile_values(profile)),
+                attrs=dict(profile.data.attrs),
+            )
+
+        density = truncate(density)
+        resistivity = truncate(kwargs.pop("resistivity", None))
+        vtor = truncate(kwargs.pop("vtor", None))
+        vpol = truncate(kwargs.pop("vpol", None))
+
+        if rhop_boundary < 1.0:
+            boundary = equ.flux_surface(rhop_boundary)
+            R = np.asarray(boundary["R"].values, dtype=np.float64)
+            Z = np.asarray(boundary["z"].values, dtype=np.float64)
+        else:
+            R = np.asarray(equ.boundary.R)
+            Z = np.asarray(equ.boundary.z)
         Raxis = float(equ.fluxdata.attrs.get("Raxis", equ.R_axis))
         Zaxis = float(equ.fluxdata.attrs.get("zaxis", equ.z_axis))
         theta = np.unwrap(np.arctan2(Z - Zaxis, R - Raxis))
-        return cls(
+        solver = cls(
             {"R": R, "Z": Z, "theta": theta},
             float(equ.Bdata.Baxis),
             q,
             density,
             pressure,
+            resistivity=resistivity,
+            vtor=vtor,
+            vpol=vpol,
             initial_guess=equ if use_surface_guess else None,
             **kwargs,
         )
+        solver.initial_guess_psipol_scale = psipol_boundary
+        solver.rhop_boundary = rhop_boundary
+        solver.psipol_boundary = psipol_boundary
+        return solver
 
     def solve(
         self,
         initial_guess=None,
         psi_tor_guess=None,
-        max_psi_iterations=4,
+        max_psi_iterations=6,
         rtol=1e-3,
         fast=False,
         **kwargs,
@@ -281,8 +463,15 @@ class DESCSolver(superEquilibrium):
 
         guess = self.initial_guess if initial_guess is None else initial_guess
         if guess is not None and hasattr(guess, "flux_surface"):
-            idx = np.unique(np.linspace(1, self.qin.x.size - 1, min(16, self.qin.x.size - 1), dtype=int))
-            guess = _make_guesses(guess, self.qin.x[idx], self.rho_tor_input[idx])
+            idx = np.unique(np.linspace(1, self.qin.x.size - 2, min(16, self.qin.x.size - 2), dtype=int))
+            guess = _make_guesses(
+                guess,
+                self.qin.x[idx],
+                self.rho_tor_input[idx],
+                self.theta_lcfs,
+                self.theta_lcfs_condensed,
+                self.initial_guess_psipol_scale,
+            )
 
         L, M = self.desc_resolution
         solve_kwargs = dict(self.solve_kwargs)
@@ -306,7 +495,10 @@ class DESCSolver(superEquilibrium):
                 sym=False,
             )
             if guess is not None:
-                eq.set_initial_guess(*guess)
+                if isinstance(guess, tuple):
+                    eq.set_initial_guess(*guess)
+                else:
+                    eq.set_initial_guess(guess)
             if verbose:
                 print(f"--- Solving DESC equilibrium, iteration {iteration + 1} ---")
             if fast:
@@ -324,7 +516,7 @@ class DESCSolver(superEquilibrium):
             if error < rtol:
                 break
             psitor *= self.Baxis_target / Baxis
-            guess = None
+            guess = solved
         else:
             raise RuntimeError(f"DESC did not match Baxis. Last relative error: {error:.3e}")
 
@@ -366,25 +558,15 @@ class DESCSolver(superEquilibrium):
             "g^rr_r", "g^rr_t", "g^rr_z", "curvature_H_rho", "J*B", "p_r",
             "kappa_n", "kappa_g", "|grad(rho)|",
         ]
-        raw = self.desc_equilibrium.compute(
-            names + ["B", "grad(rho)", "(B*grad) grad(rho)"], grid=grid
-        )
+        raw = self.desc_equilibrium.compute(names, grid=grid)
         data = {name: _reshape(raw[name], npsi, ntheta) for name in names}
         data["nu_r"] = CubicSpline(rho, data["nu"], axis=0).derivative()(rho)
 
-        B_vector = np.asarray(raw["B"]).reshape(npsi, ntheta, 3)
-        grad_rho = np.asarray(raw["grad(rho)"]).reshape(npsi, ntheta, 3)
-        B_grad_grad_rho = np.asarray(raw["(B*grad) grad(rho)"]).reshape(
-            npsi, ntheta, 3
+        shear = _reshape(
+            _local_magnetic_shear_desc(self.desc_equilibrium, grid),
+            npsi,
+            ntheta,
         )
-        B_cross_grad_rho = np.cross(B_vector, grad_rho)
-        torsion_numerator = np.sum(
-            B_cross_grad_rho * B_grad_grad_rho, axis=-1
-        )
-        shear = (
-            mu_0 * data["J*B"] / data["g^rr"]
-            - 2 * torsion_numerator / data["g^rr"] ** 2
-        ) / data["chi_r"] ** 2
 
         chi_rr = (
             data["psi_rr"] * data["iota"]
@@ -439,9 +621,10 @@ class DESCSolver(superEquilibrium):
 
         chi = data["chi"][:, 0]
         chi_r = data["chi_r"][:, 0]
-        q = data["q"][:, 0]
+        orientation = np.sign(data["q"][0, 0])
+        q = orientation * data["q"][:, 0]
         G = data["G"][:, 0]
-        I_boozer = data["I"][:, 0]
+        I_boozer = orientation * data["I"][:, 0]
         B = data["|B|"]
         h = q * G + I_boozer
         jac = h[:, None] / B**2
@@ -470,7 +653,7 @@ class DESCSolver(superEquilibrium):
         add("z", data["Z"], "m")
         add("B0", B, "T")
         add("jac", jac, "m**3/Wb")
-        add("jac_from_desc_sqrtg", data["sqrt(g)_Boozer"] / data["chi_r"], "m**3/Wb")
+        add("jac_from_desc_sqrtg", orientation * data["sqrt(g)_Boozer"] / data["chi_r"], "m**3/Wb")
 
         metric_names = [
             ["gpsi_psi", "gpsi_theta", "gpsi_zeta"],
@@ -504,10 +687,16 @@ class DESCSolver(superEquilibrium):
         self.chi_edge = chi_edge
         self._psi, self._rho = x, rho
         self.qprof = self.qin.copy()
+        self.qprof.data *= orientation
         self.Fprof = Profile(x=x, F_nm=G, attrs={"units": "T*m", "name": "F"})
         self.gprof = Profile(x=x, F_nm=G, attrs={"units": "T*m", "name": "g"})
         self.Iprof = Profile(x=x, F_nm=2 * np.pi * I_boozer, attrs={"units": "T*m", "name": "I"})
         self.hprof = Profile(x=x, F_nm=h, attrs={"units": "T*m", "name": "h"})
+        x_full = np.unique(np.concatenate(([0.0], x, [1.0])))
+        self.hprof.data = self.hprof.data.interp(
+            x=x_full,
+            kwargs={"fill_value": "extrapolate"},
+        )
         self._cache.clear()
 
         psi0 = xr.DataArray(chi_edge * self.qin.x, dims="psi", coords={"psi": self.qin.x})
@@ -537,6 +726,14 @@ class DESCSolver(superEquilibrium):
                 "L": int(self.desc_equilibrium.L),
                 "M": int(self.desc_equilibrium.M),
                 "N": int(self.desc_equilibrium.N),
+            },
+            "boundary_fit": {
+                "M": int(self.boundary_m_max),
+                "K": int(self.boundary_k_max),
+            },
+            "computational_boundary": {
+                "rhop_eqdsk": self.rhop_boundary,
+                "psipol_norm_eqdsk": self.psipol_boundary,
             },
             "magnetic_grid": {
                 "npsi": self.magspace.sizes["psi"],
@@ -573,4 +770,4 @@ class DESCSolver(superEquilibrium):
         return summary
 
 
-__all__ = ["DESCSolver", "_rho_tor_from_q", "_dtheta"]
+__all__ = ["DESCSolver", "_rho_tor_from_q", "_dtheta", "_local_magnetic_shear_desc"]
