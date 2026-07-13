@@ -7,6 +7,7 @@ from .core._classify_mode import ContinuumClassifier
 from .core.solver import superSolver
 from .core.solver2 import superSolver2
 from .core.solver3 import superSolver3
+from .core.solver4 import superSolver4
 from .radial.profile import Profile
 from .radial.base import RadialFE
 from .radial.chebyshev import ChebyshevFE

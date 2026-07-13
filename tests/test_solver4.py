@@ -6,10 +6,13 @@ import numpy as np
 import pytest
 from scipy.sparse import coo_array, csr_matrix, isspmatrix_csr
 
+import supernova
+import supernova.core.solver4 as solver4_module
 from supernova.core.solver4 import (
     MixedFieldLayout,
     _build_mixed_radial_data,
     _project_local_tensor_mixed,
+    superSolver4,
 )
 from supernova.radial import BSplineFE
 
@@ -200,3 +203,207 @@ def test_projector_validates_local_state_and_derivative_shapes():
             mixed.weights_q,
             np.zeros((2, 2)),
         )
+
+
+def _synthetic_solver(monkeypatch, seed=2718):
+    solver = object.__new__(superSolver4)
+    solver.radialfe = _high_space()
+    mixed = solver._get_mixed_radial_data()
+    n_modes = 2
+    n_state = 4 * n_modes
+    sb = SimpleNamespace(
+        m_range=np.array([-1, 2]),
+        points_q=mixed.points_q.copy(),
+        weights_q=mixed.weights_q.copy(),
+    )
+    solver.build_solver_blocks = lambda **kwargs: sb
+
+    rng = np.random.default_rng(seed)
+    local = []
+    for _ in range(3):
+        dense = rng.normal(size=(mixed.points_q.size, n_state, n_state))
+        dense = dense + 1.0j * rng.normal(size=dense.shape)
+        dense[np.abs(dense) < 1.0] = 0.0
+        local.append(coo_array(dense))
+    monkeypatch.setattr(
+        solver4_module,
+        "_build_local_M_split",
+        lambda sb, regularizer=0.0: tuple(local),
+    )
+    return solver, sb, mixed, tuple(local)
+
+
+def test_solver4_split_assembly_and_full_boundary_reduction(monkeypatch):
+    solver, sb, mixed, local = _synthetic_solver(monkeypatch)
+    layout = solver._mixed_layout(sb)
+
+    raw = solver.assemble_split_matrices(
+        ntor=4,
+        apply_bcs=False,
+    )
+    axis = solver.assemble_split_matrices(
+        ntor=4,
+        apply_bcs=True,
+        bc_kind="axis",
+    )
+    full = solver.assemble_split_matrices(
+        ntor=4,
+        apply_bcs=True,
+        bc_kind="full",
+    )
+
+    assert all(isinstance(matrix, csr_matrix) for matrix in raw + axis + full)
+    assert all(matrix.shape == (layout.n_rows, layout.n_trial) for matrix in raw)
+    assert all(
+        matrix.shape == (layout.n_rows, layout.n_trial - layout.n_modes)
+        for matrix in axis
+    )
+    assert all(matrix.shape == (layout.n_rows, layout.n_rows) for matrix in full)
+
+    bc = solver._build_nep_boundary_condition(sb, bc_kind="full")
+    P = bc.get_sparse_prolongation()
+    assert np.linalg.matrix_rank(bc.C) == 2 * layout.n_modes
+    np.testing.assert_allclose(bc.C @ P.toarray(), 0.0, atol=1e-13)
+    for raw_matrix, full_matrix in zip(raw, full):
+        np.testing.assert_allclose(
+            full_matrix.toarray(),
+            (raw_matrix @ P).toarray(),
+            rtol=1e-13,
+            atol=1e-13,
+        )
+
+    s = 0.8 + 0.2j
+    combined_local = local[0] + s * local[1] + (1.0 / s) * local[2]
+    direct = _project_local_tensor_mixed(
+        sb,
+        combined_local,
+        mixed.phi_high_q,
+        mixed.phi_low_q,
+        mixed.weights_q,
+        mixed.G_low_high,
+        include_derivative=True,
+    )
+    split = raw[0] + s * raw[1] + (1.0 / s) * raw[2]
+    np.testing.assert_allclose(split.toarray(), direct.toarray(), atol=1e-12)
+
+
+def test_solver4_result_expands_reduced_vector_and_names_all_fields(monkeypatch):
+    solver, sb, _, _ = _synthetic_solver(monkeypatch, seed=99)
+    solver._species_mass_amu = lambda: 2.0
+    layout = solver._mixed_layout(sb)
+    bc = solver._build_nep_boundary_condition(sb, bc_kind="full")
+    rng = np.random.default_rng(7)
+    reduced = rng.normal(size=(2, layout.n_rows))
+    reduced = reduced + 1.0j * rng.normal(size=reduced.shape)
+    result = SimpleNamespace(
+        eigenvalues=np.array([0.8 + 0.1j, 1.2 - 0.05j]),
+        eigenvectors=reduced,
+        nconv=2,
+        iterations=6,
+        reason="CONVERGED_TOL",
+    )
+    nep = SimpleNamespace(
+        last_residual_norms=np.array([1.0e-9, 2.0e-9]),
+        last_absolute_residual_norms=np.array([2.0e-9, 4.0e-9]),
+        spectral_shift=0.9,
+    )
+    region = {
+        "type": "ellipse",
+        "center": 1.0,
+        "radius": 0.2,
+        "vscale": 0.25,
+    }
+
+    dataset = solver._split_result_dataset(
+        result=result,
+        nep=nep,
+        ntor=4,
+        target_omega=1.0,
+        target_s=1.0,
+        region=region,
+        mmax=5,
+        max_dm=3,
+        regularizer=0.0,
+        apply_bcs=True,
+        bc_kind="full",
+        bc_tol=None,
+        verbose=False,
+        compute_residuals=True,
+        which="TARGET_MAGNITUDE",
+        nep_type="NLEIGS",
+        description="synthetic solver4 result",
+    )
+
+    expected_full = np.vstack([bc.expand_sparse(vector) for vector in reduced])
+    np.testing.assert_allclose(dataset["eigenvector"], expected_full)
+    np.testing.assert_allclose(bc.C @ expected_full.T, 0.0, atol=1e-13)
+    assert dataset["p1_coefficient"].shape == (2, layout.n_high, layout.n_modes)
+    assert dataset["xi_psi_coefficient"].shape == (
+        2,
+        layout.n_high,
+        layout.n_modes,
+    )
+    assert dataset["xi_s_coefficient"].shape == (2, layout.n_low, layout.n_modes)
+    assert dataset["div_xi_coefficient"].shape == (
+        2,
+        layout.n_low,
+        layout.n_modes,
+    )
+    np.testing.assert_allclose(
+        dataset["xi_psi_coefficient"],
+        expected_full[:, layout.trial_slice(1)].reshape(
+            2,
+            layout.n_high,
+            layout.n_modes,
+        ),
+    )
+    assert dataset.attrs["bc_expanded_eigenvectors"] is True
+    assert dataset.attrs["slepc_eigenvector_space"] == "reduced"
+    assert dataset.attrs["radial_discretization"] == "compatible_mixed_bspline"
+    assert dataset.attrs["full_dofs"] == layout.n_trial
+
+
+@pytest.mark.parametrize(
+    "builder, kwargs",
+    [
+        (
+            "build_split_nep_solver",
+            {
+                "ntor": 2,
+                "target_omega": 1.0,
+                "region": {"center": 1.0, "radius": 0.1},
+            },
+        ),
+        (
+            "build_split_ciss_solver",
+            {
+                "ntor": 2,
+                "target_omega": 1.0,
+                "region": {"center": 1.0, "radius": 0.1},
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "bc_options",
+    [
+        {"apply_bcs": False, "bc_kind": "full"},
+        {"apply_bcs": True, "bc_kind": "axis"},
+        {"apply_bcs": True, "bc_kind": "edge"},
+        {"apply_bcs": True, "bc_kind": "none"},
+    ],
+)
+def test_solver4_rejects_rectangular_nep_inputs_before_petsc(
+    builder,
+    kwargs,
+    bc_options,
+):
+    solver = object.__new__(superSolver4)
+
+    with pytest.raises(ValueError, match="require apply_bcs=True"):
+        getattr(solver, builder)(**kwargs, **bc_options)
+
+
+def test_supernova_exports_solver4_without_replacing_solver3():
+    assert supernova.superSolver4 is superSolver4
+    assert supernova.superSolver3 is not supernova.superSolver4
