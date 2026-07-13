@@ -59,6 +59,19 @@ _ALLOWED_EXPRESSION_FUNCTIONS = {
 _ALLOWED_EXPRESSION_CONSTANTS = {"pi": np.pi, "e": np.e, "mu_0": 1*unyt.mu_0}
 
 
+def _axisymmetric_cylindrical_local_shear(A, R, d_dr, d_dz):
+    """Return NOVA local shear from an axisymmetric cylindrical vector A."""
+    radius = R[:, None] if np.ndim(R) == 1 else R
+    curl_A = np.array(
+        [
+            -d_dz(A[1]),
+            d_dz(A[0]) - d_dr(A[2]),
+            d_dr(radius * A[1]) / radius,
+        ]
+    )
+    return np.sum(A * curl_A, axis=0)
+
+
 
 class superEquilibrium:
     """
@@ -274,7 +287,8 @@ class superEquilibrium:
         dPsi_dr = self.boozer.deriv.dPsi_dr.interp(R=self.equ.B.R, z=self.equ.B.z, method='cubic')
         dPsi_dphi = self.boozer.deriv.dPsi_dphi.interp(R=self.equ.B.R, z=self.equ.B.z, method='cubic')
         dPsi_dz = self.boozer.deriv.dPsi_dz.interp(R=self.equ.B.R, z=self.equ.B.z, method='cubic')
-        nabla_Psi = np.array([dPsi_dr.values, dPsi_dphi.values/self.equ.B.R.values[None, :], dPsi_dz.values])
+        radius = self.equ.B.R.values[:, None]
+        nabla_Psi = np.array([dPsi_dr.values, dPsi_dphi.values/radius, dPsi_dz.values])
         B0 = np.array([self.equ.Br.values, self.equ.Bphi.values, self.equ.Bz.values])
         B0_norm = np.sqrt(B0[0]**2 + B0[1]**2 + B0[2]**2)
 
@@ -287,7 +301,7 @@ class superEquilibrium:
         s = np.cross(B0, nabla_Psi, axis=0)
 
         # Projecting the curvature over the perpendicular directions.
-        kappa_Psi = curvb_r * dPsi_dr.values + curvb_phi * dPsi_dphi.values / self.equ.B.R.values[None, :] + curvb_z * dPsi_dz.values
+        kappa_Psi = curvb_r * dPsi_dr.values + curvb_phi * dPsi_dphi.values / radius + curvb_z * dPsi_dz.values
         kappa_s = curvb_r * s[0] + curvb_phi * s[1] + curvb_z * s[2]
 
         self.realspace['kappa_Psi'] = xr.DataArray(kappa_Psi, 
@@ -345,8 +359,12 @@ class superEquilibrium:
         d_dz = Diff(axis=1, acc=4)
         d_dr.set_grid({0: R[1] - R[0]})
         d_dz.set_grid({1: z[1] - z[0]})
-        curl_s = (d_dr(s_hat[0]) - d_dz(s_hat[2])) * R[:, None]
-        shear = s_hat[1] * curl_s
+        shear = _axisymmetric_cylindrical_local_shear(
+            s_hat,
+            R,
+            d_dr,
+            d_dz,
+        )
         self.realspace['shear'] = xr.DataArray(shear, 
                                                 dims=('R', 'z'),
                                                 attrs={'description': 'Local magnetic shear.',
