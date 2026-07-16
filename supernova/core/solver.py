@@ -598,9 +598,10 @@ class superSolver:
                 integrated_response[ii, jj, 1] = np.sqrt(np.sum(p1sum))
 
         # We will add some units to the integrated response to make it interpretable:
-        xinorm = self.equ.hprof.data.values[0] * self.equ.qprof.data.values[0]**2 \
+        hprof = self.equ("h")
+        xinorm = hprof.data.values[0] * self.equ.qprof.data.values[0]**2 \
                 * self.equ.density.data.values[0] / self.equ.Baxis**2 / self.equ.aminor**2
-        p1norm = np.sqrt(self.equ.hprof.data.values[0] / self.equ.Baxis**2) / (self.gamma_s - 1)
+        p1norm = np.sqrt(hprof.data.values[0] / self.equ.Baxis**2) / (self.gamma_s - 1)
 
         integrated_response[:, :, 0] *= xinorm
         integrated_response[:, :, 1] /= p1norm

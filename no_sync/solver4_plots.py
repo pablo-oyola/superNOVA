@@ -25,6 +25,49 @@ def _radial_coordinate(equ, psi):
     return np.sqrt(np.clip(psi, 0.0, None))
 
 
+def add_q_profile_axis(
+    ax,
+    equilibrium,
+    psi,
+    radial_coordinate,
+    *,
+    color="tab:red",
+    show_ylabel=True,
+):
+    """Overlay the signed safety-factor profile on a right-hand y axis."""
+    psi = np.asarray(psi, dtype=float).reshape(-1)
+    radial_coordinate = np.asarray(radial_coordinate, dtype=float).reshape(-1)
+    if radial_coordinate.shape != psi.shape:
+        raise ValueError("radial_coordinate and psi must have the same shape.")
+
+    q_profile = equilibrium("q")
+    q_data = q_profile.data.sel(mpol=0, ntor=0).real
+    q_psi = np.asarray(q_data.x, dtype=float).reshape(-1)
+    q_values = np.asarray(q_data.values, dtype=float).reshape(-1)
+    if q_psi.size == 0 or q_psi.shape != q_values.shape:
+        raise ValueError("The q-profile must contain a one-dimensional radial grid.")
+    if not np.all(np.isfinite(q_psi)) or not np.all(np.isfinite(q_values)):
+        raise ValueError("The q-profile must contain only finite values.")
+
+    order = np.argsort(q_psi)
+    q_on_plot_grid = np.interp(psi, q_psi[order], q_values[order])
+    q_axis = ax.twinx()
+    q_axis.plot(
+        radial_coordinate,
+        q_on_plot_grid,
+        color=color,
+        lw=1.4,
+        ls="--",
+        alpha=0.85,
+    )
+    if show_ylabel:
+        q_axis.set_ylabel(r"$q$", color=color)
+    q_axis.tick_params(axis="y", labelcolor=color)
+    q_axis.spines["right"].set_color(color)
+    q_axis.grid(False)
+    return q_axis
+
+
 def plot_xipsi_eigenpair(
     result,
     solver,
@@ -85,7 +128,7 @@ def plot_xipsi_eigenpair(
         ax.plot(rho, values.real, label=rf"$\Re\,({field_label})$")
         ax.plot(rho, values.imag, "--", label=rf"$\Im\,({field_label})$")
         ax.plot(rho, np.abs(values), ":", label=rf"$|{field_label}|$")
-        ax.legend()
+        legend_kwargs = {"loc": "upper left"}
         mode_summary = rf"$m={int(m_values[mode_index])}$"
     else:
         selected_m = m_values[mode_indices]
@@ -113,7 +156,11 @@ def plot_xipsi_eigenpair(
                 lw=width,
                 ls="--",
             )
-        ax.legend(title=r"$m$", loc="upper left", bbox_to_anchor=(1.02, 1.0))
+        legend_kwargs = {
+            "title": r"$m$",
+            "loc": "upper left",
+            "bbox_to_anchor": (1.16, 1.0),
+        }
         mode_summary = rf"dominant $m={int(m_values[dominant])}$"
 
     s_value = result["s"].isel(eigenpair=eigenpair_index).item()
@@ -132,6 +179,8 @@ def plot_xipsi_eigenpair(
         rf"$s={s_value:.4g}$, $\omega={omega_value:.4g}${residual}"
     )
     ax.grid(True, alpha=0.3)
+    add_q_profile_axis(ax, solver.equ, psi, rho)
+    ax.legend(**legend_kwargs)
     fig.tight_layout()
     return fig, ax
 
@@ -249,6 +298,7 @@ def plot_slow_sound_with_eigenmode_extensions(
 
 
 __all__ = [
+    "add_q_profile_axis",
     "plot_slow_sound_with_eigenmode_extensions",
     "plot_xipsi_eigenpair",
 ]
