@@ -330,7 +330,11 @@ class superSolver2:
 
         # Let's check if we can reuse the previous solver blocks.
         if hasattr(self, 'solver_blocks'):
-            if self.solver_blocks.ntor == ntor and self.solver_blocks.mmax == mmax_eff:
+            if (
+                self.solver_blocks.ntor == ntor
+                and self.solver_blocks.mmax == mmax_eff
+                and self.solver_blocks.max_dm == max_dm
+            ):
                 print("Reusing previous solver blocks.")
                 return self.solver_blocks
             else:
