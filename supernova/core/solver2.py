@@ -232,7 +232,10 @@ class superSolver2:
         psiN = _active_poloidal_flux_span(
             self.equ.boozer.coords.psi0
         ) * unyt.Unit('Wb/rad', registry=self.equ.registry)
-        psiN = psiN.in_base(self.equ.my_norm).to('psi0').v
+        # COCOS 1 stores poloidal flux in Wb/rad, while the NOVA magnetic-flux
+        # scale is psi0 = Baxis*aminor**2. Keep the angle unit explicit until
+        # the normalized value enters the numerical operator.
+        psiN = psiN.in_base(self.equ.my_norm).to("psi0/rad").v
 
         # We need also to divide the density by the maximum density.
         n0 = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")
