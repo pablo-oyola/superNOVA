@@ -42,6 +42,33 @@ def _periodic_integral_1d(y: np.ndarray, weights: np.ndarray) -> float:
     return total
 
 
+@njit(cache=True, nogil=True, inline="always")
+def _solve_trigonometric_gram(
+    field_cos: float,
+    field_sin: float,
+    cos_cos: float,
+    sin_sin: float,
+    cos_sin: float,
+):
+    """Return cosine/sine amplitudes, including self-conjugate grid modes."""
+    determinant = cos_cos * sin_sin - cos_sin * cos_sin
+    gram_scale = (cos_cos + sin_sin) * (cos_cos + sin_sin)
+    tolerance = 100.0 * np.finfo(np.float64).eps * max(gram_scale, 1.0)
+    if np.abs(determinant) > tolerance:
+        cosine = (field_cos * sin_sin - field_sin * cos_sin) / determinant
+        sine = (field_sin * cos_cos - field_cos * cos_sin) / determinant
+        return cosine, sine
+
+    # The constant and even-grid Nyquist modes have only one independent
+    # sampled basis vector. Choose that vector explicitly instead of applying
+    # the ordinary pi normalization and doubling its amplitude.
+    if cos_cos >= sin_sin and cos_cos > tolerance:
+        return field_cos / cos_cos, 0.0
+    if sin_sin > tolerance:
+        return 0.0, field_sin / sin_sin
+    return 0.0, 0.0
+
+
 @njit(parallel=True, cache=True, nogil=True)
 def _decompose2d_impl(field: np.ndarray, m_max: int, angle: np.ndarray, weights: np.ndarray):
     coeffs_real = np.zeros((field.shape[0], m_max + 1))
@@ -51,16 +78,33 @@ def _decompose2d_impl(field: np.ndarray, m_max: int, angle: np.ndarray, weights:
         for m in range(m_max + 1):
             cos_m_theta = np.cos(m * angle)
             sin_m_theta = np.sin(m * angle)
-            coeffs_real[i, m] = _periodic_integral_1d(field[i] * cos_m_theta, weights)
-            coeffs_imag[i, m] = _periodic_integral_1d(field[i] * sin_m_theta, weights)
-
-    for m in range(m_max + 1):
-        if m == 0:
-            coeffs_real[:, m] /= (2.0 * np.pi)
-            coeffs_imag[:, m] /= (2.0 * np.pi)
-        else:
-            coeffs_real[:, m] /= np.pi
-            coeffs_imag[:, m] /= np.pi
+            field_cos = _periodic_integral_1d(
+                field[i] * cos_m_theta,
+                weights,
+            )
+            field_sin = _periodic_integral_1d(
+                field[i] * sin_m_theta,
+                weights,
+            )
+            cos_cos = _periodic_integral_1d(
+                cos_m_theta * cos_m_theta,
+                weights,
+            )
+            sin_sin = _periodic_integral_1d(
+                sin_m_theta * sin_m_theta,
+                weights,
+            )
+            cos_sin = _periodic_integral_1d(
+                cos_m_theta * sin_m_theta,
+                weights,
+            )
+            coeffs_real[i, m], coeffs_imag[i, m] = _solve_trigonometric_gram(
+                field_cos,
+                field_sin,
+                cos_cos,
+                sin_sin,
+                cos_sin,
+            )
 
     return coeffs_real, coeffs_imag
 
@@ -74,6 +118,7 @@ def _decompose3d_impl(
     zeta: np.ndarray,
     theta_weights: np.ndarray,
     zeta_weights: np.ndarray,
+    toroidal_sign: int,
 ):
     coeffs_real = np.zeros((field.shape[0], m_max + 1, n_max + 1))
     coeffs_imag = np.zeros((field.shape[0], m_max + 1, n_max + 1))
@@ -87,11 +132,13 @@ def _decompose3d_impl(
                 sin_n_zeta = np.sin(n * zeta)
                 real_total = 0.0
                 imag_total = 0.0
+                cos_cos = 0.0
+                sin_sin = 0.0
+                cos_sin = 0.0
 
-                # Paper convention: exp(i*(m*theta - n*zeta)).
-                # Decompose in cos(m*theta - n*zeta) and sin(m*theta - n*zeta)
-                # using cos(a - b) = cos(a)cos(b) + sin(a)sin(b)
-                # and sin(a - b) = sin(a)cos(b) - cos(a)sin(b).
+                # ``toroidal_sign=-1`` is the represented solver convention
+                # x=m*theta-n*zeta. ``toroidal_sign=+1`` is used only to
+                # detect the unsupported mixed-sign family x=m*theta+n*zeta.
                 for itheta in range(field.shape[1]):
                     cos_mt = cos_m_theta[itheta]
                     sin_mt = sin_m_theta[itheta]
@@ -102,22 +149,30 @@ def _decompose3d_impl(
                         weight = theta_weight * zeta_weights[izeta]
                         value = field[i, itheta, izeta]
 
-                        cospart = cos_mt * cos_nz + sin_mt * sin_nz
-                        sinpart = sin_mt * cos_nz - cos_mt * sin_nz
+                        cospart = (
+                            cos_mt * cos_nz
+                            - toroidal_sign * sin_mt * sin_nz
+                        )
+                        sinpart = (
+                            sin_mt * cos_nz
+                            + toroidal_sign * cos_mt * sin_nz
+                        )
                         real_total += value * cospart * weight
                         imag_total += value * sinpart * weight
+                        cos_cos += cospart * cospart * weight
+                        sin_sin += sinpart * sinpart * weight
+                        cos_sin += cospart * sinpart * weight
 
-                coeffs_real[i, m, n] = real_total
-                coeffs_imag[i, m, n] = imag_total
-
-    for m in range(m_max + 1):
-        for n in range(n_max + 1):
-            if m == 0 and n == 0:
-                coeffs_real[:, m, n] /= (4.0 * np.pi**2)
-                coeffs_imag[:, m, n] /= (4.0 * np.pi**2)
-            else:
-                coeffs_real[:, m, n] /= (2.0 * np.pi**2)
-                coeffs_imag[:, m, n] /= (2.0 * np.pi**2)
+                (
+                    coeffs_real[i, m, n],
+                    coeffs_imag[i, m, n],
+                ) = _solve_trigonometric_gram(
+                    real_total,
+                    imag_total,
+                    cos_cos,
+                    sin_sin,
+                    cos_sin,
+                )
 
     return coeffs_real, coeffs_imag
 
@@ -190,36 +245,19 @@ def decompose2d(field: np.ndarray, m_max: int = None, angle: np.ndarray | None =
     return _decompose2d_impl(field, m_max, angle, weights)
 
 
-def decompose3d(
+def _decompose3d_with_toroidal_sign(
     field: np.ndarray,
     m_max: int = None,
     n_max: int = None,
     theta: np.ndarray | None = None,
     zeta: np.ndarray | None = None,
+    toroidal_sign: int = -1,
 ):
-    """
-    For an input F(Nx, Ntheta, Nzeta) this computes for each (n, m) the Fourier decomposition along the poloidal and toroidal angles.
-    The output is a 3D array of shape (Nx, m_max+1, n_max+1) containing the Fourier coefficients for each mode (n, m), where m ranges from 0 to m_max and n ranges from 0 to n_max. If m_max or n_max are None, they default to Ntheta//2 and Nzeta//2, respectively, which correspond to the Nyquist frequencies.
-    
-    Parameters
-    ----------
-    field : np.ndarray
-        3D array of shape (Nx, Ntheta, Nzeta) representing the field to be decomposed.
-    m_max : int, optional
-        Maximum mode number in the poloidal direction. If None, defaults to Ntheta//2.
-    n_max : int, optional
-        Maximum mode number in the toroidal direction. If None, defaults to Nzeta//2.
-
-    Returns
-    -------
-    np.ndarray
-        3D array of shape (Nx, m_max+1, n_max+1) containing the Fourier coefficients for each mode (n, m) - Real part.
-    np.ndarray
-        3D array of shape (Nx, m_max+1, n_max+1) containing the Fourier coefficients for each mode (n, m) - Imaginary part.
-    """
     field = np.asarray(field, dtype=np.float64)
     if field.ndim != 3:
         raise ValueError("field must have shape (Nx, Ntheta, Nzeta).")
+    if toroidal_sign not in (-1, 1):
+        raise ValueError("toroidal_sign must be either -1 or +1.")
 
     if m_max is None:
         m_max = field.shape[1] // 2
@@ -230,12 +268,64 @@ def decompose3d(
     zeta = _prepare_periodic_angle(zeta, field.shape[2], "zeta")
     theta_weights = _periodic_weights(theta)
     zeta_weights = _periodic_weights(zeta)
-    return _decompose3d_impl(field, m_max, n_max, theta, zeta, theta_weights, zeta_weights)
+    return _decompose3d_impl(
+        field,
+        m_max,
+        n_max,
+        theta,
+        zeta,
+        theta_weights,
+        zeta_weights,
+        toroidal_sign,
+    )
+
+
+def decompose3d(
+    field: np.ndarray,
+    m_max: int = None,
+    n_max: int = None,
+    theta: np.ndarray | None = None,
+    zeta: np.ndarray | None = None,
+):
+    """
+    Decompose ``F(Nx, Ntheta, Nzeta)`` in the represented family
+    ``m*theta - n*zeta`` for non-negative ``m`` and ``n``.
+
+    The returned cosine and sine arrays have shape
+    ``(Nx, m_max + 1, n_max + 1)`` and contain one-sided real-field
+    amplitudes, not two-sided complex Fourier coefficients.
+    """
+    return _decompose3d_with_toroidal_sign(
+        field,
+        m_max,
+        n_max,
+        theta,
+        zeta,
+        toroidal_sign=-1,
+    )
+
+
+def decompose3d_mixed_sign(
+    field: np.ndarray,
+    m_max: int = None,
+    n_max: int = None,
+    theta: np.ndarray | None = None,
+    zeta: np.ndarray | None = None,
+):
+    """Project onto ``m*theta + n*zeta`` to detect unsupported helicities."""
+    return _decompose3d_with_toroidal_sign(
+        field,
+        m_max,
+        n_max,
+        theta,
+        zeta,
+        toroidal_sign=1,
+    )
 
 @njit(parallel=True, cache=True, nogil=True)
 def recompose2d(theta: float, coeffs_real: np.ndarray, coeffs_imag: np.ndarray) -> np.ndarray:
     """
-    Reconstructs the original 2D field from its Fourier coefficients.
+    Reconstructs the original 2D field from its real cosine/sine amplitudes.
     
     Parameters
     ----------
@@ -260,7 +350,11 @@ def recompose2d(theta: float, coeffs_real: np.ndarray, coeffs_imag: np.ndarray) 
 @njit(parallel=True, cache=True, nogil=True)
 def recompose3d(theta: float, zeta: float, coeffs_real: np.ndarray, coeffs_imag: np.ndarray) -> np.ndarray:
     """
-    Reconstructs the original 3D field from its Fourier coefficients.
+    Reconstructs the original 3D field from its real cosine/sine amplitudes.
+
+    The phase is ``x=m*theta-n*zeta``.  Consequently this is equivalent to
+    ``Re[(coeffs_real + 1j*coeffs_imag)*exp(i*(n*zeta-m*theta))]`` for each
+    represented nonzero mode.
     
     Parameters
     ----------

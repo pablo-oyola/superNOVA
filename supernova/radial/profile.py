@@ -11,10 +11,16 @@ import xarray as xr
 from typing import List, Optional, Any
 from .base import RadialFE
 from .._logger import get_logger
-from ._harmonics_kernels import decompose2d, decompose3d
+from ._harmonics_kernels import (
+    decompose2d,
+    decompose3d,
+    decompose3d_mixed_sign,
+)
 from pycocos import MagneticCoordinates
 
 logger = get_logger(__name__)
+
+_MIXED_SIGN_RTOL = 1.0e-10
 
 def ProfileFactoryPsiThetaZeta(
     *args,
@@ -27,9 +33,23 @@ def ProfileFactoryPsiThetaZeta(
 
     Input arguments (*args) are expected to be different datarrays or datasets,
     defined on the same (Psi, Theta, Zeta) grid, and the factory will return a list of Profile
-    instances, one for each input field. 
+    instances, one for each input field.
     The factory will batch the process for all the input profiles: decomposing them all
     into (n, m) harmonics and then calling the Profile constructor that will build the Profile instances.
+
+    Nonzero entries in ``Profile.data`` are one-sided real-field amplitudes.  If
+    ``x = m*theta - n*zeta`` and the real quadrature returns
+    ``a*cos(x) + b*sin(x)``, the stored amplitude is ``a + 1j*b`` and the field
+    is reconstructed as ``real((a + 1j*b)*exp(-1j*x))``.  The corresponding
+    coefficient in a two-sided complex Fourier sum is half this stored value;
+    that conversion is owned by the harmonic matrix-building kernels.
+
+    The current rectangular storage contains only representatives with
+    ``m >= 0`` and ``n >= 0``.  Their partners ``(-m, -n)`` are implied by
+    complex-conjugate symmetry.  The factory rejects material, resolvable
+    mixed-sign helical content; representing it requires a signed mode-set API.
+    A self-conjugate Nyquist plane is exempt because the two helicities are
+    identical on that discrete grid.
     """
     if ntormax is not None and (not isinstance(ntormax, int) or ntormax < 0):
         raise ValueError("ntormax must be a non-negative integer.")
@@ -52,7 +72,7 @@ def ProfileFactoryPsiThetaZeta(
     # Some equilibrium quantities are flux functions and only live on psi.
     # Those already are Profiles with the (m, n) = (0, 0) harmonic, so avoid
     # broadcasting them over angular grids just to decompose a constant field.
-    allowed_dims = {"psi", "theta", "nu"}
+    allowed_dims = {"psi", "theta", "zeta"}
     profiles: list[Optional["Profile"]] = [None] * len(data.data_vars)
     angular_indices: list[int] = []
     angular_data = xr.Dataset()
@@ -63,12 +83,12 @@ def ProfileFactoryPsiThetaZeta(
         if extra_dims:
             raise ValueError(
                 f"Input field '{var}' has unsupported dimensions {sorted(extra_dims)}. "
-                "Expected only 'psi', 'theta', and/or 'nu'."
+                "Expected only 'psi', 'theta', and/or 'zeta'."
             )
         if "psi" not in field.dims:
             raise ValueError(f"Input field '{var}' must include a 'psi' dimension.")
 
-        if "theta" not in field.dims and "nu" not in field.dims:
+        if "theta" not in field.dims and "zeta" not in field.dims:
             field_psi = field.transpose("psi")
             profiles[out_idx] = Profile(
                 x=field_psi.coords["psi"].values,
@@ -82,9 +102,9 @@ def ProfileFactoryPsiThetaZeta(
         field_ang = field
         if "theta" not in field_ang.dims:
             field_ang = field_ang.expand_dims(theta=[0.0])
-        if "nu" not in field_ang.dims:
-            field_ang = field_ang.expand_dims(nu=[0.0])
-        angular_data[var] = field_ang.transpose("psi", "theta", "nu")
+        if "zeta" not in field_ang.dims:
+            field_ang = field_ang.expand_dims(zeta=[0.0])
+        angular_data[var] = field_ang.transpose("psi", "theta", "zeta")
         angular_indices.append(out_idx)
 
     if not angular_indices:
@@ -95,13 +115,18 @@ def ProfileFactoryPsiThetaZeta(
     # We stack all the data into a single array with (nfield*nPsi, nTheta, nZeta) shape,
     # where nfield is the number of input fields.
     tmp = data.to_array(dim='field')
-    stacked = tmp.stack(stacked=['field', 'psi']).transpose('stacked', 'theta', 'nu').values
+    stacked_data = tmp.stack(stacked=['field', 'psi']).transpose(
+        'stacked',
+        'theta',
+        'zeta',
+    )
+    stacked = stacked_data.values
 
     theta = np.asarray(data.coords["theta"].values, dtype=np.float64)
-    zeta = np.asarray(data.coords["nu"].values, dtype=np.float64)
+    zeta = np.asarray(data.coords["zeta"].values, dtype=np.float64)
 
-    sine_sign = -1.0
-    if data.theta.size == 1 and data.nu.size == 1:
+    sine_sign = 1.0
+    if data.theta.size == 1 and data.zeta.size == 1:
         # If both Theta and Zeta have only one point, we are in the axisymmetric case and we only have the (n=0, m=0) mode.
         coeffs_cos = stacked[:, 0, 0][:, None, None]
         coeffs_sin = np.zeros_like(coeffs_cos)
@@ -110,7 +135,7 @@ def ProfileFactoryPsiThetaZeta(
         mpol = [0]
         ntor = [0]
     elif data.theta.size == 1:
-        nyquist_ntor = data.nu.size // 2
+        nyquist_ntor = data.zeta.size // 2
         ntormax = nyquist_ntor if ntormax is None else ntormax
         if ntormax > nyquist_ntor:
             logger.warning(
@@ -121,13 +146,14 @@ def ProfileFactoryPsiThetaZeta(
         coeffs_cos, coeffs_sin = decompose2d(stacked[:, 0, :], ntormax, angle=zeta)
         coeffs_cos = coeffs_cos[:, None, :]
         coeffs_sin = coeffs_sin[:, None, :]
-        # decompose2d returns the coefficient of sin(n*zeta), while the paper
-        # phase for a toroidal-only mode is exp(-i*n*zeta).
-        sine_sign = 1.0
+        # Here decompose2d returns the amplitude multiplying sin(+n*zeta),
+        # whereas the stored basis is exp(+i*n*zeta).  Hence the one-sided
+        # complex amplitude is a - i*b in this toroidal-only branch.
+        sine_sign = -1.0
         mpolmax = 0
         mpol = [0]
         ntor = np.arange(ntormax+1)
-    elif data.nu.size == 1:
+    elif data.zeta.size == 1:
         nyquist_mpol = data.theta.size // 2
         mpolmax = nyquist_mpol if mpolmax is None else mpolmax
         if mpolmax > nyquist_mpol:
@@ -167,18 +193,68 @@ def ProfileFactoryPsiThetaZeta(
             theta=theta,
             zeta=zeta,
         )
+
+        # Rectangular Profile storage represents m*theta-n*zeta and its
+        # conjugate partner only.  Explicitly reject resolvable content in the
+        # independent m*theta+n*zeta family instead of silently dropping it.
+        # An even grid's Nyquist mode is self-conjugate, so its two signs are
+        # identical on the samples and cannot be classified; those boundary
+        # planes are deliberately excluded from this check.
+        if mpolmax > 0 and ntormax > 0:
+            mixed_cos, mixed_sin = decompose3d_mixed_sign(
+                stacked,
+                mpolmax,
+                ntormax,
+                theta=theta,
+                zeta=zeta,
+            )
+            mixed_amplitude = np.hypot(
+                mixed_cos[:, 1:, 1:],
+                mixed_sin[:, 1:, 1:],
+            )
+            detectable = np.ones((mpolmax, ntormax), dtype=bool)
+            if theta.size % 2 == 0 and mpolmax >= theta.size // 2:
+                detectable[theta.size // 2 - 1, :] = False
+            if zeta.size % 2 == 0 and ntormax >= zeta.size // 2:
+                detectable[:, zeta.size // 2 - 1] = False
+            mixed_amplitude = np.where(detectable[None, :, :], mixed_amplitude, 0.0)
+
+            field_scale = np.max(np.abs(stacked), axis=(1, 2))
+            tolerance = _MIXED_SIGN_RTOL * np.maximum(
+                field_scale,
+                np.finfo(np.float64).tiny,
+            )
+            excess = mixed_amplitude - tolerance[:, None, None]
+            if np.any(excess > 0.0):
+                surface_index, m_index, n_index = np.unravel_index(
+                    np.argmax(excess),
+                    excess.shape,
+                )
+                field_name, psi_value = stacked_data.coords["stacked"].values[
+                    surface_index
+                ]
+                amplitude = mixed_amplitude[surface_index, m_index, n_index]
+                raise ValueError(
+                    f"Input field {field_name!r} at psi={psi_value!r} contains "
+                    "material unsupported mixed-sign Fourier content for phase "
+                    f"m*theta+n*zeta at (m, n)=({m_index + 1}, {n_index + 1}): "
+                    f"amplitude {amplitude:.6e} exceeds tolerance "
+                    f"{tolerance[surface_index]:.6e}. Profile storage represents "
+                    "only m*theta-n*zeta for non-negative m and n."
+                )
         mpol = np.arange(mpolmax+1)
         ntor = np.arange(ntormax+1)
     
-    # From the decomposition in cosine and sine coefficients, we can 
-    # build the complex coefficients for the (n, m) harmonics. In the 
+    # From the decomposition in cosine and sine coefficients, we can
+    # build the one-sided complex amplitudes for the (n, m) harmonics. In the
     # decomposition, n and m start from 0 to ntormax and mpolmax, 
     # respectively, and the 0th mode is the average (n=0, m=0) 
     # which is purely real.
-    # In the paper convention, F(psi, theta, zeta) is expanded as
-    # sum F_{m,n}(psi) exp(i*(m*theta - n*zeta)). For real fields the negative
-    # pair is implied by F_{-m,-n} = F_{m,n}^*, so storing the nonnegative
-    # (m, n) coefficient requires half of the real cosine/sine amplitude.
+    # With exp(i*(n*zeta - m*theta)), a real field is reconstructed from the
+    # stored amplitude A_mn as Re[A_mn*exp(i*(n*zeta-m*theta))].  Thus
+    # A_mn = a_mn + i*b_mn for the general and poloidal-only decompositions.
+    # The two-sided Fourier coefficient A_mn/2 is formed only when building
+    # Toeplitz matrices or performing harmonic convolution.
     nfields = tmp.field.size
     coeffs_complex = np.zeros((nfields*data.coords['psi'].size, mpolmax+1, ntormax+1), dtype=np.complex128)
     coeffs_complex[:, 0, 0] = coeffs_cos[:, 0, 0]  # n=0, m=0 mode is purely real
@@ -186,7 +262,10 @@ def ProfileFactoryPsiThetaZeta(
         for i in range(mpolmax+1):
             if i == 0 and j == 0:
                 continue  # already set the (0, 0) mode
-            coeffs_complex[:, i, j] = 0.5 * (coeffs_cos[:, i, j] + sine_sign * 1j * coeffs_sin[:, i, j])
+            coeffs_complex[:, i, j] = (
+                coeffs_cos[:, i, j]
+                + sine_sign * 1j * coeffs_sin[:, i, j]
+            )
 
     # We now build the Profile instances for each field. We need to reshape the 
     # coefficients back to (nfield, nPsi, mpol, ntor) shape and then we can call 
@@ -247,6 +326,12 @@ class Profile:
     """
     This will contain the information of a collection of radial profiles, indexing them
     by their poloidal and toroidal mode numbers, n and m.
+
+    For real angular fields, nonzero ``F_nm`` values are one-sided amplitudes:
+    ``F_nm = a_nm + 1j*b_nm`` represents
+    ``a_nm*cos(m*theta-n*zeta) + b_nm*sin(m*theta-n*zeta)``.  Negative mode
+    partners are implied by conjugation.  Harmonic matrix kernels convert these
+    amplitudes to the half-sized coefficients required by a two-sided Fourier sum.
     """
     def __init__(self, x: np.ndarray, F_nm: np.ndarray, 
                  ntor: List[int]=None, mpol: List[int]=None,

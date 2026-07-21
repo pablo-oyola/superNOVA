@@ -34,9 +34,14 @@ def _fill_block_kernel(
     Core kernel to fill a specific block of the result matrix.
     Calculates differences on-the-fly to save memory.
 
-    With the paper basis ``exp(i*(m*theta - n*zeta))`` and the Galerkin
-    bracket ``<row|A|col>``, entry ``(i, j)`` uses the stored coefficient at
+    With the basis ``exp(i*(n*zeta - m*theta))`` and the Galerkin bracket
+    ``<row|A|col>``, entry ``(i, j)`` uses the harmonic at
     ``(m_i - m_j, n_i - n_j)``.
+
+    The input table stores one-sided real-field amplitudes.  A nonzero stored
+    amplitude is therefore divided by two when converted to the coefficient of
+    the implied two-sided Fourier sum.  The zero mode is unchanged and negative
+    mode pairs are supplied by complex-conjugate symmetry.
 
     Only the \Delta m < max_dm and \Delta n < max_dn are filled, to reduce
     the memory footprint of the result matrix. The rest of the entries are left as zero.
@@ -59,10 +64,14 @@ def _fill_block_kernel(
             if dmi >= 0 and dni >= 0:
                 if dmi <= mmax and dni <= nmax:
                     val = harmonics[dmi, dni]
+                    if dmi != 0 or dni != 0:
+                        val *= 0.5
             elif dmi <= 0 and dni <= 0:
                 dmp, dnp = -dmi, -dni
                 if dmp <= mmax and dnp <= nmax:
                     val = np.conjugate(harmonics[dmp, dnp])
+                    if dmp != 0 or dnp != 0:
+                        val *= 0.5
             
             if conjugate_mode:
                 out_view[i, j] = np.conjugate(val)
@@ -108,7 +117,12 @@ def get_active_bounds(table, epsilon=1e-15):
 def _fill_convolution_block_kernel(
     table_A, table_B, mode_m, mode_n, out_view, scale=1.0
 ):
-    """Convolution with pre-calculated active index bounds."""
+    """Fill a multiplication matrix from the convolution of two real fields.
+
+    ``table_A`` and ``table_B`` contain one-sided amplitudes.  Harmonic lookup
+    converts them to two-sided Fourier coefficients before the convolution, so
+    ``out_view`` is already the correctly normalized Toeplitz matrix.
+    """
     n_i = mode_m.size
     n_j = mode_m.size
     
@@ -159,14 +173,20 @@ fill_convolution_block_kernel = njit(parallel=True, cache=True, nogil=True, inli
 
 @njit(inline='always')
 def get_harmonic_value(table, m, n):
-    """Helper to handle the nonnegative storage lookup."""
+    """Return a two-sided Fourier coefficient from one-sided amplitude storage."""
     m_max, n_max = table.shape[0] - 1, table.shape[1] - 1
     if m >= 0 and n >= 0:
         if m <= m_max and n <= n_max:
-            return table[m, n]
+            value = table[m, n]
+            if m != 0 or n != 0:
+                value *= 0.5
+            return value
     elif m <= 0 and n <= 0:
         if -m <= m_max and -n <= n_max:
-            return np.conjugate(table[-m, -n])
+            value = np.conjugate(table[-m, -n])
+            if m != 0 or n != 0:
+                value *= 0.5
+            return value
     return 0.0 + 0.0j
 
 @njit(cache=True, nogil=True)
@@ -190,10 +210,10 @@ def assemble_full_matrices(
     A = [[A11, A12],    B = [[B11, 0  ],
          [0  , A22]]         [B21, B22]]
 
-    where A11 = G* H G,
-          A12 = gamma_s p_0 K
+    where A11 = G^H H G,
+          A12 = -mu_0 gamma_s p_0 K
           A21 = 0
-          A22 = gamma_s p_0 G* M G
+          A22 = mu_0 gamma_s p_0 G^H M G
           B11 = J
           B12 = 0
           B21 = K
