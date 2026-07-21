@@ -58,6 +58,245 @@ _ALLOWED_EXPRESSION_FUNCTIONS = {
 }
 _ALLOWED_EXPRESSION_CONSTANTS = {"pi": np.pi, "e": np.e, "mu_0": 1*unyt.mu_0}
 
+_THETA_CROSS_METRIC_FIELDS = frozenset(
+    {
+        "gpsi_theta",
+        "gtheta_psi",
+        "gtheta_zeta",
+        "gzeta_theta",
+    }
+)
+
+
+def _active_poloidal_flux_span(psi0) -> float:
+    """Return the positive physical flux span represented by ``psi0``."""
+    values = np.asarray(psi0, dtype=np.float64)
+    if values.size < 2 or not np.all(np.isfinite(values)):
+        raise ValueError("The Boozer poloidal-flux grid must contain finite values.")
+    span = float(np.max(values) - np.min(values))
+    if not np.isfinite(span) or span <= 0.0:
+        raise ValueError("The Boozer poloidal-flux grid must have a positive span.")
+    return span
+
+
+def _outward_boozer_interpolation_grid(
+    psi0: xr.DataArray,
+    normalized_profile_grid,
+) -> np.ndarray:
+    """Map an axis-to-edge profile grid onto the active physical-psi interval.
+
+    pyCOCOS stores ``psi0`` in increasing numerical order for spline safety,
+    which is not necessarily the physical axis-to-boundary order.  The
+    explicit endpoint metadata preserves that distinction.
+    """
+    values = np.asarray(psi0, dtype=np.float64)
+    x = np.asarray(normalized_profile_grid, dtype=np.float64)
+    if x.size == 0 or not np.all(np.isfinite(x)):
+        raise ValueError("The normalized profile grid must contain finite values.")
+    tolerance = 100.0 * np.finfo(np.float64).eps
+    if np.any(x < -tolerance) or np.any(x > 1.0 + tolerance):
+        raise ValueError("The normalized profile grid must lie in [0, 1].")
+    x = np.clip(x, 0.0, 1.0)
+
+    attrs = getattr(psi0, "attrs", {})
+    if "psi_axis" not in attrs or "psi_boundary" not in attrs:
+        raise ValueError(
+            "Boozer psi0 must define psi_axis and psi_boundary metadata. "
+            "Recompute the coordinates with convention-aware pyCOCOS."
+        )
+
+    psi_axis = float(attrs["psi_axis"])
+    psi_boundary = float(attrs["psi_boundary"])
+    physical_span = psi_boundary - psi_axis
+    if (
+        not np.isfinite(psi_axis)
+        or not np.isfinite(psi_boundary)
+        or np.isclose(physical_span, 0.0)
+    ):
+        raise ValueError("Boozer psi_axis and psi_boundary must be finite and distinct.")
+
+    psi_normalized = (values - psi_axis) / physical_span
+    if not np.all(np.isfinite(psi_normalized)):
+        raise ValueError("The Boozer physical normalized-flux grid must be finite.")
+    active_axis = float(np.min(psi_normalized))
+    active_boundary = float(np.max(psi_normalized))
+    if active_boundary <= active_axis:
+        raise ValueError("The active Boozer normalized-flux interval must be nonempty.")
+    target_normalized = active_axis + x * (active_boundary - active_axis)
+    return psi_axis + target_normalized * physical_span
+
+
+def _one_signed_orientation(values, name: str) -> int:
+    """Return the common sign of a finite, nonzero, one-signed profile."""
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values.")
+    scale = float(np.max(np.abs(array)))
+    if scale == 0.0:
+        raise ValueError(f"{name} must not vanish identically.")
+    zero = np.abs(array) <= 100.0 * np.finfo(np.float64).eps * scale
+    if np.any(zero):
+        raise ValueError(f"{name} must remain nonzero over the active flux domain.")
+    signs = np.sign(array)
+    if not np.all(signs == signs.flat[0]):
+        raise ValueError(f"{name} must have one sign over the active flux domain.")
+    return int(signs.flat[0])
+
+
+def _validate_internal_equilibrium_convention(equilibrium) -> None:
+    """Require explicit canonical COCOS metadata at the solver boundary."""
+    required_metadata = (
+        "cocos_internal",
+        "phiclockwise_internal",
+        "flux_normalization_internal",
+    )
+    missing = [name for name in required_metadata if not hasattr(equilibrium, name)]
+    if missing:
+        raise ValueError(
+            "superNOVA requires explicit internal COCOS metadata; missing: "
+            + ", ".join(missing)
+            + ". Load EQDSK inputs with convention-aware pyCOCOS."
+        )
+
+    cocos_internal = equilibrium.cocos_internal
+    if (
+        isinstance(cocos_internal, (bool, np.bool_))
+        or not isinstance(cocos_internal, (int, np.integer))
+        or int(cocos_internal) != 1
+    ):
+        raise ValueError(
+            "superNOVA requires equilibrium arrays converted to internal COCOS 1."
+        )
+
+    phiclockwise_internal = equilibrium.phiclockwise_internal
+    if (
+        not isinstance(phiclockwise_internal, (bool, np.bool_))
+        or bool(phiclockwise_internal)
+    ):
+        raise ValueError(
+            "superNOVA requires phiclockwise_internal=False for internal COCOS 1."
+        )
+
+    if equilibrium.flux_normalization_internal != "Wb/rad":
+        raise ValueError(
+            "superNOVA requires flux_normalization_internal='Wb/rad' for "
+            "internal COCOS 1."
+        )
+
+
+def _canonicalize_boozer_flux_profiles(
+    h,
+    q,
+    F,
+    I,
+):
+    """Orient flux functions to positive-q NOVA coordinates."""
+    h_raw = np.asarray(h, dtype=np.float64)
+    q_raw = np.asarray(q, dtype=np.float64)
+    F_raw = np.asarray(F, dtype=np.float64)
+    I_raw = np.asarray(I, dtype=np.float64)
+    if not (
+        h_raw.shape == q_raw.shape == F_raw.shape == I_raw.shape
+        and np.all(np.isfinite(h_raw))
+        and np.all(np.isfinite(F_raw))
+        and np.all(np.isfinite(I_raw))
+    ):
+        raise ValueError("Boozer flux profiles must be finite and share one shape.")
+
+    identity = q_raw * F_raw + I_raw
+    identity_scale = max(1.0, float(np.max(np.abs(h_raw))))
+    if not np.allclose(
+        h_raw,
+        identity,
+        rtol=5.0e-6,
+        atol=1.0e-8 * identity_scale,
+    ):
+        relative_residual = float(np.max(np.abs(h_raw - identity))) / identity_scale
+        raise ValueError(
+            "Raw Boozer profiles do not satisfy h = q*F + I "
+            f"(relative residual {relative_residual:.3e})."
+        )
+    # Interpolating h, q, F, and I separately introduces a tiny product-rule
+    # mismatch. Restore the exact Boozer identity at the solver grid. A negative-q
+    # coordinate representation is handled below by Theta -> -Theta.
+    h_raw = identity
+
+    orientation = _one_signed_orientation(q_raw, "Boozer q")
+    h_nova = orientation * h_raw
+    q_nova = orientation * q_raw
+    I_nova = orientation * I_raw
+    F_nova = F_raw.copy()
+    if np.any(q_nova <= 0.0):
+        raise ValueError("The oriented NOVA safety factor must be positive.")
+    _one_signed_orientation(h_nova, "Oriented NOVA Boozer Jacobian factor h")
+    if not np.allclose(
+        h_nova,
+        q_nova * F_nova + I_nova,
+        rtol=1.0e-8,
+        atol=1.0e-10 * identity_scale,
+    ):
+        raise ValueError("Oriented Boozer profiles do not satisfy h = q*F + I.")
+    return h_nova, q_nova, F_nova, I_nova, orientation
+
+
+def _reflect_boozer_theta(dataset: xr.Dataset, orientation: int) -> xr.Dataset:
+    """Express a magnetic dataset in the positive-q poloidal angle."""
+    if orientation not in (-1, 1):
+        raise ValueError("The Boozer poloidal orientation must be +1 or -1.")
+    out = dataset.copy(deep=True)
+    if orientation == 1:
+        return out
+    if "theta" not in out.coords:
+        raise ValueError("The magnetic dataset has no theta coordinate to reflect.")
+
+    theta = np.asarray(out.coords["theta"], dtype=np.float64)
+    if theta.size < 2 or not np.all(np.isfinite(theta)) or np.any(np.diff(theta) <= 0.0):
+        raise ValueError("The magnetic theta grid must be finite and increasing.")
+    steps = np.diff(theta)
+    if not np.allclose(steps, steps[0], rtol=1.0e-7, atol=1.0e-12):
+        raise ValueError("The magnetic theta grid must be uniformly spaced.")
+
+    includes_endpoint = np.isclose(
+        theta[-1] - theta[0], 2.0 * np.pi, rtol=1.0e-7, atol=1.0e-10
+    )
+    if includes_endpoint:
+        indices = np.concatenate(
+            (np.array([0]), np.arange(theta.size - 2, 0, -1), np.array([theta.size - 1]))
+        )
+    elif np.isclose(
+        steps[0] * theta.size, 2.0 * np.pi, rtol=1.0e-7, atol=1.0e-10
+    ):
+        indices = np.concatenate((np.array([0]), np.arange(theta.size - 1, 0, -1)))
+    else:
+        raise ValueError("The magnetic theta grid must cover one periodic interval.")
+
+    for name in out.data_vars:
+        field = out[name]
+        if "theta" not in field.dims:
+            continue
+        axis = field.get_axis_num("theta")
+        reflected = np.take(np.asarray(dataset[name]), indices, axis=axis)
+        out[name].values[...] = reflected
+
+    for name in _THETA_CROSS_METRIC_FIELDS:
+        if name in out:
+            out[name] *= orientation
+    return out
+
+
+def _orient_realspace_boozer_components(
+    dataset: xr.Dataset,
+    orientation: int,
+) -> xr.Dataset:
+    """Orient coordinate-indexed R-Z fields without moving physical points."""
+    if orientation not in (-1, 1):
+        raise ValueError("The Boozer poloidal orientation must be +1 or -1.")
+    for name in _THETA_CROSS_METRIC_FIELDS:
+        if name in dataset:
+            dataset[name] *= orientation
+    dataset.attrs["poloidal_coordinate_orientation"] = orientation
+    return dataset
+
 
 def _axisymmetric_cylindrical_local_shear(A, R, d_dr, d_dz):
     """Return NOVA local shear from an axisymmetric cylindrical vector A."""
@@ -80,6 +319,10 @@ class superEquilibrium:
     It will also contain important equilibrium profiles like the background
     flows, density, pressur and resistivity profiles, which are important for the stability analysis.
     """
+    cocos_internal = 1
+    phiclockwise_internal = False
+    flux_normalization_internal = "Wb/rad"
+
     def __init__(self, equ: Equilibrium, density: Profile, pressure: Profile,
                  m_max: int=128,
                  resistivity: Profile=None, vtor: Profile=None, vpol: Profile=None,
@@ -106,6 +349,7 @@ class superEquilibrium:
         """
          # We store internally the equilibrium data
         self.equ: Equilibrium = equ
+        _validate_internal_equilibrium_convention(self.equ)
         self.density: Profile = density
         self.pressure: Profile = pressure
         self.vtor: Profile = vtor
@@ -193,23 +437,28 @@ class superEquilibrium:
         It gets and regularizes some important profiles from the Boozer coordinates that 
         are commonly used across the problem.
 
-        I = \int B \cdot dl, the toroidal current function (divided by 2\pi).
+        I = B_\Theta, the covariant Boozer current function.
         g = RB_Tor
         q = \frac{1}{2\pi} \int \frac{B \cdot dl}{RB_Tor} (Global safety factor)
         h = gq + I --> This is the factor to make the toroidal angle straight in the Boozer coordinates.
         """
          # Evaluate the function h(\Psi):
-        psiN = (self.boozer.deriv.h.psi0 - self.boozer.deriv.h.psi0.min()) / \
-               (self.boozer.deriv.h.psi0.max() - self.boozer.deriv.h.psi0.min())
-        psi0min = self.boozer.deriv.h.psi0.min().item()
-        psi0max = self.boozer.deriv.h.psi0.max().item()
-        psiNorm = (psi0max - psi0min)
-        psigrid = self.density.x * psiNorm + psi0min
+        psigrid = _outward_boozer_interpolation_grid(
+            self.boozer.deriv.h.psi0,
+            self.density.x,
+        )
 
-        h = self.boozer.deriv.h.squeeze()
-        q = self.boozer.deriv.q.squeeze()
-        F = self.boozer.deriv.F.squeeze()
-        I = self.boozer.deriv.I.squeeze()
+        required = ("h", "q", "F", "I")
+        missing = [name for name in required if name not in self.boozer.deriv]
+        if missing:
+            raise ValueError(
+                "The Boozer derivative dataset is missing required profiles: "
+                + ", ".join(missing)
+            )
+        h = self.boozer.deriv.h.squeeze().copy(deep=True)
+        q = self.boozer.deriv.q.squeeze().copy(deep=True)
+        F = self.boozer.deriv.F.squeeze().copy(deep=True)
+        I = self.boozer.deriv.I.squeeze().copy(deep=True)
 
         # Let's check if the innermost point show a divergence.
         if np.abs(h[0]) < 1e-6:
@@ -224,10 +473,18 @@ class superEquilibrium:
             F.values[-1] = F.values[-2]
             I.values[-1] = I.values[-2]
 
-        h = np.abs(h.interp(psi0=psigrid, method='cubic').values)
-        q = np.abs(q.interp(psi0=psigrid, method='cubic').values)
-        F = np.abs(F.interp(psi0=psigrid, method='cubic').values)
-        I = np.abs(I.interp(psi0=psigrid, method='cubic').values)
+        h_raw = h.interp(psi0=psigrid, method='cubic').values
+        q_raw = q.interp(psi0=psigrid, method='cubic').values
+        F_raw = F.interp(psi0=psigrid, method='cubic').values
+        I_raw = I.interp(psi0=psigrid, method='cubic').values
+        h, q, F, I, self._poloidal_orientation = (
+            _canonicalize_boozer_flux_profiles(
+                h_raw,
+                q_raw,
+                F_raw,
+                I_raw,
+            )
+        )
 
 
         self.hprof = Profile(F_nm=h, x=self.density.x, attrs={'units': 'T*m', 'name': 'h'})
@@ -242,7 +499,7 @@ class superEquilibrium:
 
         This will prepare:
             - All contravariant metric coefficients (g^{ij}).
-            - Un-normalized diamagnetic vector: \hat{s} = \nabla \Psi \times \mathbf{B}.
+            - Un-normalized diamagnetic vector: \hat{s} = \mathbf{B} \times \nabla \Psi.
             - Normalized diamagnetic vector: \hat{s}_N = \hat{s} / g^\psi\psi
             - Magnetic field components.
             - Curvature: \kappa = \hat{b} \cdot \nabla \hat{b}.
@@ -264,8 +521,10 @@ class superEquilibrium:
 
         for ii in ['psi', 'theta', 'zeta']:
             for jj in ['psi', 'theta', 'zeta']:
-                tmp = self.boozer.metric(ii, jj, 
-                                            return_psi_norm=True
+                tmp = self.boozer.metric(
+                    ii,
+                    jj,
+                    tensor="contravariant",
                 ).interp(R=self.equ.B.R.values, z=self.equ.B.z.values, method='linear')
                 self.realspace[f'g{ii}_{jj}'] = tmp
 
@@ -321,7 +580,7 @@ class superEquilibrium:
                                                    z=self.equ.B.z,
                                                    method='linear')
         self.realspace['jac'] = xr.DataArray(
-            np.abs(jac.values),
+            self._poloidal_orientation * jac.values,
             coords={'R': self.equ.B.R, 'z': self.equ.B.z},
             dims=['R', 'z'],
             attrs={'description': 'Coordinate transformation Jacobian.',
@@ -339,7 +598,7 @@ class superEquilibrium:
                          self.equ.Jdata.Jphi.values,
                          self.equ.Jdata.Jz.values))
         
-        JB = np.sum(Jvec*B0, axis=0) # Parallel component of the current
+        JB = np.sum(Jvec*B0, axis=0)
         Jdiag = np.sum(Jvec*s, axis=0) # Diamagnetic component of the current
         self.realspace['J_B'] = xr.DataArray(JB, dims = ('R', 'z'),
                                              attrs={'description': r'$\vec{J}\cdot\vec{B}$',
@@ -371,16 +630,30 @@ class superEquilibrium:
                                                        'units': '1/m**3'})
 
         # We also compute the following quantity:
-        # gpsipsi * div(\nabla\Psi/gpsipsi)
+        # div(\nabla\Psi/gpsipsi)
         gradpsi_norm = nabla_Psi / gpsipsi[None, ...]
         divPsiVec = d_dr(gradpsi_norm[0]) + d_dz(gradpsi_norm[2]) + gradpsi_norm[0]/R[:, None]
         self.realspace['divPsiVec'] = xr.DataArray(divPsiVec, 
                                                     dims=('R', 'z'),
                                                     attrs={'description': r'div(\nabla\Psi/||\nabla\Psi||^2).',
-                                                           'units': '1/m'})
+                                                           'units': '1/Wb'})
 
         # We can now transform all the (R, z) quantities to the (Psi, Theta) coordinates.
         self.magspace = self.boozer.cyl2mag_scalar(field=self.realspace, return_psi_norm=True)
+        self.magspace = _reflect_boozer_theta(
+            self.magspace,
+            self._poloidal_orientation,
+        )
+        # Transforming the raw metric first and reflecting the magnetic-space
+        # result above avoids a double sign.  The R-Z cache remains at the same
+        # physical points, so only its coordinate components need reorientation.
+        self.realspace = _orient_realspace_boozer_components(
+            self.realspace,
+            self._poloidal_orientation,
+        )
+        self.magspace.attrs['poloidal_coordinate_orientation'] = (
+            self._poloidal_orientation
+        )
 
         # We will add to the magnetic space the h, pressure, density, q, I and the flows.
         prof = [self.hprof, self.qprof, self.Fprof, self.Iprof,

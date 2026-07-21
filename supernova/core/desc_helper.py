@@ -12,7 +12,10 @@ from scipy.optimize import least_squares
 
 from ..radial.profile import Profile
 from .desc_loader import *
-from .equilibrium import superEquilibrium
+from .equilibrium import (
+    _validate_internal_equilibrium_convention,
+    superEquilibrium,
+)
 
 
 def _profile_values(profile: Profile):
@@ -20,6 +23,30 @@ def _profile_values(profile: Profile):
         profile.data.sel(mpol=0, ntor=0).values.real,
         dtype=np.float64,
     )
+
+
+def _reflect_boozer_surface_arrays(data, metric, shear, div_psi, orientation):
+    """Express DESC surface arrays in the solver's positive-q Boozer angle."""
+    if orientation not in (-1, 1):
+        raise ValueError("The Boozer poloidal orientation must be +1 or -1.")
+    if orientation == 1:
+        return data, metric, shear, div_psi
+
+    ntheta = metric.shape[1]
+    indices = np.concatenate(([0], np.arange(ntheta - 1, 0, -1)))
+    reflected = {
+        name: np.take(values, indices, axis=1)
+        for name, values in data.items()
+    }
+    metric = np.take(metric, indices, axis=1)
+    shear = np.take(shear, indices, axis=1)
+    div_psi = np.take(div_psi, indices, axis=1)
+
+    # Theta'=-Theta: a contravariant metric component changes sign exactly
+    # when it carries one theta index.
+    metric[..., 1, :] *= -1.0
+    metric[..., :, 1] *= -1.0
+    return reflected, metric, shear, div_psi
 
 
 def _rho_tor_from_q(psipol, q):
@@ -377,6 +404,7 @@ class DESCSolver(superEquilibrium):
         **kwargs,
     ):
         """Build the same solver from an EQDSK object."""
+        _validate_internal_equilibrium_convention(equ)
         if "q" not in equ.gs_profs or "pres" not in equ.gs_profs:
             raise ValueError("The EQDSK must contain q and pressure profiles.")
         if not 0.0 < rhop_boundary <= 1.0:
@@ -619,14 +647,29 @@ class DESCSolver(superEquilibrium):
             for j in range(3):
                 g[..., i, j] = _to_boozer(g[..., i, j], theta_B, theta)
 
+        q_raw = np.asarray(data["q"][:, 0], dtype=np.float64)
+        if (
+            not np.all(np.isfinite(q_raw))
+            or np.any(np.isclose(q_raw, 0.0))
+            or np.any(np.sign(q_raw) != np.sign(q_raw[0]))
+        ):
+            raise ValueError("DESC Boozer q must be finite, nonzero, and one-signed.")
+        orientation = int(np.sign(q_raw[0]))
+        data, g, shear, divPsiVec = _reflect_boozer_surface_arrays(
+            data,
+            g,
+            shear,
+            divPsiVec,
+            orientation,
+        )
+
         chi = data["chi"][:, 0]
         chi_r = data["chi_r"][:, 0]
-        orientation = np.sign(data["q"][0, 0])
         q = orientation * data["q"][:, 0]
         G = data["G"][:, 0]
-        I_boozer = orientation * data["I"][:, 0]
+        I = orientation * data["I"][:, 0]
         B = data["|B|"]
-        h = q * G + I_boozer
+        h = q * G + I
         jac = h[:, None] / B**2
         gpp = g[..., 0, 0]
 
@@ -636,6 +679,7 @@ class DESCSolver(superEquilibrium):
 
         coords = {"psi": x, "theta": theta}
         self.magspace = xr.Dataset(coords=coords)
+        self.magspace.attrs["poloidal_coordinate_orientation"] = orientation
 
         def add(name, values, units):
             dims = ("psi",) if np.ndim(values) == 1 else ("psi", "theta")
@@ -643,9 +687,9 @@ class DESCSolver(superEquilibrium):
             self.magspace[name].attrs["units"] = units
 
         add("psi_pol_norm", x, "1")
-        add("psi_pol", chi, "Wb")
+        add("psi_pol", chi, "Wb/rad")
         add("rho_tor", rho, "1")
-        add("dpsi_pol_drho", chi_r, "Wb")
+        add("dpsi_pol_drho", chi_r, "Wb/rad")
         add("theta_B", np.broadcast_to(theta[None, :], (npsi, ntheta)), "rad")
         add("theta_DESC", data["theta_DESC"], "rad")
         add("zeta_B", data["zeta_B"], "rad")
@@ -675,8 +719,7 @@ class DESCSolver(superEquilibrium):
         add("G", G, "T*m")
         add("F", G, "T*m")
         add("g", G, "T*m")
-        add("I_boozer", I_boozer, "T*m")
-        add("I", 2 * np.pi * I_boozer, "T*m")
+        add("I", I, "T*m")
         add("h", h, "T*m")
         add("density", np.interp(x, self.density.x, _profile_values(self.density)), "m**-3")
         add("pressure", np.interp(x, self.pressure.x, _profile_values(self.pressure)), "Pa")
@@ -690,7 +733,7 @@ class DESCSolver(superEquilibrium):
         self.qprof.data *= orientation
         self.Fprof = Profile(x=x, F_nm=G, attrs={"units": "T*m", "name": "F"})
         self.gprof = Profile(x=x, F_nm=G, attrs={"units": "T*m", "name": "g"})
-        self.Iprof = Profile(x=x, F_nm=2 * np.pi * I_boozer, attrs={"units": "T*m", "name": "I"})
+        self.Iprof = Profile(x=x, F_nm=I, attrs={"units": "T*m", "name": "I"})
         self.hprof = Profile(x=x, F_nm=h, attrs={"units": "T*m", "name": "h"})
         x_full = np.unique(np.concatenate(([0.0], x, [1.0])))
         self.hprof.data = self.hprof.data.interp(
@@ -699,7 +742,19 @@ class DESCSolver(superEquilibrium):
         )
         self._cache.clear()
 
-        psi0 = xr.DataArray(chi_edge * self.qin.x, dims="psi", coords={"psi": self.qin.x})
+        psi0 = xr.DataArray(
+            chi_edge * self.qin.x,
+            dims="psi",
+            coords={"psi": self.qin.x},
+            attrs={
+                "units": "Wb/rad",
+                "psi_axis": 0.0,
+                "psi_boundary": chi_edge,
+                "normalization": (
+                    "psi_N = (psi - psi_axis) / (psi_boundary - psi_axis)"
+                ),
+            },
+        )
         self.boozer = SimpleNamespace(coords=SimpleNamespace(psi0=psi0))
         self.equ = SimpleNamespace(
             desc_equilibrium=self.desc_equilibrium,
