@@ -65,6 +65,10 @@ class ITPAEq(superEquilibrium):
         self._rho = r_minor / self.aminor
         self._theta_geom = theta_geom
         self._theta = theta
+        # With psi increasing outwards and zeta=phi, the geometric circular
+        # angle has negative q in internal COCOS 1.  The solver gauge is the
+        # coordinate reflection Theta=-theta_raw, not a physical B reversal.
+        self._poloidal_orientation = -1
 
         q = self._q_of_r(r_minor)
         qbar = self._qbar_of_r(r_minor)
@@ -103,7 +107,8 @@ class ITPAEq(superEquilibrium):
         )
 
         F = np.full_like(psi, self.Baxis * self.Rmajor)
-        I = self._I_of_r(r_minor, dpsi_dr, theta_geom)
+        I_raw = self._I_of_r(r_minor, dpsi_dr, theta_geom)
+        I = self._poloidal_orientation * I_raw
         h = F * q + I
         self.hprof = self._make_profile(psi, h, units="T*m", name="h")
         self.qprof = self._make_profile(psi, q, units="1", name="q")
@@ -150,6 +155,8 @@ class ITPAEq(superEquilibrium):
         return self._q_of_r(r_minor) * aspect_factor
 
     def _dpsi_dr(self, r_minor: np.ndarray) -> np.ndarray:
+        # qbar is the positive solver-gauge magnitude.  The COCOS-1 sign of
+        # the physical poloidal field is applied separately in _build_magspace.
         qbar = self._qbar_of_r(r_minor)
         return self.Baxis * r_minor / qbar
 
@@ -160,14 +167,17 @@ class ITPAEq(superEquilibrium):
         theta: np.ndarray,
     ) -> np.ndarray:
         r"""
-        Return the circular-surface Boozer current function.
+        Return the raw geometric-angle Boozer current function.
 
         For a circular flux surface, ``I = (1 / 2 pi) int B . dl`` reduces to
-        ``r <B_theta>_theta`` with ``B_theta = (dPsi / dr) / R(theta)``.
+        ``r <B_theta>_theta``.  Internal COCOS 1 with outward-increasing
+        ``Psi`` has ``B_theta = -(dPsi / dr) / R(theta)``, so this raw current
+        and raw q are negative.  Both become positive under the solver-facing
+        coordinate reflection ``Theta=-theta_raw``.
         """
         r = r_minor[:, None]
         R = self.Rmajor + r * np.cos(theta)[None, :]
-        Btheta = dpsi_dr[:, None] / R
+        Btheta = -dpsi_dr[:, None] / R
         return r_minor * np.mean(Btheta, axis=1)
 
     def _current_coordinate_jacobian(
@@ -181,12 +191,15 @@ class ITPAEq(superEquilibrium):
 
         The current coordinates are physical poloidal flux ``Psi``, geometric
         poloidal angle, and the toroidal angle. For circular surfaces,
-        ``dV = R r dr dtheta dzeta``, so ``sqrt(g) = R r / (dPsi / dr)``.
+        the signed triple product is
+        ``J = -R r / (dPsi / dr)`` for ``Z=r sin(theta)`` and
+        counterclockwise ``zeta=phi``.  The subsequent positive-q reflection
+        changes the sign of both ``theta`` and ``J``.
         """
         r = r_minor[:, None]
         psi_prime = dpsi_dr[:, None]
         psi_prime_safe = np.where(psi_prime == 0.0, dpsi_dr[1], psi_prime)
-        return self._regularize_axis(R * r / psi_prime_safe)
+        return self._regularize_axis(-R * r / psi_prime_safe)
 
     @staticmethod
     def _interp_periodic_rows(
@@ -206,19 +219,28 @@ class ITPAEq(superEquilibrium):
         psi: np.ndarray,
         theta_geom: np.ndarray,
         theta_magnetic: np.ndarray,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, np.ndarray | int]:
         jac_current = self.magspace["jac_current"].values
         jac_boozer = self.magspace["jac_boozer"].values
-        weight = np.divide(
+        signed_ratio = np.divide(
             jac_current,
             jac_boozer,
             out=np.ones_like(jac_current),
             where=jac_boozer != 0.0,
         )
-        if not np.all(np.isfinite(weight)):
+        if not np.all(np.isfinite(signed_ratio)):
             raise ValueError("Cannot build magnetic angle from non-finite Jacobian ratio.")
+        ratio_sign = np.sign(signed_ratio)
+        if np.any(ratio_sign == 0.0) or not np.all(ratio_sign == ratio_sign.flat[0]):
+            raise ValueError("Magnetic-angle Jacobian ratio must be nonzero and one-signed.")
+        orientation = int(ratio_sign.flat[0])
+        if orientation != self._poloidal_orientation:
+            raise ValueError(
+                "Analytic ITPA poloidal orientation disagrees with its signed Jacobian."
+            )
+        weight = orientation * signed_ratio
         if np.any(weight <= 0.0):
-            raise ValueError("Cannot build magnetic angle from non-positive Jacobian ratio.")
+            raise ValueError("Cannot build magnetic angle from non-positive Jacobian magnitude ratio.")
 
         theta_ext = np.concatenate([theta_geom, [2.0 * np.pi]])
         weight_ext = np.concatenate([weight, weight[:, :1]], axis=1)
@@ -230,14 +252,19 @@ class ITPAEq(superEquilibrium):
         theta_of_geom_ext = np.zeros((weight.shape[0], weight.shape[1] + 1), dtype=np.float64)
         theta_of_geom_ext[:, 1:] = np.cumsum(increments, axis=1)
         theta_of_geom_ext *= (2.0 * np.pi / total)[:, None]
+        theta_of_geom_ext *= orientation
         theta_of_geom = theta_of_geom_ext[:, :-1]
-        dtheta_dtheta_geom = weight * (2.0 * np.pi / total)[:, None]
+        dtheta_dtheta_geom = (
+            orientation * weight * (2.0 * np.pi / total)[:, None]
+        )
 
         theta_geom_of_theta = np.empty((weight.shape[0], theta_magnetic.size), dtype=np.float64)
+        alpha_of_geom_ext = orientation * theta_of_geom_ext
+        alpha_target = np.mod(orientation * theta_magnetic, 2.0 * np.pi)
         for ipsi in range(weight.shape[0]):
             theta_geom_of_theta[ipsi] = np.interp(
-                theta_magnetic,
-                theta_of_geom_ext[ipsi],
+                alpha_target,
+                alpha_of_geom_ext[ipsi],
                 theta_ext,
             )
 
@@ -259,6 +286,7 @@ class ITPAEq(superEquilibrium):
             "theta_geom_of_theta": theta_geom_of_theta,
             "dtheta_dtheta_geom": dtheta_dtheta_geom_on_theta,
             "dtheta_dpsi_geom": dtheta_dpsi_geom_on_theta,
+            "coordinate_orientation": orientation,
         }
 
     @staticmethod
@@ -306,6 +334,7 @@ class ITPAEq(superEquilibrium):
         theta_geom_of_theta = mapping["theta_geom_of_theta"]
         dtheta_dtheta_geom = mapping["dtheta_dtheta_geom"]
         dtheta_dpsi_geom = mapping["dtheta_dpsi_geom"]
+        coordinate_orientation = int(mapping["coordinate_orientation"])
 
         coords = {"psi": psi, "theta": theta_magnetic}
         values_on_theta: dict[str, np.ndarray] = {}
@@ -338,7 +367,10 @@ class ITPAEq(superEquilibrium):
         jac_current = values_on_theta["jac_current"]
         jac_boozer = values_on_theta["h"][:, None] / values_on_theta["B0"]**2
         jac_magnetic = jac_current / dtheta_dtheta_geom
-        geom_error = jac_current - jac_boozer
+        # jac_current belongs to the raw geometric angle, while jac_boozer is
+        # in the positive-q solver gauge.  Align their coordinate orientation
+        # before diagnosing the pre-remap magnitude error.
+        geom_error = coordinate_orientation * jac_current - jac_boozer
         geom_rel_error = np.divide(
             geom_error,
             jac_boozer,
@@ -371,7 +403,7 @@ class ITPAEq(superEquilibrium):
         attrs.update(
             {
                 "jac_current": self._replace_attrs(
-                    "Geometric-coordinate Jacobian sampled on the magnetic-angle grid.",
+                    "Signed raw geometric-coordinate Jacobian sampled on the magnetic-angle grid.",
                     "m**3/Wb",
                 ),
                 "jac_boozer": self._replace_attrs(
@@ -383,7 +415,7 @@ class ITPAEq(superEquilibrium):
                     "m**3/Wb",
                 ),
                 "jac_geometric_boozer_error": self._replace_attrs(
-                    "Geometric-coordinate Jacobian minus h / |B|**2.",
+                    "Orientation-aligned geometric-coordinate Jacobian minus h / |B|**2.",
                     "m**3/Wb",
                 ),
                 "jac_geometric_boozer_rel_error": self._replace_attrs(
@@ -435,6 +467,15 @@ class ITPAEq(superEquilibrium):
                 )
 
         self.magspace = xr.Dataset(data_vars)
+        self.magspace.attrs.update(
+            {
+                "poloidal_coordinate_orientation": coordinate_orientation,
+                "coordinate_convention": (
+                    "Internal COCOS 1; solver Theta is the positive-q reflection "
+                    "of the raw geometric circular angle."
+                ),
+            }
+        )
         self._theta = theta_magnetic
         self._rmajor = self.magspace["R"]
         self._z = self.magspace["z"]
@@ -507,7 +548,8 @@ class ITPAEq(superEquilibrium):
         psi_prime = dpsi_dr[:, None]
         psi_prime_safe = np.where(psi_prime == 0.0, dpsi_dr[1], psi_prime)
         psi_second = d2psi_dr2[:, None]
-        Btheta = psi_prime / R
+        # Internal COCOS 1: B=grad(phi) x grad(Psi) + F grad(phi).
+        Btheta = -psi_prime / R
         Bphi = F0 / R
         BR = -Btheta * sin_theta
         BZ = Btheta * cos_theta
@@ -523,7 +565,7 @@ class ITPAEq(superEquilibrium):
         kappa_phi = (btheta / r_safe) * dbphi_dtheta - (bphi * btheta) * sin_theta / R
 
         kappa_Psi = kappa_r * psi_prime
-        kappa_s = psi_prime * (kappa_theta * Bphi + kappa_phi * Btheta)
+        kappa_s = psi_prime * (- kappa_theta * Bphi + kappa_phi * Btheta)
 
         r_btheta = r * Btheta
         d_r_btheta_dr = np.gradient(r_btheta, r_minor, axis=0, edge_order=2)
@@ -540,7 +582,7 @@ class ITPAEq(superEquilibrium):
         A = np.array(
             [
                 Bphi / psi_prime_safe * sin_theta,
-                1.0 / R,
+                Btheta / psi_prime_safe,
                 -Bphi / psi_prime_safe * cos_theta,
             ]
         )
@@ -672,7 +714,6 @@ class ITPAEq(superEquilibrium):
                     "description": description,
                 },
             )
-
     def _add_jacobian_diagnostics(self, r_minor: np.ndarray, dpsi_dr: np.ndarray):
         jac_current = self._current_coordinate_jacobian(
             r_minor,
@@ -680,7 +721,7 @@ class ITPAEq(superEquilibrium):
             self.magspace["R"].values,
         )
         jac_boozer = self.magspace["h"].values[:, None] / self.magspace["B0"].values**2
-        jac_error = jac_current - jac_boozer
+        jac_error = self._poloidal_orientation * jac_current - jac_boozer
         jac_rel_error = np.divide(
             jac_error,
             jac_boozer,
@@ -704,7 +745,7 @@ class ITPAEq(superEquilibrium):
         self.magspace["jac_current"] = da(
             jac_current,
             "m**3/Wb",
-            "Coordinate Jacobian estimate for current geometric coordinates.",
+            "Signed coordinate Jacobian for the raw geometric coordinates.",
         )
         self.magspace["jac_boozer"] = da(
             jac_boozer,
@@ -714,12 +755,12 @@ class ITPAEq(superEquilibrium):
         self.magspace["jac_boozer_error"] = da(
             jac_error,
             "m**3/Wb",
-            "Current-coordinate Jacobian minus h / |B|**2.",
+            "Orientation-aligned geometric Jacobian minus h / |B|**2.",
         )
         self.magspace["jac_boozer_rel_error"] = da(
             jac_rel_error,
             "1",
-            "Relative Boozer-Jacobian error: (jac_current - jac_boozer) / jac_boozer.",
+            "Relative orientation-aligned geometric Boozer-Jacobian error.",
         )
 
     def _relative_error_summary(self, name: str, skip_axis: bool = True) -> dict[str, float]:
@@ -903,7 +944,14 @@ class ITPAEq(superEquilibrium):
             psi * self._psi_edge,
             coords={"psi": psi},
             dims=("psi",),
-            attrs={"units": "Wb"},
+            attrs={
+                "units": "Wb/rad",
+                "psi_axis": 0.0,
+                "psi_boundary": self._psi_edge,
+                "normalization": (
+                    "psi_N = (psi - psi_axis) / (psi_boundary - psi_axis)"
+                ),
+            },
         )
         self.boozer = SimpleNamespace(coords=SimpleNamespace(psi0=psi0))
         self.equ = SimpleNamespace(
