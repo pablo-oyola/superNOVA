@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import xarray as xr
 import unyt
 from scipy.sparse.linalg import splu
-from .equilibrium import superEquilibrium
+from .equilibrium import superEquilibrium, _active_poloidal_flux_span
 from .continuum import superContinuum
 from .continuum import continuum_crossings, get_knots_clustered_at
 from ..radial.base import RadialFE
@@ -66,8 +66,8 @@ class superSolver:
         C   = (0    C22), 
 
         where C11 = 2 * K_\Psi, 
-        C22 = - g^{\psi\psi}* div (\nabla\Psi / g^{\psi\psi})
-        C12 = \lambda + 2\mu_0p_0'K_\Psi + sqrt(g) * g^{\psi\psi} G^H O G + \
+        C22 = - div (\nabla\Psi / g^{\psi\psi})
+        C12 = \lambda + 2\mu_0p_0'K_\Psi - sqrt(g) * g^{\psi\psi} G^H O G + \
               (J · B - Sg^{\psi\psi}) * S*g^{\psi\psi}/B^2,
         where O = 1/(sqrt(g)||\nabla\Psi||^2) and G = i(nq - m)\delta_{m,m'}\delta_{n,n'} and
         \lambda is the eigenvalue: \lambda = \omega^2 * \rho_0 * \mu_0.
@@ -79,9 +79,9 @@ class superSolver:
         where D11 = - (J · B - Sg^{\psi\psi}) * g^{\psi\psi}/(sqrt(g)*B^2) * G
               D12 = 2 \gamma_s * p_0 * \mu_0 K_\Psi
               D21 = g^{\psi\psi} * (2K_s - \sigma/(sqrt(g)*B^2))
-              D22 = g^{\psi\psi} * (1 + \mu_0 p_0 \gamma_s / \lambda G^H M G),
+              D22 = g^{\psi\psi} * (1 - \mu_0 p_0 \gamma_s / \lambda G^H M G),
               where
-              \sigma = i(In - gm)\delta_{m,m'}\delta_{n,n'}, and
+              \sigma = -i(gm + In)\delta_{m,m'}\delta_{n,n'}, and
               M = 1/(sqrt(g)B_0^2).
 
         F = (F11  F12)
@@ -103,16 +103,16 @@ class superSolver:
         g^{\Psi\Psi} = ||\nabla\Psi||^2 from the LHS to the RHS. After recalculation:
 
         C11 = 2*kappa_\Psi/g^{\psi\psi}
-        C12 = \lambda/g^{\psi\psi} + \mu_0 * p_0' * C11 + 1/sqrt(g) G^H O G + \
+        C12 = \lambda/g^{\psi\psi} + \mu_0 * p_0' * C11 - 1/sqrt(g) G^H O G + \
               (J · B - Sg^{\psi\psi}) * S/ B^2
         C22 = - \nabla·(\nabla\Psi/g^{\psi\psi}) --> Precomputed as divPsiVec
 
         D11 = - (J · B - Sg^{\psi\psi}) /(sqrt(g)*B^2) * G
         D12 = gamma_s * p_0 * mu_0 * C11
         D21 = 2*kappa_s - \sigma/(sqrt(g)*B^2)
-        D22 = 1 + \mu_0 p_0 \gamma_s / \lambda G^H M G
+        D22 = 1 - \mu_0 p_0 \gamma_s / \lambda G^H M G
 
-        Hence the final problem is:
+        For the stored basis ``exp(i*(n*zeta-m*Theta))``, the final problem is:
         \partial_\Psi (p_1, \xi_\psi) =
         (C + DE^-1F + i m g^{\psi\Theta}/g^{\psi\psi}
         - i n g^{\psi\zeta}/g^{\psi\psi}) (p_1, \xi_\psi)
@@ -137,8 +137,8 @@ class superSolver:
                        '-1/B0**4*h', # F21                                                        - 10
                        '-2*kappa_Psi/(gpsi_psi*B0**2)*h', # F22                                     - 11
                        '1/gpsi_psi', # Harmonic operator needed by lambda/gpsi_psi.               - 12
-                       'gpsi_theta/gpsi_psi', # Surface phase term for e^{i(m*theta-n*zeta)}.     - 13
-                       'gpsi_zeta/gpsi_psi', # Surface phase term for e^{i(m*theta-n*zeta)}.      - 14
+                       'gpsi_theta/gpsi_psi', # Surface phase term for e^{i(n*zeta-m*theta)}.     - 13
+                       'gpsi_zeta/gpsi_psi', # Surface phase term for e^{i(n*zeta-m*theta)}.      - 14
                        ]
         
         # We only build the elements at the collocation nodes
@@ -214,10 +214,12 @@ class superSolver:
         self.K.data = self.K.data.interp(x=self.unique_points)
 
         # We need to get for the radial derivative the underlying unit and scale
-        # of the flux. For the absolute value of the flux at the edge, psiN, we
-        # need to inquire the boozer coordinates.
-        psiN = np.abs(self.equ.boozer.coords.psi0).max() * unyt.Unit('Wb', registry=self.equ.registry)
-        psiN = psiN.data.in_base(self.equ.my_norm).to('psi0').v
+        # of the flux. Use the active-domain span so this derivative is
+        # invariant to the arbitrary additive offset of poloidal flux.
+        psiN = _active_poloidal_flux_span(
+            self.equ.boozer.coords.psi0
+        ) * unyt.Unit('Wb/rad', registry=self.equ.registry)
+        psiN = psiN.in_base(self.equ.my_norm).to('psi0').v
 
         # We need also to divide the density by the maximum density.
         n0 = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")
@@ -277,10 +279,12 @@ class superSolver:
         self.K.data = self.K.data.interp(x=self.unique_points)
 
         # We need to get for the radial derivative the underlying unit and scale
-        # of the flux. For the absolute value of the flux at the edge, psiN, we
-        # need to inquire the boozer coordinates.
-        psiN = np.abs(self.equ.boozer.coords.psi0).max() * unyt.Unit('Wb', registry=self.equ.registry)
-        psiN = psiN.data.in_base(self.equ.my_norm).to('psi0').v
+        # of the flux. Use the active-domain span so this derivative is
+        # invariant to the arbitrary additive offset of poloidal flux.
+        psiN = _active_poloidal_flux_span(
+            self.equ.boozer.coords.psi0
+        ) * unyt.Unit('Wb/rad', registry=self.equ.registry)
+        psiN = psiN.in_base(self.equ.my_norm).to('psi0').v
 
         # We need also to divide the density by the maximum density.
         n0 = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")

@@ -170,8 +170,15 @@ def _build_local_M_split(
     C0 = _combine_coo_tensors(
         xip1_shape,
         sb.C0,
-        _offset_coo_tensor(phase, 0, 0, xip1_shape, "phase"),
-        _offset_coo_tensor(phase, nmode, nmode, xip1_shape, "phase"),
+        _offset_coo_tensor(phase, 0, 0, xip1_shape, "phase", scale=-1.0),
+        _offset_coo_tensor(
+            phase,
+            nmode,
+            nmode,
+            xip1_shape,
+            "phase",
+            scale=-1.0,
+        ),
     )
     C1 = _offset_coo_tensor(
         _scale_coo_axis0(sb.C1, rho, "C1"),

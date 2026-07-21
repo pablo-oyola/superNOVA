@@ -435,10 +435,10 @@ def assemble_continuum(H: np.ndarray, K: np.ndarray, J: np.ndarray,
     A = [[A11, A12],    B = [[B11, 0  ],
          [0  , A22]]         [B21, B22]]
 
-    where A11 = G* H G,
-          A12 = gamma_s p_0 K
+    where A11 = G^H H G,
+          A12 = -mu_0 gamma_s p_0 K
           A21 = 0
-          A22 = gamma_s p_0 G* M G
+          A22 = mu_0 gamma_s p_0 G^H M G
           B11 = J
           B12 = 0
           B21 = K
@@ -559,7 +559,13 @@ def build_M_at(sb: solver_blocks2, omega: float, regularizer: float=1e-3) -> coo
     M = [[C'     D]
          [F   - E]],
 
-    where C' = C - (im(g^{\psi\theta}/g^{\psi\psi}) + in(g^{\psi\zeta}/g^{\psi\psi})) * ((1 0)(0 1))
+    where the direct angular phase is
+
+    ``P = (g^{psi,theta}/g^{psi,psi})(-i*m)
+          + (g^{psi,zeta}/g^{psi,psi})(+i*n)``
+
+    for ``exp(i*(n*zeta-m*theta))``, and ``C' = C - P*I`` because this
+    angular derivative is moved from the left-hand side to the radial RHS.
 
     this forms part of the ideal MHD problem:
 
@@ -611,8 +617,15 @@ def build_M_at(sb: solver_blocks2, omega: float, regularizer: float=1e-3) -> coo
             xip1_shape,
             "C1",
         ),
-        _offset_coo_tensor(phase, 0, 0, xip1_shape, "phase"),
-        _offset_coo_tensor(phase, nmode, nmode, xip1_shape, "phase"),
+        _offset_coo_tensor(phase, 0, 0, xip1_shape, "phase", scale=-1.0),
+        _offset_coo_tensor(
+            phase,
+            nmode,
+            nmode,
+            xip1_shape,
+            "phase",
+            scale=-1.0,
+        ),
     )
     D = _combine_coo_tensors(
         xip1_shape,

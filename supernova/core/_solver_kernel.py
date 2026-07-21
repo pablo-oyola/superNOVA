@@ -386,11 +386,11 @@ def scale_rows(matrix: np.ndarray, diag: np.ndarray, conj: bool=False):
 @njit(cache=True, nogil=True, inline="always")
 def scale_cols(matrix: np.ndarray, diag: np.ndarray, conj: bool=False):
     """
-    Multiply each matrix row by the corresponding diagonal factor in place.
+    Multiply each matrix column by the corresponding diagonal factor in place.
 
-    This is a small Numba helper for left multiplication by a diagonal matrix.
-    After the call, ``matrix[i, j]`` has been multiplied by ``diag[i]`` for all
-    columns ``j``. The operation mutates ``matrix`` and returns nothing.
+    This is a small Numba helper for right multiplication by a diagonal matrix.
+    After the call, ``matrix[i, j]`` has been multiplied by ``diag[j]`` for all
+    rows ``i``. The operation mutates ``matrix`` and returns nothing.
 
     It will be used to apply the following operation:
     H @ G, where G = diag(g) and H is the original matrix.
@@ -406,7 +406,7 @@ def scale_cols(matrix: np.ndarray, diag: np.ndarray, conj: bool=False):
     matrix : ndarray
         Two-dimensional complex matrix to mutate.
     diag : ndarray
-        One-dimensional row-scaling factors with length ``matrix.shape[0]``.
+        One-dimensional column-scaling factors with length ``matrix.shape[1]``.
     conj : bool, optional
         If True, use the complex conjugate of the diagonal factors. 
         Default is False.
@@ -557,8 +557,8 @@ def _build_static_blocks(
         g_diag = np.zeros(nstate, dtype=np.complex128)
         sigma_diag = np.zeros(nstate, dtype=np.complex128)
         for i in range(nstate):
-            g_diag[i] = -1j*(qprof[ipsi] * n_range[i] - m_range[i])
-            sigma_diag[i] = 1j * (Iprof[ipsi] * n_range[i] - gprof[ipsi] * m_range[i])
+            g_diag[i] = 1j*(qprof[ipsi] * n_range[i] - m_range[i])
+            sigma_diag[i] = - 1j * (Iprof[ipsi] * n_range[i] + gprof[ipsi] * m_range[i])
 
         # Now we create and fill other matrices.
         c12_2mat = np.zeros((nstate, nstate), dtype=np.complex128)
@@ -601,8 +601,8 @@ def _build_static_blocks(
         scale_rows(f12_1mat, g_diag) # G @ F12_1
         scale_cols(f12_2mat, g_diag) # F12_2 @ G
 
-        # We add the F12 contributions, and we also add the contribution of 
-        # the convolution of K with the 2\mu_0\gamma_s p_0 factor.
+        # We add the F12 contributions and the pressure-curvature term
+        # -mu_0 * p_0' * K. The continuum profile K already contains 2*K_s.
         F[ipsi, :nstate, nstate:] += f12_1mat + f12_2mat \
             - kmat * mu_0 * pressure_deriv[ipsi] 
 
@@ -610,7 +610,7 @@ def _build_static_blocks(
         fill_block_kernel(one_gpp[ipsi], m_range, n_range, C1[ipsi], max_dm=dm_max, max_dn=dn_max)
         fill_block_kernel(M[ipsi], m_range, n_range, D1[ipsi], max_dm=dm_max, max_dn=dn_max)
         apply_ghg_scaling(D1[ipsi], qprof[ipsi], n_range, m_range) # D1 = G^H @ M @ G.
-        D1[ipsi] *= -mu_0 * gamma_s * pressure[ipsi] # We scale D1 by the 2\mu_0\gamma_s p_0 factor.
+        D1[ipsi] *= -mu_0 * gamma_s * pressure[ipsi]
 
         # And finally we fill the gpt_over_gpp and gpz_over_gpp matrices, that will be used to apply the convolution with the G operator in the solver.+
         fill_block_kernel(gtp_over_gpp[ipsi], m_range, n_range, gtp_over_gpp_mat[ipsi], max_dm=dm_max, max_dn=dn_max)
@@ -990,10 +990,13 @@ def eval_M_at(sb: solver_blocks, omega: float, regularizer: float=None, get_Mpri
         C[:n_harm, n_harm:] += sb.C1[ipsi] * lambda_target[ipsi] # C = C0 + C1*lambda
         M[ipsi] += C # C + D @ E^-1 @ F
 
-        # Finally, add the radial-surface phase to both p1 and xi equations.
+        # The stored surface phase is the direct angular part of
+        # (g^{psi,theta} d_theta + g^{psi,zeta} d_zeta)/g^{psi,psi},
+        # with d_theta=-i*m and d_zeta=+i*n.  It lives on the left-hand side
+        # of the radial equation, so subtract it from the local radial RHS.
         phase = sb.gtp_over_gpp[ipsi] + sb.gpz_over_gpp[ipsi]
-        M[ipsi, :n_harm, :n_harm] += phase
-        M[ipsi, n_harm:, n_harm:] += phase
+        M[ipsi, :n_harm, :n_harm] -= phase
+        M[ipsi, n_harm:, n_harm:] -= phase
 
     if get_Mprime:
         Mprime = _apply_Eprime_inv(
