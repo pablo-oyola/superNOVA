@@ -12,7 +12,11 @@ import supernova
 import supernova.core.solver2 as solver2_module
 import supernova.core.solver5 as solver5_module
 import no_sync.solver5_itpa_fitted_eqdsk.solver5_plots as solver5_plots_module
-from supernova.core.solver5 import _polynomial_residual_norm, superSolver5
+from supernova.core.solver5 import (
+    _polynomial_backward_error,
+    _polynomial_residual_norm,
+    superSolver5,
+)
 from supernova.core.solver4 import MixedFieldLayout
 from supernova.core._solver_kernel2 import _build_static_blocks
 from supernova.core.equilibrium import (
@@ -121,6 +125,33 @@ def test_polynomial_residual_uses_tminus1_t0_t1_order():
 
     assert absolute == pytest.approx(0.0)
     assert relative == pytest.approx(0.0)
+
+
+def test_polynomial_backward_error_is_operator_scaled():
+    A0 = csr_matrix(np.eye(2) * 2.0)
+    A1 = csr_matrix(np.eye(2) * 3.0)
+    A2 = csr_matrix(np.eye(2) * 4.0)
+    eigenvalue = 0.5
+    vector = np.array([3.0, 4.0])
+
+    backward = _polynomial_backward_error(
+        A0,
+        A1,
+        A2,
+        eigenvalue,
+        vector,
+    )
+
+    residual_scale = 2.0 + 3.0 * eigenvalue + 4.0 * eigenvalue**2
+    matrix_scale = (
+        np.linalg.norm(A0.data)
+        + eigenvalue * np.linalg.norm(A1.data)
+        + eigenvalue**2 * np.linalg.norm(A2.data)
+    )
+    expected = residual_scale * np.linalg.norm(vector) / (
+        matrix_scale * np.linalg.norm(vector)
+    )
+    assert backward == pytest.approx(expected)
 
 
 def test_build_pep_maps_split_matrices_to_polynomial_coefficients(monkeypatch):
@@ -260,6 +291,9 @@ def test_quadratic_pep_retarget_resets_and_reattaches_existing_operators(
     wrapper.verbose = False
     wrapper.last_residual_norms = np.array([1.0])
     wrapper.last_absolute_residual_norms = np.array([2.0])
+    wrapper.last_backward_errors = np.array([3.0])
+    wrapper.last_slepc_error_estimates = np.array([4.0])
+    wrapper.last_slepc_backward_errors = np.array([5.0])
     wrapper._configure_mixed_shift_solver = lambda: events.append(("configure",))
     monkeypatch.setattr(
         solver5_module,
@@ -292,6 +326,9 @@ def test_quadratic_pep_retarget_resets_and_reattaches_existing_operators(
     }
     assert wrapper.last_residual_norms is None
     assert wrapper.last_absolute_residual_norms is None
+    assert wrapper.last_backward_errors is None
+    assert wrapper.last_slepc_error_estimates is None
+    assert wrapper.last_slepc_backward_errors is None
 
 
 def test_quadratic_pep_retarget_validates_before_reset():
@@ -425,8 +462,11 @@ def test_split_result_dataset_packs_explicit_signed_harmonic_coordinates():
         iterations=3,
     )
     nep = SimpleNamespace(
-        last_residual_norms=None,
-        last_absolute_residual_norms=None,
+        last_residual_norms=np.array([1.0e-9]),
+        last_absolute_residual_norms=np.array([2.0e-9]),
+        last_backward_errors=np.array([3.0e-9]),
+        last_slepc_error_estimates=np.array([4.0e-9]),
+        last_slepc_backward_errors=np.array([5.0e-9]),
     )
 
     packed = solver._split_result_dataset(
@@ -454,6 +494,10 @@ def test_split_result_dataset_packs_explicit_signed_harmonic_coordinates():
     assert packed.attrs["harmonic_selection"] == "explicit_diagnostic"
     assert packed.sizes["m_pol"] == n_modes
     assert packed["xi_psi_coefficient"].shape == (1, 2, n_modes)
+    assert packed["residual_norm"].item() == pytest.approx(1.0e-9)
+    assert packed["backward_error"].item() == pytest.approx(3.0e-9)
+    assert packed["slepc_error_estimate"].item() == pytest.approx(4.0e-9)
+    assert packed["slepc_backward_error"].item() == pytest.approx(5.0e-9)
 
 
 class _MirrorTestBasis:

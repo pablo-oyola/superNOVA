@@ -132,6 +132,29 @@ def test_mixed_radial_data_builds_exact_strong_derivative():
     np.testing.assert_allclose(mixed.G_low_high.toarray(), direct, atol=1e-13)
 
 
+def test_mixed_radial_data_accepts_one_external_master_quadrature():
+    fine = BSplineFE(
+        knots=np.array(
+            [0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0]
+        ),
+        order=3,
+        domain=(0.0, 1.0),
+        quad_order=5,
+    )
+    points, weights = fine.get_quadrature_points()
+
+    mixed = _build_mixed_radial_data(_high_space(), points, weights)
+
+    np.testing.assert_array_equal(mixed.points_q, points)
+    np.testing.assert_array_equal(mixed.weights_q, weights)
+    assert mixed.pair.low.build_matrices is False
+    assert mixed.pair.low.mass_matrix is None
+    direct = mixed.phi_low_q.T @ (
+        weights[:, None] * mixed.pair.high.eval_basis_derivative(points).T
+    )
+    np.testing.assert_allclose(mixed.G_low_high.toarray(), direct, atol=1e-13)
+
+
 @pytest.mark.parametrize("include_derivative", [False, True])
 def test_mixed_projection_matches_direct_dense_quadrature(include_derivative):
     mixed = _build_mixed_radial_data(_high_space())

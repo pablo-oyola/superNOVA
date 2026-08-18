@@ -120,15 +120,50 @@ class MixedRadialData:
     G_low_high: csr_matrix
 
 
-def _build_mixed_radial_data(high: BSplineFE) -> MixedRadialData:
-    """Build and verify the shared high/low quadrature data."""
-    pair = CompatibleBSplinePair.from_high(high)
-    points_q, weights_q = pair.high.get_quadrature_points()
-    points_low, weights_low = pair.low.get_quadrature_points()
-    if not np.array_equal(points_q, points_low) or not np.array_equal(
-        weights_q, weights_low
-    ):
-        raise RuntimeError("Compatible high and low spaces must share quadrature.")
+def _build_mixed_radial_data(
+    high: BSplineFE,
+    points_q: np.ndarray | None = None,
+    weights_q: np.ndarray | None = None,
+) -> MixedRadialData:
+    """Build compatible basis data on native or externally supplied quadrature.
+
+    Supplying ``points_q`` and ``weights_q`` avoids generating a native
+    quadrature for the compatible low space.  This is the multigrid path: all
+    nested levels are evaluated on the identical finest-grid rule.
+    """
+    external_quadrature = points_q is not None or weights_q is not None
+    if external_quadrature:
+        if points_q is None or weights_q is None:
+            raise ValueError("points_q and weights_q must be supplied together.")
+        points_q = np.asarray(points_q, dtype=np.float64)
+        weights_q = np.asarray(weights_q, dtype=np.float64)
+        if points_q.ndim != 1 or weights_q.shape != points_q.shape:
+            raise ValueError(
+                "External quadrature points and weights must be equal-length "
+                "one-dimensional arrays."
+            )
+        if points_q.size == 0:
+            raise ValueError("External quadrature must contain at least one point.")
+        if np.any(~np.isfinite(points_q)) or np.any(~np.isfinite(weights_q)):
+            raise ValueError("External quadrature points and weights must be finite.")
+        if np.any(np.diff(points_q) <= 0.0) or np.any(weights_q <= 0.0):
+            raise ValueError(
+                "External quadrature points must be strictly increasing and "
+                "weights must be positive."
+            )
+        pair = CompatibleBSplinePair.from_high(
+            high,
+            build_low_matrices=False,
+            verification_points=points_q,
+        )
+    else:
+        pair = CompatibleBSplinePair.from_high(high)
+        points_q, weights_q = pair.high.get_quadrature_points()
+        points_low, weights_low = pair.low.get_quadrature_points()
+        if not np.array_equal(points_q, points_low) or not np.array_equal(
+            weights_q, weights_low
+        ):
+            raise RuntimeError("Compatible high and low spaces must share quadrature.")
 
     phi_high_q = pair.high.eval_basis(points_q).T
     phi_low_q = pair.low.eval_basis(points_q).T
@@ -306,8 +341,12 @@ class superSolver4(superSolver3):
             self._mixed_radial_data = cached
         return cached
 
-    def _mixed_layout(self, sb: solver_blocks2) -> MixedFieldLayout:
-        mixed = self._get_mixed_radial_data()
+    def _mixed_layout(
+        self,
+        sb: solver_blocks2,
+        mixed: MixedRadialData | None = None,
+    ) -> MixedFieldLayout:
+        mixed = self._get_mixed_radial_data() if mixed is None else mixed
         return MixedFieldLayout(
             n_high=mixed.pair.high.get_ndofs(),
             n_low=mixed.pair.low.get_ndofs(),
@@ -318,10 +357,11 @@ class superSolver4(superSolver3):
         self,
         sb: solver_blocks2,
         bc_kind: str | None = "full",
+        mixed: MixedRadialData | None = None,
     ) -> BoundaryCondition:
         """Build endpoint constraints in the mixed field-major trial space."""
-        mixed = self._get_mixed_radial_data()
-        layout = self._mixed_layout(sb)
+        mixed = self._get_mixed_radial_data() if mixed is None else mixed
+        layout = self._mixed_layout(sb, mixed=mixed)
         kind = self._normalize_bc_kind(bc_kind)
 
         if kind == "none":
@@ -372,7 +412,34 @@ class superSolver4(superSolver3):
                 max_dm=max_dm,
             )
         mixed = self._get_mixed_radial_data()
-        layout = self._mixed_layout(sb)
+        M0, M1, Mminus1 = _build_local_M_split(sb, regularizer=regularizer)
+        return self._assemble_split_matrices_from_local(
+            sb,
+            mixed,
+            (M0, M1, Mminus1),
+            apply_bcs=apply_bcs,
+            bc_kind=bc_kind,
+            bc_tol=bc_tol,
+            verbose=verbose,
+        )
+
+    def _assemble_split_matrices_from_local(
+        self,
+        sb: solver_blocks2,
+        mixed: MixedRadialData,
+        local_split: tuple,
+        *,
+        apply_bcs: bool = True,
+        bc_kind: str | None = "full",
+        bc_tol: float | None = None,
+        verbose: bool = False,
+    ) -> tuple[csr_matrix, csr_matrix, csr_matrix]:
+        """Project already-built local tensors into one compatible radial level.
+
+        This is intentionally separate from local block construction so nested
+        Galerkin spaces can reuse one finest-grid point-local MHD operator.
+        """
+        layout = self._mixed_layout(sb, mixed=mixed)
 
         if not np.allclose(
             np.asarray(sb.points_q),
@@ -389,7 +456,9 @@ class superSolver4(superSolver3):
         ):
             raise ValueError("Solver blocks and mixed bases use different quadrature weights.")
 
-        M0, M1, Mminus1 = _build_local_M_split(sb, regularizer=regularizer)
+        if len(local_split) != 3:
+            raise ValueError("local_split must contain (M0, M1, Mminus1).")
+        M0, M1, Mminus1 = local_split
         nq = mixed.weights_q.size
         M0_q = _slice_to_quadrature(M0, nq, "M0")
         M1_q = _slice_to_quadrature(M1, nq, "M1")
@@ -436,7 +505,7 @@ class superSolver4(superSolver3):
         if verbose:
             print("[superSolver4] assembled mixed split matrices before BC reduction")
             print(
-                f"  ntor={ntor}, n_modes={layout.n_modes}, "
+                f"  ntor={sb.ntor}, n_modes={layout.n_modes}, "
                 f"n_high={layout.n_high}, n_low={layout.n_low}"
             )
             print(f"  {_matrix_stats('T0', T0)}")
@@ -447,7 +516,11 @@ class superSolver4(superSolver3):
         if not apply_bcs or kind == "none":
             return T0, T1, Tminus1
 
-        bc = self._build_nep_boundary_condition(sb, bc_kind=kind)
+        bc = self._build_nep_boundary_condition(
+            sb,
+            bc_kind=kind,
+            mixed=mixed,
+        )
         bc_rank = int(np.linalg.matrix_rank(bc.C))
         expected_rank = 2 * layout.n_modes if kind == "full" else layout.n_modes
         if bc_rank != expected_rank:
@@ -724,6 +797,21 @@ class superSolver4(superSolver3):
             data_vars["absolute_residual_norm"] = (
                 "eigenpair",
                 nep.last_absolute_residual_norms,
+            )
+        if getattr(nep, "last_backward_errors", None) is not None:
+            data_vars["backward_error"] = (
+                "eigenpair",
+                nep.last_backward_errors,
+            )
+        if getattr(nep, "last_slepc_error_estimates", None) is not None:
+            data_vars["slepc_error_estimate"] = (
+                "eigenpair",
+                nep.last_slepc_error_estimates,
+            )
+        if getattr(nep, "last_slepc_backward_errors", None) is not None:
+            data_vars["slepc_backward_error"] = (
+                "eigenpair",
+                nep.last_slepc_backward_errors,
             )
 
         attrs = {

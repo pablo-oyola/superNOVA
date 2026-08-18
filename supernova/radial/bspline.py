@@ -21,7 +21,7 @@ class BSplineFE(RadialFE):
     """
 
     def __init__(self, knots: np.ndarray, order: int, domain: Tuple[float, float],
-                 quad_order: int=None):
+                 quad_order: int=None, build_matrices: bool=True):
         """
         Define a B-Spline basis based on the knots position and order. Domains are
         usually clamped, so the elements at the edge have to handled properly if needed.
@@ -82,7 +82,13 @@ class BSplineFE(RadialFE):
         for i in range(self.dofs):
             self.grid[i] = np.mean(self.knots[i+1 : i + self.order + 1])
 
-        # Building the matrices and the cache.
+        # Evaluation-only spaces are used by nested multigrid levels that are
+        # projected on one externally supplied finest-grid quadrature.  The
+        # default remains the fully assembled single-grid behavior.
+        self.build_matrices = bool(build_matrices)
+
+        # Building the basis functions and, when requested, the native
+        # quadrature matrices and cache.
         self._build_design_matrices()
 
     def _build_design_matrices(self):
@@ -112,6 +118,14 @@ class BSplineFE(RadialFE):
             )
 
             self.dbasis_functions[ii] = self.basis_functions[ii].derivative(1)
+
+        if not self.build_matrices:
+            self.M = None
+            self.WD = None
+            self.S = None
+            self.active_span_index = None
+            self._quadrature_cache = None
+            return
 
         self.M = lil_matrix((n_basis, n_basis), dtype=np.float64)
         self.WD = lil_matrix((n_basis, n_basis), dtype=np.float64)
@@ -239,6 +253,10 @@ class BSplineFE(RadialFE):
         Each requested basis index may contain multiple active span blocks.
         Therefore the returned objects are lists of lists.
         """
+        if self._quadrature_cache is None:
+            raise RuntimeError(
+                "This evaluation-only BSplineFE has no native quadrature cache."
+            )
         if ielem is None:
             ielem = list(range(self.dofs))
 
@@ -259,6 +277,10 @@ class BSplineFE(RadialFE):
         point appears once, while basis overlap is represented by evaluating
         all basis functions on these points.
         """
+        if self._quadrature_cache is None:
+            raise RuntimeError(
+                "This evaluation-only BSplineFE has no native quadrature rule."
+            )
         points = []
         weights = []
         quad_points, quad_weights = leggauss(self.quadrature_order)
@@ -412,7 +434,13 @@ class CompatibleBSplinePair:
     derivative: csr_matrix
 
     @classmethod
-    def from_high(cls, high: BSplineFE) -> "CompatibleBSplinePair":
+    def from_high(
+        cls,
+        high: BSplineFE,
+        *,
+        build_low_matrices: bool | None = None,
+        verification_points: np.ndarray | None = None,
+    ) -> "CompatibleBSplinePair":
         """Construct the compatible lower space and coefficient derivative."""
         if not isinstance(high, BSplineFE):
             raise TypeError("high must be a BSplineFE instance")
@@ -431,11 +459,14 @@ class CompatibleBSplinePair:
                 "denominators."
             )
 
+        if build_low_matrices is None:
+            build_low_matrices = high.build_matrices
         low = BSplineFE(
             knots=knots[1:-1],
             order=high.order - 1,
             domain=(knots[0], knots[-1]),
             quad_order=high.quadrature_order,
+            build_matrices=build_low_matrices,
         )
 
         n_low = low.get_ndofs()
@@ -456,7 +487,16 @@ class CompatibleBSplinePair:
             shape=(n_low, n_high),
         ).tocsr()
 
-        points, _ = high.get_quadrature_points()
+        if verification_points is None:
+            points, _ = high.get_quadrature_points()
+        else:
+            points = np.asarray(verification_points, dtype=np.float64)
+            if points.ndim != 1 or points.size == 0:
+                raise ValueError(
+                    "verification_points must be a nonempty one-dimensional array."
+                )
+            if np.any(~np.isfinite(points)):
+                raise ValueError("verification_points must be finite.")
         high_derivative = high.eval_basis_derivative(points)
         compatible_derivative = derivative.T @ low.eval_basis(points)
         if not np.allclose(

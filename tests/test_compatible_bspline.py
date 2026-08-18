@@ -120,3 +120,34 @@ def test_pair_rejects_nonpositive_derivative_denominator():
 
     with pytest.raises(ValueError, match="positive derivative denominators"):
         CompatibleBSplinePair.from_high(high)
+
+
+def test_evaluation_only_pair_uses_external_points_without_native_quadrature():
+    assembled = _make_high([0.2, 0.5, 0.8])
+    points, _ = assembled.get_quadrature_points()
+    high = BSplineFE(
+        knots=assembled.knots,
+        order=assembled.order,
+        domain=(0.0, 1.0),
+        quad_order=assembled.quadrature_order,
+        build_matrices=False,
+    )
+
+    pair = CompatibleBSplinePair.from_high(
+        high,
+        build_low_matrices=False,
+        verification_points=points,
+    )
+
+    assert high.mass_matrix is None
+    assert pair.low.mass_matrix is None
+    with pytest.raises(RuntimeError, match="no native quadrature"):
+        high.get_quadrature_points()
+    with pytest.raises(RuntimeError, match="no native quadrature"):
+        pair.low.get_quadrature_points()
+    np.testing.assert_allclose(
+        high.eval_basis_derivative(points).T,
+        pair.low.eval_basis(points).T @ pair.derivative.toarray(),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )

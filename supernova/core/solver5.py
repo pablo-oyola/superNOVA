@@ -51,6 +51,31 @@ def _polynomial_residual_norm(
     return abs_norm, rel_norm
 
 
+def _polynomial_backward_error(
+    A0: csr_matrix,
+    A1: csr_matrix,
+    A2: csr_matrix,
+    eigenvalue: complex,
+    eigenvector: np.ndarray,
+) -> float:
+    """Return a normwise operator-scaled quadratic backward error."""
+    vector = np.asarray(eigenvector, dtype=np.complex128)
+    absolute, _ = _polynomial_residual_norm(
+        A0,
+        A1,
+        A2,
+        eigenvalue,
+        vector,
+    )
+    matrix_scale = (
+        float(np.linalg.norm(A0.data))
+        + abs(eigenvalue) * float(np.linalg.norm(A1.data))
+        + abs(eigenvalue) ** 2 * float(np.linalg.norm(A2.data))
+    )
+    denominator = matrix_scale * float(np.linalg.norm(vector))
+    return absolute / max(np.finfo(float).tiny, denominator)
+
+
 def _validate_quadratic_coefficient(
     name: str,
     matrix: csr_matrix,
@@ -224,6 +249,9 @@ class QuadraticPEPSolver:
         self.region = new_region
         self.last_residual_norms = None
         self.last_absolute_residual_norms = None
+        self.last_backward_errors = None
+        self.last_slepc_error_estimates = None
+        self.last_slepc_backward_errors = None
         self._vprint(
             "[QuadraticPEPSolver] retargeted: "
             f"target_s={_format_complex(self.target_s)}, region={self.region}"
@@ -232,6 +260,7 @@ class QuadraticPEPSolver:
     def solve(self, max_eigenpairs: int | None = None) -> NEPResult:
         """Solve the quadratic PEP and return converged eigenpairs in ``s``."""
         petsc = _require_petsc()
+        slepc = _require_slepc()
         self._vprint("[QuadraticPEPSolver] calling PEPSolve()")
         self.pep.solve()
         nconv = int(self.pep.getConverged())
@@ -250,6 +279,9 @@ class QuadraticPEPSolver:
         eigenvectors = np.zeros((nout, self.size), dtype=np.complex128)
         self.last_residual_norms = np.full(nout, np.nan)
         self.last_absolute_residual_norms = np.full(nout, np.nan)
+        self.last_backward_errors = np.full(nout, np.nan)
+        self.last_slepc_error_estimates = np.full(nout, np.nan)
+        self.last_slepc_backward_errors = np.full(nout, np.nan)
         vr = self.mats[0].createVecRight()
         real_scalars = not np.issubdtype(self.scalar_type, np.complexfloating)
         vi = self.mats[0].createVecRight() if real_scalars else None
@@ -266,10 +298,27 @@ class QuadraticPEPSolver:
                     )
                     self.last_absolute_residual_norms[ii] = absolute
                     self.last_residual_norms[ii] = relative
+                    self.last_backward_errors[ii] = _polynomial_backward_error(
+                        self.A0,
+                        self.A1,
+                        self.A2,
+                        eigenvalues[ii],
+                        vector,
+                    )
+                    self.last_slepc_error_estimates[ii] = float(
+                        self.pep.getErrorEstimate(ii)
+                    )
+                    self.last_slepc_backward_errors[ii] = float(
+                        self.pep.computeError(
+                            ii,
+                            slepc.PEP.ErrorType.BACKWARD,
+                        )
+                    )
                 self._vprint(
                     f"  eigenpair[{ii}]: s={_format_complex(eigenvalues[ii])}, "
                     f"omega={_format_complex(np.sqrt(eigenvalues[ii]))}, "
-                    f"residual={self.last_residual_norms[ii]:.3e}"
+                    f"residual={self.last_residual_norms[ii]:.3e}, "
+                    f"backward_error={self.last_backward_errors[ii]:.3e}"
                 )
         finally:
             vr.destroy()
