@@ -120,6 +120,22 @@ def _scale_coo_rows_by_axis0(
     return coo_array((data, coords), shape=tensor.shape, dtype=np.complex128)
 
 
+def _validate_dpsi_hat_dx(value) -> float:
+    """Return the positive scalar ``d(psi_hat)/dx`` radial chain factor."""
+    raw = np.asarray(value)
+    if raw.ndim != 0 or np.iscomplexobj(raw):
+        raise ValueError("dpsi_hat_dx must be a finite positive real scalar.")
+    try:
+        factor = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "dpsi_hat_dx must be a finite positive real scalar."
+        ) from error
+    if not np.isfinite(factor) or factor <= 0.0:
+        raise ValueError("dpsi_hat_dx must be a finite positive real scalar.")
+    return factor
+
+
 def _offset_coo_tensor(
     tensor,
     row_offset: int,
@@ -205,6 +221,8 @@ class solver_blocks2:
     points_q: np.ndarray # Quadrature points.
     phi_q: np.ndarray # Radial basis functions evaluated at the quadrature points.
     WD: csr_matrix # Weak derivative matrix evaluated at the quadrature points.
+    # Radial chain factor d(Psi/(Baxis*aminor**2))/dx for solver coordinate x.
+    dpsi_hat_dx: float = 1.0
 
     def to_xarray(self):
         """
@@ -339,6 +357,10 @@ class solver_blocks2:
                 "ntor": int(self.ntor),
                 "max_dm": int(getattr(self, "max_dm", 100)),
                 "mmax": int(getattr(self, "mmax", np.max(np.abs(m_range)))),
+                "dpsi_hat_dx": _validate_dpsi_hat_dx(self.dpsi_hat_dx),
+                "dpsi_hat_dx_definition": (
+                    "d(Psi/(Baxis*aminor**2))/dx for the solver radial coordinate"
+                ),
                 "state_order": "full_state is ordered as p1(m_range) followed by xi(m_range).",
                 "description": "Serialized solver_blocks2 data for solver debugging and persistence.",
             },
@@ -387,6 +409,9 @@ class solver_blocks2:
         WD = _build_sparse(dataset["WD"].values, dm_max) if "WD" in dataset else None
         m_range = dataset.coords["m_pol"].values if "m_pol" in dataset.coords else None
         ntor = int(dataset.attrs["ntor"]) if "ntor" in dataset.attrs else None
+        dpsi_hat_dx = _validate_dpsi_hat_dx(
+            dataset.attrs.get("dpsi_hat_dx", 1.0)
+        )
 
         return solver_blocks2(
             max_dm=dm_max,
@@ -404,6 +429,7 @@ class solver_blocks2:
             pressure=pressure,
             pressure_deriv=pressure_deriv,
             density=density,
+            dpsi_hat_dx=dpsi_hat_dx,
             A=A, B=B,
             weights_q=weights_q,
             phi_q=phi_q,
@@ -503,7 +529,8 @@ def build_solver_blocks2(
     pressure: np.ndarray, pressure_deriv: np.ndarray, density: np.ndarray, gamma_s: float,
     one_gpp: np.ndarray, gtp_over_gpp: np.ndarray, gpz_over_gpp: np.ndarray,
     H: np.ndarray, J: np.ndarray, L: np.ndarray,
-    ntor: int, m_range: np.ndarray, max_dm: int=1000, max_dn: int=1000
+    ntor: int, m_range: np.ndarray, max_dm: int=1000, max_dn: int=1000,
+    dpsi_hat_dx: float = 1.0,
 ) -> solver_blocks2:
     r"""
     Intermediary function that will call the kernel to build the blocks,
@@ -520,6 +547,7 @@ def build_solver_blocks2(
                                gpz_over_gpp=gpz_over_gpp, ntor=ntor,
                                m_range=m_range, dm_max=max_dm, dn_max=max_dn)
     C0, C1, D0, D1, F, gtp_over_gpp_mat, gpz_over_gpp_mat = tmp
+    dpsi_hat_dx = _validate_dpsi_hat_dx(dpsi_hat_dx)
 
     # We now assemble the continuum matrices A and B, that will be used in the solver to apply the continuum operator.
     A, B = assemble_continuum(H=H, K=K, J=J, L=L, M=M, m_range=m_range, 
@@ -543,6 +571,7 @@ def build_solver_blocks2(
                         gtp_over_gpp=gtp_over_gpp_mat, gpz_over_gpp=gpz_over_gpp_mat,
                         hprof=hprof, Iprof=Iprof, gprof=gprof, qprof=qprof, 
                         pressure=pressure, pressure_deriv=pressure_deriv, density=density,
+                        dpsi_hat_dx=dpsi_hat_dx,
                         A=A, B=B,
                         weights_q=None, points_q=None, phi_q=None, WD=None)
     out.max_dm = max_dm
@@ -674,7 +703,15 @@ def get_T_sparse(sb: solver_blocks2, M: coo_array,
     (p1, xi^\psi, xi^s, \nabla\cdot\xi) for a given
     frequency omega.
 
-    T = ((\partial_\psi,\partial_\psi,0, 0)\otimes I_M - M )
+    The local differential rows are defined per
+    ``psi_hat = Psi/(Baxis*aminor**2)`` while ``WD`` differentiates in the
+    solver coordinate ``x``. Therefore the Galerkin term uses
+    ``dpsi_hat_dx*M`` only for the first two equation groups:
+
+    T = ((\partial_x,\partial_x,0,0)\otimes I_M
+         - diag(beta,beta,1,1) M),
+
+    with ``beta = dpsi_hat_dx``.
     """
     M = _as_coo_tensor(M, "M")
     if M.shape[1] != M.shape[2]:
@@ -682,6 +719,9 @@ def get_T_sparse(sb: solver_blocks2, M: coo_array,
 
     nq, n_state, _ = M.shape
     nmode = sb.m_range.size
+    dpsi_hat_dx = _validate_dpsi_hat_dx(
+        getattr(sb, "dpsi_hat_dx", 1.0)
+    )
     expected_state = 4 * nmode
     if n_state != expected_state:
         raise ValueError(f"M state size must be {expected_state}, got {n_state}.")
@@ -726,7 +766,8 @@ def get_T_sparse(sb: solver_blocks2, M: coo_array,
         data.append(np.repeat(wd.data.astype(np.complex128), derivative_states.size))
 
     q_coords, local_rows, local_cols = M.coords
-    local_data = M.data.astype(np.complex128, copy=False)
+    local_data = M.data.astype(np.complex128, copy=True)
+    local_data[local_rows < 2 * nmode] *= dpsi_hat_dx
     local_keep = local_data != 0.0
     if np.any(local_keep):
         q_coords = q_coords[local_keep]

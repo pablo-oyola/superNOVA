@@ -209,22 +209,34 @@ def _prepare_periodic_angle(angle: np.ndarray | None, size: int, name: str) -> n
 
 def decompose2d(field: np.ndarray, m_max: int = None, angle: np.ndarray | None = None):
     """
-    Computes using the trapezoidal rule the Fourier decomposition along the
-    poloidal angle.
+    Compute the Fourier decomposition along a periodic angle.
+
+    This currently uses an FFT as a diagnostic replacement for the weighted
+    trigonometric projection whenever the samples are uniform.  A duplicated
+    periodic endpoint is removed before the FFT.  Genuinely nonuniform grids
+    retain the weighted projection because a standard FFT is not defined on
+    those samples.
+
+    The returned arrays retain the existing one-sided real-field convention:
+    ``a*cos(m*angle) + b*sin(m*angle)`` is returned as ``coeffs_real=a`` and
+    ``coeffs_imag=b``.  The phase correction keeps those coefficients tied to
+    the physical angle when the first sample is not zero.
 
     The input field is assumed to have  (Nx, Ntheta) shape and span over
-    [0, 2pi) in the poloidal angle. This automatically computes the Fourier modes
-    in the poloidal direction, assuming a periodic domain. The output is a 2D array of 
+    one periodic interval, with or without the duplicated endpoint. This
+    automatically computes the Fourier modes in the angular direction,
+    assuming a periodic domain. The output is a 2D array of
     shape (Nx, m_max+1) containing the Fourier coefficients for each mode m, where m ranges 
-    from 0 to m_max. If m_max is None, it defaults to Ntheta//2, which corresponds to 
-    the Nyquist frequency.
+    from 0 to m_max. If m_max is None, it defaults to half the number of
+    distinct periodic samples, which corresponds to the Nyquist frequency.
 
     Parameters
     ----------
     field : np.ndarray
         2D array of shape (Nx, Ntheta) representing the field to be decomposed.
     m_max : int, optional
-        Maximum mode number to compute. If None, defaults to Ntheta//2.
+        Maximum mode number to compute. If None, defaults to the Nyquist mode
+        of the distinct periodic samples.
     
     Returns
     -------
@@ -237,12 +249,68 @@ def decompose2d(field: np.ndarray, m_max: int = None, angle: np.ndarray | None =
     if field.ndim != 2:
         raise ValueError("field must have shape (Nx, Nangle).")
 
-    if m_max is None:
-        m_max = field.shape[1] // 2
-
     angle = _prepare_periodic_angle(angle, field.shape[1], "angle")
-    weights = _periodic_weights(angle)
-    return _decompose2d_impl(field, m_max, angle, weights)
+
+    # pyCOCOS and other valid callers include both endpoints of the periodic
+    # interval.  They are the same physical sample, so retain only the first
+    # one before applying an FFT.
+    includes_endpoint = (
+        angle.size > 1
+        and np.isclose(
+            angle[-1] - angle[0],
+            2.0 * np.pi,
+            rtol=1.0e-10,
+            atol=1.0e-12,
+        )
+    )
+    if includes_endpoint:
+        angle = angle[:-1]
+        field = field[:, :-1]
+
+    nangle = angle.size
+    if m_max is None:
+        m_max = nangle // 2
+    if not isinstance(m_max, (int, np.integer)) or m_max < 0:
+        raise ValueError("m_max must be a non-negative integer.")
+    if m_max > nangle // 2:
+        raise ValueError(
+            f"m_max={m_max} exceeds the Nyquist mode {nangle // 2} "
+            f"for {nangle} angular samples."
+        )
+
+    expected_step = 2.0 * np.pi / nangle
+    uniform = nangle == 1 or (
+        np.allclose(
+            np.diff(angle),
+            expected_step,
+            rtol=1.0e-10,
+            atol=1.0e-12,
+        )
+        and np.isclose(
+            angle[0] + 2.0 * np.pi - angle[-1],
+            expected_step,
+            rtol=1.0e-10,
+            atol=1.0e-12,
+        )
+    )
+    if not uniform:
+        weights = _periodic_weights(angle)
+        return _decompose2d_impl(field, m_max, angle, weights)
+
+    modes = np.arange(m_max + 1)
+    spectrum = np.fft.rfft(field, axis=1)[:, :m_max + 1] / nangle
+    spectrum *= np.exp(-1j * modes * angle[0])[None, :]
+
+    # A real field has paired +/-m coefficients. Convert each positive
+    # two-sided FFT coefficient into the existing one-sided amplitude, except
+    # for the self-conjugate mean and even-grid Nyquist modes.
+    one_sided_scale = np.full(m_max + 1, 2.0)
+    one_sided_scale[0] = 1.0
+    if nangle % 2 == 0 and m_max == nangle // 2:
+        one_sided_scale[-1] = 1.0
+    amplitudes = spectrum * one_sided_scale[None, :]
+
+    return amplitudes.real, -amplitudes.imag
 
 
 def _decompose3d_with_toroidal_sign(

@@ -126,6 +126,49 @@ def _outward_boozer_interpolation_grid(
     return psi_axis + target_normalized * physical_span
 
 
+def _normalize_active_magnetic_radial_coordinate(dataset: xr.Dataset) -> xr.Dataset:
+    """Map an active physical psi_N interval onto solver-local x in [0, 1]."""
+    if "psi" not in dataset.coords:
+        raise ValueError("The magnetic dataset must define a psi coordinate.")
+    psi_physical_norm = np.asarray(dataset.coords["psi"], dtype=np.float64)
+    if (
+        psi_physical_norm.ndim != 1
+        or psi_physical_norm.size < 2
+        or not np.all(np.isfinite(psi_physical_norm))
+        or np.any(np.diff(psi_physical_norm) <= 0.0)
+    ):
+        raise ValueError(
+            "The active physical normalized-flux coordinate must be finite and "
+            "strictly increasing outward."
+        )
+    active_min = float(psi_physical_norm[0])
+    active_max = float(psi_physical_norm[-1])
+    active_span = active_max - active_min
+    if not np.isfinite(active_span) or active_span <= 0.0:
+        raise ValueError("The active physical normalized-flux interval must be nonempty.")
+
+    solver_x = (psi_physical_norm - active_min) / active_span
+    physical_attrs = dict(dataset.coords["psi"].attrs)
+    output = dataset.assign_coords(psi=solver_x)
+    output.coords["psi"].attrs = {
+        "name": "psi_active_norm",
+        "units": "",
+        "desc": "Poloidal flux normalized over the active Boozer interval",
+        "short_name": "$x$",
+        "normalization": (
+            "x = (psi_N - psi_N_active_min) / "
+            "(psi_N_active_max - psi_N_active_min)"
+        ),
+        "physical_psi_norm_min": active_min,
+        "physical_psi_norm_max": active_max,
+    }
+    output = output.assign_coords(
+        psi_physical_norm=("psi", psi_physical_norm)
+    )
+    output.coords["psi_physical_norm"].attrs = physical_attrs
+    return output
+
+
 def _one_signed_orientation(values, name: str) -> int:
     """Return the common sign of a finite, nonzero, one-signed profile."""
     array = np.asarray(values, dtype=np.float64)
@@ -492,6 +535,69 @@ class superEquilibrium:
         self.Fprof = Profile(F_nm=F, x=self.density.x, attrs={'units': 'T*m', 'name': 'F'})
         self.Iprof = Profile(F_nm=I, x=self.density.x, attrs={'units': 'T*m', 'name': 'I'})
 
+    def _cyl2mag_on_solver_grid(self, field):
+        """Transform an R-Z field and relabel the active flux interval for NOVA."""
+        magnetic = self.boozer.cyl2mag_scalar(
+            field=field,
+            return_psi_norm=True,
+        )
+        return _normalize_active_magnetic_radial_coordinate(magnetic)
+
+    def _boozer_geometry_on_solver_grid(self):
+        """Project metric and Jacobian before the native-grid downsampling.
+
+        pyCOCOS constructs coordinate-indexed derivatives on its coordinate R-Z
+        grid and intentionally masks them outside the fitted annulus.  Sending
+        those fields through the coarser native EQDSK grid can remove every
+        finite interpolation vertex near the first requested flux surface.
+        Batch-project those fields directly onto the magnetic grid while
+        keeping ``self.realspace`` on the native grid for real-space operators.
+        """
+        geometry_rz = xr.Dataset()
+        units_i = {"psi": "Wb", "theta": "rad", "zeta": "rad"}
+        for ii in ("psi", "theta", "zeta"):
+            for jj in ("psi", "theta", "zeta"):
+                name = f"g{ii}_{jj}"
+                geometry_rz[name] = self.boozer.metric(
+                    ii,
+                    jj,
+                    tensor="contravariant",
+                )
+
+        geometry_rz["jac"] = (
+            self._poloidal_orientation * self.boozer.jacobian()
+        )
+        geometry = self._cyl2mag_on_solver_grid(geometry_rz)
+
+        for ii in ("psi", "theta", "zeta"):
+            for jj in ("psi", "theta", "zeta"):
+                name = f"g{ii}_{jj}"
+                unit_str = str(
+                    unyt.Unit(
+                        f"{units_i[ii]}*{units_i[jj]}/m**2"
+                    ).simplify()
+                )
+                geometry[name].attrs.update(
+                    {
+                        "units": unit_str,
+                        "projection": (
+                            "pyCOCOS coordinate R-Z geometry projected "
+                            "directly to the magnetic grid"
+                        ),
+                    }
+                )
+        geometry["jac"].attrs.update(
+            {
+                "description": "Coordinate transformation Jacobian.",
+                "units": "m**3/Wb",
+                "projection": (
+                    "pyCOCOS coordinate R-Z geometry projected "
+                    "directly to the magnetic grid"
+                ),
+            }
+        )
+        return geometry
+
     def _prepare_quantities(self):
         r"""
         It will prepare and evaluate quantities that are commonly used across the problem,
@@ -638,8 +744,14 @@ class superEquilibrium:
                                                     attrs={'description': r'div(\nabla\Psi/||\nabla\Psi||^2).',
                                                            'units': '1/Wb'})
 
+        # Project metric/Jacobian data before their masked coordinate-grid support
+        # is downsampled into the native real-space cache.
+        magnetic_geometry = self._boozer_geometry_on_solver_grid()
+
         # We can now transform all the (R, z) quantities to the (Psi, Theta) coordinates.
-        self.magspace = self.boozer.cyl2mag_scalar(field=self.realspace, return_psi_norm=True)
+        self.magspace = self._cyl2mag_on_solver_grid(self.realspace)
+        for name, field in magnetic_geometry.data_vars.items():
+            self.magspace[name] = field
         self.magspace = _reflect_boozer_theta(
             self.magspace,
             self._poloidal_orientation,
@@ -729,7 +841,7 @@ class superEquilibrium:
                                                    'units': units})
         
         # Transforming the new quantity to magnetic coordinates and adding it to the magspace database.
-        mag_data = self.magspace.cyl2mag_scalar(field=self.realspace[name], return_psi_norm=True)
+        mag_data = self._cyl2mag_on_solver_grid(self.realspace[name])
         self.magspace[name] = mag_data
     
     def add_mag(self, name: str, data: xr.DataArray, units: str, description: Optional[str] = None):
@@ -775,7 +887,7 @@ class superEquilibrium:
             out = _unytfy_my_xarray(self.magspace[name], reg=self.registry)
         elif name in self.realspace:
             # We need to transform it to magnetic coordinates.
-            mag_data = self.magspace.cyl2mag_scalar(field=self.realspace[name], return_psi_norm=True)
+            mag_data = self._cyl2mag_on_solver_grid(self.realspace[name])
             self.magspace[name] = mag_data
             out =  _unytfy_my_xarray(mag_data, reg=self.registry)
         elif name in _ALLOWED_EXPRESSION_CONSTANTS:
@@ -976,7 +1088,7 @@ class superEquilibrium:
         
         # First thing, we transform from the real space to the magnetic space.
         for ii, name in real2mag:
-            mag_data = self.magspace.cyl2mag_scalar(field=self.realspace[name], return_psi_norm=True)
+            mag_data = self._cyl2mag_on_solver_grid(self.realspace[name])
             self.magspace[name] = mag_data # We cache the magnetic coordinates version of the quantity for later.
             mag2prof.append((ii, name))
 

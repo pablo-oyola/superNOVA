@@ -8,7 +8,7 @@ namespace.
 For a non-interactive whole-file check:
 
     conda run -n desc-petsc-np2 env MPLBACKEND=Agg NUMBA_DISABLE_JIT=1 \
-        python no_sync/test_solver4_itpa.py
+        python no_sync/ITPA/test_solver4_itpa.py
 """
 
 from __future__ import annotations
@@ -26,7 +26,20 @@ import unyt
 import xarray as xr
 from scipy.sparse.csgraph import structural_rank
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+_working_directory = Path.cwd().resolve()
+REPO_ROOT = next(
+    (
+        candidate
+        for candidate in (_working_directory, *_working_directory.parents)
+        if (candidate / "pyproject.toml").is_file()
+        and (candidate / "supernova" / "__init__.py").is_file()
+    ),
+    None,
+)
+if REPO_ROOT is None:
+    raise RuntimeError(
+        "Run this script from the superNOVA_2 repository or one of its child folders."
+    )
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -233,18 +246,19 @@ def _itpa_plot_quantity(
         values[0] = 0.0
     elif quantity == "es":
         # The Boozer-coordinate relation supplied for this diagnostic is
-        # xi^psi_nm = i phi_nm (I n + g m) / h.  Form I as h - g q so the
-        # conversion is independent of the solver-facing 2*pi*I convention
-        # used by DESC-backed equilibria.
+        # xi^psi_nm = i phi_nm (I n + g m) / h.  Recover the canonical
+        # unscaled Boozer I as h-gq so this diagnostic also checks the identity.
         h = _surface_profile(solver.equ, "h", psi_plot)
         g = _surface_profile(solver.equ, "g", psi_plot)
         q = _surface_profile(solver.equ, "q", psi_plot)
-        I_boozer = h - g * q
-        # superNOVA uses exp(i*(m*theta - ntor*zeta)); the displayed relation
-        # uses exp(i*(m*theta + n*zeta)).  Thus its n is -ntor here.
+        I = h - g * q
+        # The displayed relation uses exp(i*(m*theta+n*zeta)), so its
+        # n=-ntor for the same labelled harmonic. superNOVA stores the
+        # conjugate exp(i*(ntor*zeta-m*theta)) coefficient; conjugating the
+        # displayed relation changes its leading +i to -i.
         n_boozer = -int(result.attrs["ntor"])
         denominator = (
-            I_boozer[:, None] * n_boozer
+            I[:, None] * n_boozer
             + g[:, None] * np.asarray(selected_mpol, dtype=float)[None, :]
         )
         denominator_scale = max(float(np.max(np.abs(denominator))), 1.0)
@@ -253,7 +267,7 @@ def _itpa_plot_quantity(
                 "Cannot reconstruct ES where the Boozer factor I*n + g*m "
                 "vanishes."
             )
-        values = h[:, None] * values / (1j * denominator)
+        values = h[:, None] * values / (-1j * denominator)
 
     if not np.all(np.isfinite(values)):
         raise ValueError(
@@ -572,8 +586,8 @@ mmax = 20
 nfe = 100
 order = 3
 quad_order = 6
-ns = 64
-ntheta = 64
+ns = 256
+ntheta = 256
 
 aminor = 1.0 * unyt.m
 Rmajor = 10.0 * unyt.m
@@ -606,14 +620,19 @@ max_modes_to_plot = 10
 extension_threshold = 0.67
 verbose = False
 
-itpa_code_csv = "/home/pablooyola/Desktop/Pablo/codes/superNOVA_2/no_sync/konies2018_figure5_eigenfunctions.csv"
+itpa_code_csv = (
+    REPO_ROOT
+    / "no_sync"
+    / "ITPA"
+    / "konies2018_figure5_eigenfunctions.csv"
+)
 itpa_comparison_panel = "A"
 itpa_comparison_codes = None
 itpa_comparison_mpol = (9, 10, 11, 12)
 itpa_comparison_quantity = "ES"  # "xi_psi", "xi_r", or "ES"
 
 write_results = False
-results_path = REPO_ROOT / "no_sync" / "solver4_itpa_eigenmodes.h5"
+results_path = REPO_ROOT / "no_sync" / "ITPA" / "solver4_itpa_eigenmodes.h5"
 
 
 # %% Build the analytical ITPA reference equilibrium.

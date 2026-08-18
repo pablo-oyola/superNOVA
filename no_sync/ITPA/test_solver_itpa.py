@@ -14,7 +14,20 @@ from scipy.sparse.linalg import norm as sparse_norm
 from scipy.spatial.distance import squareform
 import unyt
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+_working_directory = Path.cwd().resolve()
+REPO_ROOT = next(
+    (
+        candidate
+        for candidate in (_working_directory, *_working_directory.parents)
+        if (candidate / "pyproject.toml").is_file()
+        and (candidate / "supernova" / "__init__.py").is_file()
+    ),
+    None,
+)
+if REPO_ROOT is None:
+    raise RuntimeError(
+        "Run this script from the superNOVA_2 repository or one of its child folders."
+    )
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -768,7 +781,10 @@ radial_derivative_check = check_radial_derivative_matrix(solver, sb)
 if WRITE_SOLVER_BLOCKS:
     try:
         sbdat = sb.to_xarray()
-        sbdat.to_netcdf("no_sync/solver_blocks_itpa.h5", engine="h5netcdf")
+        sbdat.to_netcdf(
+            REPO_ROOT / "no_sync" / "ITPA" / "solver_blocks_itpa.h5",
+            engine="h5netcdf",
+        )
     except ModuleNotFoundError as exc:
         print(f"Skipping solver block dump: {exc}")
 
@@ -891,6 +907,12 @@ fig_xipsi, ax_xipsi = plot_xipsi_eigenpair(
 # fig_overlap.tight_layout()
 
 # %% Comparison to codes.
-plot_itpa_code_eigenfunctions(tmp, solver, sb,
-                              "/home/pablooyola/Desktop/Pablo/codes/superNOVA_2/no_sync/konies2018_figure5_eigenfunctions.csv",
-                              eigenpair_index=3, panel="A", codes=None)
+plot_itpa_code_eigenfunctions(
+    tmp,
+    solver,
+    sb,
+    REPO_ROOT / "no_sync" / "ITPA" / "konies2018_figure5_eigenfunctions.csv",
+    eigenpair_index=3,
+    panel="A",
+    codes=None,
+)

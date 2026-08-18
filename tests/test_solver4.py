@@ -26,6 +26,38 @@ def _high_space():
     )
 
 
+def test_mixed_projection_applies_radial_chain_only_to_differential_rows():
+    beta = 0.25
+    local = np.arange(1.0, 33.0, dtype=np.complex128).reshape(2, 4, 4)
+    tensor = coo_array(local)
+    phi_high_q = np.eye(2, dtype=np.float64)
+    phi_low_q = np.ones((2, 1), dtype=np.float64)
+    weights_q = np.array([0.4, 0.6], dtype=np.float64)
+    derivative = csr_matrix((1, 2), dtype=np.float64)
+
+    baseline = _project_local_tensor_mixed(
+        SimpleNamespace(m_range=np.array([2]), dpsi_hat_dx=1.0),
+        tensor,
+        phi_high_q,
+        phi_low_q,
+        weights_q,
+        derivative,
+        include_derivative=False,
+    ).toarray()
+    corrected = _project_local_tensor_mixed(
+        SimpleNamespace(m_range=np.array([2]), dpsi_hat_dx=beta),
+        tensor,
+        phi_high_q,
+        phi_low_q,
+        weights_q,
+        derivative,
+        include_derivative=False,
+    ).toarray()
+
+    np.testing.assert_allclose(corrected[:2], beta * baseline[:2])
+    np.testing.assert_allclose(corrected[2:], baseline[2:])
+
+
 def _dense_oracle(M, mixed, n_modes, include_derivative):
     n_high = mixed.pair.high.get_ndofs()
     n_low = mixed.pair.low.get_ndofs()

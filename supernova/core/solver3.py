@@ -37,6 +37,7 @@ from ._solver_kernel2 import (
     _combine_coo_tensors,
     _scale_coo_axis0,
     _offset_coo_tensor,
+    _validate_dpsi_hat_dx,
 )
 
 
@@ -247,8 +248,10 @@ def _project_local_tensor(
     r"""
     Project a local tensor to a global CSR matrix.
 
-    The Galerkin term contributes ``-M``. If ``include_derivative`` is true,
-    the weak radial derivative is added for the first two state groups.
+    The Galerkin term contributes ``-M`` after converting its first two
+    differential-equation rows from ``d/d(psi_hat)`` to ``d/dx`` with
+    ``sb.dpsi_hat_dx``. If ``include_derivative`` is true, the weak ``d/dx``
+    term is added for the first two state groups.
     """
     M = _as_coo_tensor(M, "M")
     if M.shape[1] != M.shape[2]:
@@ -256,6 +259,9 @@ def _project_local_tensor(
 
     nq, n_state, _ = M.shape
     nmode = sb.m_range.size
+    dpsi_hat_dx = _validate_dpsi_hat_dx(
+        getattr(sb, "dpsi_hat_dx", 1.0)
+    )
     expected_state = 4 * nmode
     if n_state != expected_state:
         raise ValueError(f"M state size must be {expected_state}, got {n_state}.")
@@ -298,7 +304,8 @@ def _project_local_tensor(
             data.append(np.repeat(wd.data.astype(np.complex128), derivative_states.size))
 
     q_coords, local_rows, local_cols = M.coords
-    local_data = M.data.astype(np.complex128, copy=False)
+    local_data = M.data.astype(np.complex128, copy=True)
+    local_data[local_rows < 2 * nmode] *= dpsi_hat_dx
     local_keep = local_data != 0.0
     if np.any(local_keep):
         q_coords = q_coords[local_keep]

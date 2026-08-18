@@ -487,7 +487,7 @@ def _build_static_blocks(
     assert one_gpp.shape == C11.shape, "one_gpp must have shape (npsi, mpol, ntor)"
     assert gtp_over_gpp.shape == C11.shape, r"g^{\theta\psi} must have shape (npsi, mpol, ntor)"
     assert gpz_over_gpp.shape == C11.shape, r"g_{\zeta\psi} must have shape (npsi, mpol, ntor)"
-    assert gamma_s > 0, "gamma_s must be positive."
+    assert gamma_s >= 0, "gamma_s must be positive."
 
     # Allocating the space. 
     C0 = np.zeros((npsi, 2*nstate, 2*nstate), dtype=np.complex128)
@@ -537,15 +537,15 @@ def _build_static_blocks(
                           D0[ipsi, nstate:, :nstate], 
                           max_dm=dm_max, max_dn=dn_max)
 
-        # D22 has a 1 + \beta elements on it. The beta elements depend on the
-        # eigenvalue, so we will place the 1 part here and the rest later.
+        # D22 has a 1 - \beta contribution. The beta term depends on the
+        # eigenvalue, so place the 1 part here and the signed term in D1 below.
         D0[ipsi, nstate:, nstate:] = diagonal_ones
 
         # F11 element is composed by -K + \hat\sigma/B^2. We just place now the
         # K part, and we will add the rest later.
         kmat = np.zeros((nstate, nstate), dtype=np.complex128)
         fill_block_kernel(K[ipsi], m_range, n_range, kmat, max_dm=dm_max, max_dn=dn_max)
-        F[ipsi, :nstate, :nstate] = -kmat
+        F[ipsi, :nstate, :nstate] = - kmat
         one_over_B2 = np.zeros((nstate, nstate), dtype=np.complex128) 
         fill_block_kernel(F11_2[ipsi], m_range, n_range, one_over_B2, max_dm=dm_max, max_dn=dn_max)
 
@@ -609,8 +609,11 @@ def _build_static_blocks(
         # Filling the C1 and D1 matrices, that will have a dependence on the eigenvalue.
         fill_block_kernel(one_gpp[ipsi], m_range, n_range, C1[ipsi], max_dm=dm_max, max_dn=dn_max)
         fill_block_kernel(M[ipsi], m_range, n_range, D1[ipsi], max_dm=dm_max, max_dn=dn_max)
-        apply_ghg_scaling(D1[ipsi], qprof[ipsi], n_range, m_range) # D1 = G^H @ M @ G.
+        apply_ghg_scaling(D1[ipsi], qprof[ipsi], n_range, m_range) # Compressibility core: G^H @ M @ G.
         D1[ipsi] *= -mu_0 * gamma_s * pressure[ipsi]
+        # Stored inverse-lambda coefficient: D1 = -M[B0**2/h] @ A22.
+        D1[ipsi] = c12_2mat @ D1[ipsi]
+        apply_dm_cutoff(D1[ipsi], m_range, dm_max)
 
         # And finally we fill the gpt_over_gpp and gpz_over_gpp matrices, that will be used to apply the convolution with the G operator in the solver.+
         fill_block_kernel(gtp_over_gpp[ipsi], m_range, n_range, gtp_over_gpp_mat[ipsi], max_dm=dm_max, max_dn=dn_max)

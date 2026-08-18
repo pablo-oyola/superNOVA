@@ -19,6 +19,9 @@ class ITPAEq(superEquilibrium):
     the normalized toroidal flux, computed from ``dPsi_tor = q(r) dPsi_pol``.
     The internal geometry is first built in geometric circular angle and then
     interpolated to a Boozer/straight-field-line poloidal angle.
+
+    ``Bt_sign`` selects the physical toroidal-field direction while ``B0``
+    remains the positive magnetic-field normalization magnitude.
     """
 
     def __init__(
@@ -26,11 +29,12 @@ class ITPAEq(superEquilibrium):
         aminor: float = 1.0 * unyt.m,
         Rmajor: float = 10.0 * unyt.m,
         q0: float = 1.71,
-        qedge: float = 1.85,
+        qedge: float = 1.87,
         B0: float = 3.0 * unyt.T,
         ns: int = 100,
         ntheta: int = 256,
         m_max: int = 128,
+        Bt_sign: int = 1,
     ):
         if ns < 4:
             raise ValueError("ns must be at least 4.")
@@ -40,6 +44,9 @@ class ITPAEq(superEquilibrium):
         self.Rmajor = self._as_mks_value(Rmajor, "m")
         self.aminor = self._as_mks_value(aminor, "m")
         self.Baxis = self._as_mks_value(B0, "T")
+        if isinstance(Bt_sign, (bool, np.bool_)) or Bt_sign not in (-1, 1):
+            raise ValueError("Bt_sign must be either +1 or -1.")
+        self.Bt_sign = int(Bt_sign)
         self.q0 = float(q0)
         self.qedge = float(qedge)
         self.m_max = abs(int(m_max))
@@ -65,10 +72,10 @@ class ITPAEq(superEquilibrium):
         self._rho = r_minor / self.aminor
         self._theta_geom = theta_geom
         self._theta = theta
-        # With psi increasing outwards and zeta=phi, the geometric circular
-        # angle has negative q in internal COCOS 1.  The solver gauge is the
-        # coordinate reflection Theta=-theta_raw, not a physical B reversal.
-        self._poloidal_orientation = -1
+        # With psi increasing outwards and zeta=phi, the raw geometric q has
+        # sign -Bt_sign in internal COCOS 1.  Reflect the poloidal coordinate
+        # only when needed so the solver-facing q remains positive.
+        self._poloidal_orientation = -self.Bt_sign
 
         q = self._q_of_r(r_minor)
         qbar = self._qbar_of_r(r_minor)
@@ -106,7 +113,7 @@ class ITPAEq(superEquilibrium):
             d2psi_dr2=d2psi_dr2,
         )
 
-        F = np.full_like(psi, self.Baxis * self.Rmajor)
+        F = np.full_like(psi, self.Bt_sign * self.Baxis * self.Rmajor)
         I_raw = self._I_of_r(r_minor, dpsi_dr, theta_geom)
         I = self._poloidal_orientation * I_raw
         h = F * q + I
@@ -543,7 +550,7 @@ class ITPAEq(superEquilibrium):
 
         R = self.Rmajor + r * cos_theta
         Z = r * sin_theta
-        F0 = self.Baxis * self.Rmajor
+        F0 = self.Bt_sign * self.Baxis * self.Rmajor
 
         psi_prime = dpsi_dr[:, None]
         psi_prime_safe = np.where(psi_prime == 0.0, dpsi_dr[1], psi_prime)

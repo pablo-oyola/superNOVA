@@ -22,6 +22,24 @@ logger = get_logger(__name__)
 
 _MIXED_SIGN_RTOL = 1.0e-10
 
+
+def _periodic_nyquist(angle: np.ndarray) -> int:
+    """Return the Nyquist index after excluding a duplicated 2*pi endpoint."""
+    angle = np.asarray(angle, dtype=np.float64)
+    unique_size = angle.size
+    if (
+        angle.size > 1
+        and np.isclose(
+            angle[-1] - angle[0],
+            2.0 * np.pi,
+            rtol=1.0e-10,
+            atol=1.0e-12,
+        )
+    ):
+        unique_size -= 1
+    return unique_size // 2
+
+
 def ProfileFactoryPsiThetaZeta(
     *args,
     ntormax: Optional[int] = None,
@@ -135,7 +153,7 @@ def ProfileFactoryPsiThetaZeta(
         mpol = [0]
         ntor = [0]
     elif data.theta.size == 1:
-        nyquist_ntor = data.zeta.size // 2
+        nyquist_ntor = _periodic_nyquist(zeta)
         ntormax = nyquist_ntor if ntormax is None else ntormax
         if ntormax > nyquist_ntor:
             logger.warning(
@@ -154,7 +172,7 @@ def ProfileFactoryPsiThetaZeta(
         mpol = [0]
         ntor = np.arange(ntormax+1)
     elif data.zeta.size == 1:
-        nyquist_mpol = data.theta.size // 2
+        nyquist_mpol = _periodic_nyquist(theta)
         mpolmax = nyquist_mpol if mpolmax is None else mpolmax
         if mpolmax > nyquist_mpol:
             logger.warning(

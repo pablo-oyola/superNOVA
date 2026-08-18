@@ -136,14 +136,14 @@ class superSolver2:
         _to_compute = ['kappa_Psi/gpsi_psi',             # C11, also for D12                      - 0
                        'B0**2/h',   # C12 - second part                                           - 1
                        '(J_B - shear*gpsi_psi) * shear / B0**2',  # C12 - third part              - 2
-                       'B0**2/gpsi_psi/h',    # The O operator                                    - 3
+                       'B0**2/(gpsi_psi*h)',    # The O operator                                    - 3
                        '- divPsiVec', # C22 - Precomputed.                                        - 4
                        '(shear*gpsi_psi - J_B)/h',  # D11                                         - 5
-                       'kappa_s',  # D21 - first part; distinct from the continuum K operator.    - 6
+                       'kappa_s / B0**2',  # D21 - first part; distinct from the continuum K operator.    - 6
                        '1/B0**2', # F11 second part.                                              - 7
                        'gpsi_psi/B0**2 * shear', # F12 - first part                               - 8
                        '- J_B/B0**2', # F12 - second part                                         - 9
-                       '-1/B0**4*h', # F21                                                        - 10
+                       '-h/B0**4', # F21                                                        - 10
                        '-2*kappa_Psi/(gpsi_psi*B0**2)*h', # F22                                     - 11
                        '1/gpsi_psi', # Harmonic operator needed by lambda/gpsi_psi.               - 12
                        'gpsi_theta/gpsi_psi', # Surface phase term for e^{i(n*zeta-m*theta)}.     - 13
@@ -235,7 +235,9 @@ class superSolver2:
         # COCOS 1 stores poloidal flux in Wb/rad, while the NOVA magnetic-flux
         # scale is psi0 = Baxis*aminor**2. Keep the angle unit explicit until
         # the normalized value enters the numerical operator.
-        psiN = psiN.in_base(self.equ.my_norm).to("psi0/rad").v
+        self.dpsi_hat_dx = float(
+            psiN.in_base(self.equ.my_norm).to("psi0/rad").v
+        )
 
         # We need also to divide the density by the maximum density.
         n0 = (1 * unyt.Unit("naxis", registry=self.equ.registry)).to("1/aminor**3")
@@ -246,7 +248,10 @@ class superSolver2:
         self.pressure_deriv = self.equ('pressure', normalize=True)
         self.density.data = self.density.data.interp(x=self.unique_points) / n0.v
         self.pressure.data = self.pressure.data.interp(x=self.unique_points)
-        self.pressure_deriv.data = self.pressure.data.differentiate('x').interp(x=self.unique_points) / psiN
+        self.pressure_deriv.data = (
+            self.pressure.data.differentiate('x').interp(x=self.unique_points)
+            / self.dpsi_hat_dx
+        )
 
         # We evaluate as well hprof, qprof, Iprof and gprof at the solver points for later use in the integrals.
         self.hprof = self.equ('h', normalize=True)
@@ -304,6 +309,170 @@ class superSolver2:
 
         return np.ascontiguousarray(data.values[:, 0, 0], dtype=np.complex128)
 
+    @staticmethod
+    def _validate_explicit_m_values(
+        m_values: np.ndarray,
+        available_mmax: int,
+    ) -> np.ndarray:
+        """Validate an explicit diagnostic perturbation-harmonic list.
+
+        The production path continues to select a contiguous positive-q band.
+        This helper exists for verification problems whose harmonic space must
+        be closed under a specified transformation, such as ``m -> -m``.
+        """
+        try:
+            values = np.asarray(m_values)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "m_values must be a numeric array of integer mode numbers."
+            ) from error
+        if values.ndim != 1 or values.size == 0:
+            raise ValueError("m_values must be a nonempty one-dimensional array.")
+        if np.issubdtype(values.dtype, np.bool_):
+            raise ValueError("m_values must contain integer mode numbers, not booleans.")
+        if np.issubdtype(values.dtype, np.integer):
+            int64_info = np.iinfo(np.int64)
+            if np.issubdtype(values.dtype, np.unsignedinteger):
+                if np.any(values > int64_info.max):
+                    raise ValueError("m_values exceed the supported int64 range.")
+            elif values.dtype.itemsize > np.dtype(np.int64).itemsize:
+                if np.any(values < int64_info.min) or np.any(values > int64_info.max):
+                    raise ValueError("m_values exceed the supported int64 range.")
+        elif np.issubdtype(values.dtype, np.floating):
+            if not np.all(np.isfinite(values)) or not np.all(values == np.rint(values)):
+                raise ValueError("m_values must contain finite integer mode numbers.")
+            # ``float64(int64.max)`` rounds to 2**63, so compare against the
+            # exactly representable half-open int64 interval rather than
+            # converting ``int64.max`` to float.
+            if np.any(values < -float(2**63)) or np.any(values >= float(2**63)):
+                raise ValueError("m_values exceed the supported int64 range.")
+        else:
+            raise ValueError(
+                "m_values must be a real numeric array of integer mode numbers."
+            )
+        try:
+            values = values.astype(np.int64, copy=False)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError("m_values exceed the supported int64 range.") from error
+        if np.unique(values).size != values.size:
+            raise ValueError("m_values must not contain duplicate mode numbers.")
+        if np.any(np.diff(values) <= 0):
+            raise ValueError("m_values must be strictly increasing.")
+        available_mmax = int(available_mmax)
+        if available_mmax < 0:
+            raise ValueError("available_mmax must be non-negative.")
+        if np.any(values < -available_mmax) or np.any(values > available_mmax):
+            maximum_absolute_mode = max(abs(int(value)) for value in values)
+            raise ValueError(
+                "m_values exceed the available equilibrium harmonic range: "
+                f"max(abs(m_values))={maximum_absolute_mode}, "
+                f"available={available_mmax}."
+            )
+        return values
+
+    def _assemble_solver_blocks_for_m_range(
+        self,
+        *,
+        ntor: int,
+        m_range: np.ndarray,
+        max_dm: int,
+    ) -> solver_blocks2:
+        """Assemble solver blocks for an already validated harmonic list."""
+        m_range = np.asarray(m_range, dtype=np.int64)
+        if int(max_dm) < 0:
+            raise ValueError("max_dm must be non-negative.")
+        max_dm = int(max_dm)
+        perturbation_mmax = int(np.max(np.abs(m_range)))
+        largest_retained_difference = min(
+            int(max_dm),
+            int(np.max(m_range) - np.min(m_range)),
+        )
+        available_mmax = int(np.abs(self.M.m_pol).max())
+        coefficient_mmax = min(
+            available_mmax,
+            max(perturbation_mmax, largest_retained_difference),
+        )
+        nmax_eff = 0
+
+        H = self._profile_harmonics
+        S = self._profile_scalar
+        # Solver blocks use lambda = mu_0 * rho_mass * omega**2.  The
+        # equilibrium density profile is normalized number density, while
+        # omegaA is referenced to 1 amu, so include the species mass in amu
+        # here rather than rescaling the requested frequency.
+        mass_amu = float(self.cont.mass.to("amu").v)
+        mass_density = S(self.density) * mass_amu
+
+        blocks = build_solver_blocks2(
+            C11=H(self.C11, coefficient_mmax, nmax_eff),
+            O=H(self.O, coefficient_mmax, nmax_eff),
+            C12_2=H(self.C12_2, coefficient_mmax, nmax_eff),
+            C12_3=H(self.C12_3, coefficient_mmax, nmax_eff),
+            C22=H(self.C22, coefficient_mmax, nmax_eff),
+            D11=H(self.D11, coefficient_mmax, nmax_eff),
+            D12=H(self.C11, coefficient_mmax, nmax_eff),
+            kappa_s=H(self.D21_1, coefficient_mmax, nmax_eff),
+            K=H(self.K, coefficient_mmax, nmax_eff),
+            M=H(self.M, coefficient_mmax, nmax_eff),
+            F11_2=H(self.F11_2, coefficient_mmax, nmax_eff),
+            F12_1=H(self.F12_1, coefficient_mmax, nmax_eff),
+            F12_2=H(self.F12_2, coefficient_mmax, nmax_eff),
+            F21=H(self.F21, coefficient_mmax, nmax_eff),
+            F22=H(self.F22, coefficient_mmax, nmax_eff),
+            hprof=S(self.hprof),
+            Iprof=S(self.Iprof),
+            gprof=S(self.gprof),
+            qprof=S(self.qprof),
+            pressure=S(self.pressure),
+            pressure_deriv=S(self.pressure_deriv),
+            density=mass_density,
+            gamma_s=self.gamma_s,
+            dpsi_hat_dx=self.dpsi_hat_dx,
+            one_gpp=H(self.inv_gpsi_psi, coefficient_mmax, nmax_eff),
+            gtp_over_gpp=H(
+                self.gpsi_theta_over_gpsi_psi,
+                coefficient_mmax,
+                nmax_eff,
+            ),
+            gpz_over_gpp=H(
+                self.gpsi_zeta_over_gpsi_psi,
+                coefficient_mmax,
+                nmax_eff,
+            ),
+            H=H(self.cont.H, coefficient_mmax, nmax_eff),
+            J=H(self.cont.J, coefficient_mmax, nmax_eff),
+            L=H(self.cont.L, coefficient_mmax, nmax_eff),
+            ntor=ntor,
+            m_range=m_range,
+            max_dm=max_dm,
+        )
+        blocks.mmax = perturbation_mmax
+        blocks.coefficient_mmax = coefficient_mmax
+        blocks.weights_q = self.weights
+        blocks.points_q = self.points
+        blocks.phi_q = self.radialfe.eval_basis(self.points).T
+        blocks.WD = self.radialfe.weak_derivative_matrix.T
+        return blocks
+
+    def build_solver_blocks_for_m_values(
+        self,
+        ntor: int,
+        m_values: np.ndarray,
+        max_dm: int = 10,
+    ) -> solver_blocks2:
+        """Build uncached blocks for an explicit diagnostic harmonic list.
+
+        This opt-in path does not alter ``self.solver_blocks`` and therefore
+        cannot change the production positive-band cache or defaults.
+        """
+        available_mmax = int(np.abs(self.M.m_pol).max())
+        m_range = self._validate_explicit_m_values(m_values, available_mmax)
+        return self._assemble_solver_blocks_for_m_range(
+            ntor=ntor,
+            m_range=m_range,
+            max_dm=max_dm,
+        )
+
     def build_solver_blocks(self, ntor: int, max_dm: int=10, mmax: int=None) -> solver_blocks2:
         """
         We build the solver blocks using the pre-evaluated profiles already
@@ -325,11 +494,11 @@ class superSolver2:
 
         mmin_q = int(np.floor(ntor * qmin)) - 3
         mmax_q = min(mmax, int(np.ceil(ntor * qmax)) + 3)
+        # mmin_q = -mmax_q
 
         mmax = min(mmax, mmax_q)
 
         mmax_eff = mmax#self._solver_mmax(mmax)
-        nmax_eff = 0
 
         m_range = np.arange(mmin_q, mmax + 1)
 
@@ -340,53 +509,15 @@ class superSolver2:
                 and self.solver_blocks.mmax == mmax_eff
                 and self.solver_blocks.max_dm == max_dm
             ):
-                print("Reusing previous solver blocks.")
                 return self.solver_blocks
             else:
                 print("Building new solver blocks for ntor =", ntor, "and mmax =", mmax_eff)
 
-        H = self._profile_harmonics
-        S = self._profile_scalar
-        # Solver blocks use lambda = mu_0 * rho_mass * omega**2.  The
-        # equilibrium density profile is normalized number density, while
-        # omegaA is referenced to 1 amu, so include the species mass in amu
-        # here rather than rescaling the requested frequency.
-        mass_amu = float(self.cont.mass.to("amu").v)
-        mass_density = S(self.density) * mass_amu
-
-        self.solver_blocks = build_solver_blocks2(C11=H(self.C11, mmax_eff, nmax_eff),
-                                                 O=H(self.O, mmax_eff, nmax_eff),
-                                                 C12_2=H(self.C12_2, mmax_eff, nmax_eff),
-                                                 C12_3=H(self.C12_3, mmax_eff, nmax_eff),
-                                                 C22=H(self.C22, mmax_eff, nmax_eff),
-                                                 D11=H(self.D11, mmax_eff, nmax_eff),
-                                                 D12=H(self.C11, mmax_eff, nmax_eff),
-                                                 kappa_s=H(self.D21_1, mmax_eff, nmax_eff),
-                                                 K=H(self.K, mmax_eff, nmax_eff),
-                                                 M=H(self.M, mmax_eff, nmax_eff),
-                                                 F11_2=H(self.F11_2, mmax_eff, nmax_eff),
-                                                 F12_1=H(self.F12_1, mmax_eff, nmax_eff),
-                                                 F12_2=H(self.F12_2, mmax_eff, nmax_eff),
-                                                 F21=H(self.F21, mmax_eff, nmax_eff),
-                                                 F22=H(self.F22, mmax_eff, nmax_eff),
-                                                 hprof=S(self.hprof),
-                                                 Iprof=S(self.Iprof),
-                                                 gprof=S(self.gprof),
-                                                 qprof=S(self.qprof),
-                                                 pressure=S(self.pressure),
-                                                 pressure_deriv=S(self.pressure_deriv),
-                                                 density=mass_density,
-                                                 gamma_s=self.gamma_s,
-                                                 one_gpp=H(self.inv_gpsi_psi, mmax_eff, nmax_eff),
-                                                 gtp_over_gpp=H(self.gpsi_theta_over_gpsi_psi, mmax_eff, nmax_eff),
-                                                 gpz_over_gpp=H(self.gpsi_zeta_over_gpsi_psi, mmax_eff, nmax_eff),
-                                                 H=H(self.cont.H, mmax_eff, nmax_eff),
-                                                 J=H(self.cont.J, mmax_eff, nmax_eff),
-                                                 L=H(self.cont.L, mmax_eff, nmax_eff),
-                                                 ntor=ntor,
-                                                 m_range=m_range,
-                                                 max_dm=max_dm)
-        self.solver_blocks.mmax = mmax_eff
+        self.solver_blocks = self._assemble_solver_blocks_for_m_range(
+            ntor=ntor,
+            m_range=m_range,
+            max_dm=max_dm,
+        )
         
         # We will now solve the continuum problem for the first time to 
         # get the SVD decomposition for the E^-1 operator for the ntor given.
@@ -398,12 +529,6 @@ class superSolver2:
         # self.solver_blocks.vl = vdict['left']
         # self.solver_blocks.norm = vdict['normalizations']
         # self.solver_blocks.cont_eigvals = w
-
-        # We fill the elements related to the radial operations.
-        self.solver_blocks.weights_q = self.weights
-        self.solver_blocks.points_q = self.points
-        self.solver_blocks.phi_q = self.radialfe.eval_basis(self.points).T
-        self.solver_blocks.WD = self.radialfe.weak_derivative_matrix.T
 
         return self.solver_blocks
 

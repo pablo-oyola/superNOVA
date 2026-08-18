@@ -33,6 +33,20 @@ def _biorthogonal_normalizations(vl: np.ndarray, B: np.ndarray,
     return normalizations
 
 
+def _eigh_signed_definite(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Solve a Hermitian pencil whose mass matrix has either orientation.
+
+    The Boozer Jacobian, and therefore both matrices in the reduced Alfvén
+    and slow-sound pencils, may be globally negative under a valid coordinate
+    convention.  ``scipy.linalg.eigh`` requires a positive-definite second
+    matrix, so reverse both matrices when the zero Fourier harmonic of ``B``
+    has the negative orientation.  A genuinely indefinite ``B`` is still
+    rejected by ``eigh``.
+    """
+    pencil_sign = -1.0 if np.real(B[0, 0]) < 0.0 else 1.0
+    return eigh(pencil_sign * A, pencil_sign * B, eigvals_only=True)
+
+
 class superContinuum:
     """
     """
@@ -249,7 +263,7 @@ class superContinuum:
                 if return_eigvecs:
                     raise NotImplementedError("Currently, the return of eigenvectors is only implemented for the full case. This will be added for the slow_sound case in future releases.")
                 else:
-                    w = eigh(A, B, eigvals_only=True)
+                    w = _eigh_signed_definite(A, B)
                     order = np.argsort(np.real(w))
                     w = w[order]
                     vl = None

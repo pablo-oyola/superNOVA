@@ -13,6 +13,7 @@ applied on the trial side.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import xarray as xr
@@ -20,7 +21,11 @@ from scipy.sparse import coo_matrix, csr_matrix
 
 from ..radial import BSplineFE, CompatibleBSplinePair
 from ._boundary4 import BoundaryCondition, idealSeparatrixBC, regularityAxisBC
-from ._solver_kernel2 import _as_coo_tensor, solver_blocks2
+from ._solver_kernel2 import (
+    _as_coo_tensor,
+    _validate_dpsi_hat_dx,
+    solver_blocks2,
+)
 from .solver3 import (
     SplitRationalCISSNEPSolver,
     SplitRationalNEPSolver,
@@ -170,9 +175,10 @@ def _project_local_tensor_mixed(
 ) -> csr_matrix:
     r"""Project one local split tensor into the mixed field-major spaces.
 
-    The Galerkin contribution is ``-<Phi_L, M Phi_trial>``.  For the first
-    two state groups, the optional derivative contribution is
-    ``+<Phi_L, d(Phi_H)/ds> = +G_low_high``.
+    The Galerkin contribution is ``-<Phi_L, M Phi_trial>`` after multiplying
+    its first two differential-equation rows by ``sb.dpsi_hat_dx``. For the
+    first two state groups, the optional derivative contribution is
+    ``+<Phi_L, d(Phi_H)/dx> = +G_low_high``.
     """
     M = _as_coo_tensor(M, "M")
     phi_high_q = np.asarray(phi_high_q)
@@ -187,6 +193,9 @@ def _project_local_tensor_mixed(
 
     nq = M.shape[0]
     n_modes = np.asarray(sb.m_range).size
+    dpsi_hat_dx = _validate_dpsi_hat_dx(
+        getattr(sb, "dpsi_hat_dx", 1.0)
+    )
     n_state = 4 * n_modes
     if M.shape[1:] != (n_state, n_state):
         raise ValueError(
@@ -228,7 +237,8 @@ def _project_local_tensor_mixed(
                 data_parts.append(derivative.data.astype(np.complex128, copy=False))
 
     q_coords, local_rows, local_cols = M.coords
-    local_data = M.data.astype(np.complex128, copy=False)
+    local_data = M.data.astype(np.complex128, copy=True)
+    local_data[local_rows < 2 * n_modes] *= dpsi_hat_dx
     nonzero = local_data != 0.0
     q_coords = q_coords[nonzero]
     local_rows = local_rows[nonzero]
@@ -342,9 +352,25 @@ class superSolver4(superSolver3):
         bc_kind: str | None = "full",
         bc_tol: float | None = None,
         verbose: bool = False,
+        m_values: np.ndarray | None = None,
     ) -> tuple[csr_matrix, csr_matrix, csr_matrix]:
-        r"""Assemble the mixed ``T0``, ``T1`` and ``Tminus1`` matrices."""
-        sb = self.build_solver_blocks(ntor=ntor, mmax=mmax, max_dm=max_dm)
+        r"""Assemble the mixed ``T0``, ``T1`` and ``Tminus1`` matrices.
+
+        ``m_values`` is an opt-in verification interface for an explicit,
+        possibly noncontiguous signed harmonic list.  It bypasses the
+        production q-band selector without changing or populating the
+        production solver-block cache.
+        """
+        if m_values is None:
+            sb = self.build_solver_blocks(ntor=ntor, mmax=mmax, max_dm=max_dm)
+        else:
+            if mmax is not None:
+                raise ValueError("Specify either mmax or m_values, not both.")
+            sb = self.build_solver_blocks_for_m_values(
+                ntor=ntor,
+                m_values=m_values,
+                max_dm=max_dm,
+            )
         mixed = self._get_mixed_radial_data()
         layout = self._mixed_layout(sb)
 
@@ -602,9 +628,24 @@ class superSolver4(superSolver3):
         nep_type: str,
         description: str,
         extra_attrs: dict | None = None,
+        m_values: np.ndarray | None = None,
     ) -> xr.Dataset:
         """Pack full mixed vectors and named high/low coefficient arrays."""
-        sb = self.build_solver_blocks(ntor=ntor, mmax=mmax, max_dm=max_dm)
+        if m_values is None:
+            sb = self.build_solver_blocks(ntor=ntor, mmax=mmax, max_dm=max_dm)
+            explicit_m_values = None
+        else:
+            if mmax is not None:
+                raise ValueError("Specify either mmax or m_values, not both.")
+            available_mmax = int(np.abs(self.M.m_pol).max())
+            explicit_m_values = self._validate_explicit_m_values(
+                m_values,
+                available_mmax,
+            )
+            # Result packing needs only the harmonic labels. Reassembling the
+            # uncached diagnostic blocks here would duplicate the expensive
+            # signed-m assembly already performed for the eigensolve.
+            sb = SimpleNamespace(m_range=explicit_m_values)
         layout = self._mixed_layout(sb)
         species_mass_amu = self._species_mass_amu()
         omega = np.sqrt(result.eigenvalues)
@@ -695,6 +736,16 @@ class superSolver4(superSolver3):
             "target_omega": target_omega,
             "target_s": target_s,
             "mmax": None if mmax is None else int(mmax),
+            "harmonic_selection": (
+                "production_q_band"
+                if explicit_m_values is None
+                else "explicit_diagnostic"
+            ),
+            "explicit_m_values": (
+                ""
+                if explicit_m_values is None
+                else np.array2string(explicit_m_values, separator=",")
+            ),
             "max_dm": int(max_dm),
             "regularizer": regularizer,
             "apply_bcs": bool(apply_bcs),

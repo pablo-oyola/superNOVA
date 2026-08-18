@@ -9,7 +9,15 @@ __pycache__/
 .codex
 .agents
 .pytest_cache/
-tests/
+tests/*
+!tests/test_desc_helper.py
+!tests/test_continuum.py
+!tests/test_equilibrium_cocos.py
+!tests/test_itpa_shear.py
+!tests/test_radial_profile.py
+!tests/test_solver5.py
+!tests/test_solver_fourier_convention.py
+!tests/test_symmetry_verification.py
 *.egg-info/
 *.code-workspace
 *.h5
