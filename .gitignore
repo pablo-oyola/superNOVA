@@ -22,3 +22,7 @@ tests/*
 *.code-workspace
 *.h5
 *.nc4
+*.git
+*.geqdsk
+*.npz
+*.png
