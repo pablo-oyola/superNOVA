@@ -168,7 +168,6 @@ class superSolver2:
         self.C22 = tmp[4]
         self.D11 = tmp[5]
         self.D21_1 = tmp[6]
-        self.D21_2 = self.cont.M # = h(\psi)
         self.F11_2 = tmp[7]
         self.F12_1 = tmp[8]
         self.F12_2 = tmp[9]
@@ -178,9 +177,15 @@ class superSolver2:
         self.gpsi_theta_over_gpsi_psi = tmp[13]
         self.gpsi_zeta_over_gpsi_psi = tmp[14]
 
-        # The rest of the operators come from the continuum:
-        self.M = self.cont.M
-        self.K = self.cont.K
+        # The rest of the operators come from the continuum.  Solvers may use
+        # different radial quadrature grids while sharing one continuum, so
+        # keep private copies before _setup_radial_points resamples them.
+        self.H = self.cont.H.copy(deepcopy=True)
+        self.J = self.cont.J.copy(deepcopy=True)
+        self.K = self.cont.K.copy(deepcopy=True)
+        self.L = self.cont.L.copy(deepcopy=True)
+        self.M = self.cont.M.copy(deepcopy=True)
+        self.D21_2 = self.M  # = h(\psi)
 
     def _setup_radial_points(self):
         """
@@ -208,23 +213,21 @@ class superSolver2:
         self.C22.data = self.C22.data.interp(x=self.unique_points)
         self.D11.data = self.D11.data.interp(x=self.unique_points)
         self.D21_1.data = self.D21_1.data.interp(x=self.unique_points)
-        self.D21_2.data = self.D21_2.data.interp(x=self.unique_points)
         self.F11_2.data = self.F11_2.data.interp(x=self.unique_points)
         self.F12_1.data = self.F12_1.data.interp(x=self.unique_points)
         self.F12_2.data = self.F12_2.data.interp(x=self.unique_points)
         self.F21.data = self.F21.data.interp(x=self.unique_points)
         self.F22.data = self.F22.data.interp(x=self.unique_points)
-        self.cont.H.data = self.cont.H.data.interp(x=self.unique_points)
-        self.cont.M.data = self.cont.M.data.interp(x=self.unique_points)
-        self.cont.L.data = self.cont.L.data.interp(x=self.unique_points)
-        self.cont.J.data = self.cont.J.data.interp(x=self.unique_points)
         self.inv_gpsi_psi.data = self.inv_gpsi_psi.data.interp(x=self.unique_points)
         self.gpsi_theta_over_gpsi_psi.data = self.gpsi_theta_over_gpsi_psi.data.interp(x=self.unique_points)
         self.gpsi_zeta_over_gpsi_psi.data = self.gpsi_zeta_over_gpsi_psi.data.interp(x=self.unique_points)
 
         # The rest of the operators come from the continuum:
-        self.M.data = self.M.data.interp(x=self.unique_points)
+        self.H.data = self.H.data.interp(x=self.unique_points)
+        self.J.data = self.J.data.interp(x=self.unique_points)
         self.K.data = self.K.data.interp(x=self.unique_points)
+        self.L.data = self.L.data.interp(x=self.unique_points)
+        self.M.data = self.M.data.interp(x=self.unique_points)
 
         # We need to get for the radial derivative the underlying unit and scale
         # of the flux. Use the active-domain span so this derivative is
@@ -269,7 +272,7 @@ class superSolver2:
         Return the effective poloidal harmonic limit used by both the static
         solver blocks and the continuum eigensystem.
         """
-        available = int(np.abs(self.cont.H.m_pol).max())
+        available = int(np.abs(self.H.m_pol).max())
         if mmax is None:
             return available
         if mmax < 0:
@@ -439,9 +442,9 @@ class superSolver2:
                 coefficient_mmax,
                 nmax_eff,
             ),
-            H=H(self.cont.H, coefficient_mmax, nmax_eff),
-            J=H(self.cont.J, coefficient_mmax, nmax_eff),
-            L=H(self.cont.L, coefficient_mmax, nmax_eff),
+            H=H(self.H, coefficient_mmax, nmax_eff),
+            J=H(self.J, coefficient_mmax, nmax_eff),
+            L=H(self.L, coefficient_mmax, nmax_eff),
             ntor=ntor,
             m_range=m_range,
             max_dm=max_dm,
