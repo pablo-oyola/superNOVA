@@ -9,6 +9,12 @@ from .core.solver2 import superSolver2
 from .core.solver3 import superSolver3
 from .core.solver4 import superSolver4
 from .core.solver5 import superSolver5
+from .core.solver5_multigrid import (
+    ModeClassificationThresholds,
+    MultigridPEPResult,
+    MultigridSearchOptions,
+    superSolver5Multigrid,
+)
 from .radial.profile import Profile
 from .radial.base import RadialFE
 from .radial.chebyshev import ChebyshevFE

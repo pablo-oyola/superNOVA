@@ -177,6 +177,11 @@ class QuadraticPEPSolver:
         if self.options:
             apply_petsc_options(self.prefix, **self.options)
         self.pep.setFromOptions()
+        dimensions = self.pep.getDimensions()
+        self.effective_nev = int(dimensions[0])
+        effective_tol, effective_maxit = self.pep.getTolerances()
+        self.effective_tol = float(effective_tol)
+        self.effective_maxit = int(effective_maxit)
         self._configure_mixed_shift_solver()
 
     def _configure_mixed_shift_solver(self) -> None:
@@ -257,7 +262,12 @@ class QuadraticPEPSolver:
             f"target_s={_format_complex(self.target_s)}, region={self.region}"
         )
 
-    def solve(self, max_eigenpairs: int | None = None) -> NEPResult:
+    def solve(
+        self,
+        max_eigenpairs: int | None = None,
+        *,
+        allow_empty: bool = False,
+    ) -> NEPResult:
         """Solve the quadratic PEP and return converged eigenpairs in ``s``."""
         petsc = _require_petsc()
         slepc = _require_slepc()
@@ -267,7 +277,7 @@ class QuadraticPEPSolver:
         nout = nconv if max_eigenpairs is None else min(nconv, int(max_eigenpairs))
         reason = self.pep.getConvergedReason()
         iterations = int(self.pep.getIterationNumber())
-        if nconv == 0:
+        if nconv == 0 and not allow_empty:
             raise RuntimeError(
                 "SLEPc PEP converged no eigenpairs: "
                 f"reason={reason}, iterations={iterations}, "

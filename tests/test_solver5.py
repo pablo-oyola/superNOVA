@@ -404,6 +404,54 @@ def test_solve_pep_destroys_pep_after_success(monkeypatch):
     assert pep.destroy_calls == 1
 
 
+def test_quadratic_pep_allow_empty_supports_adaptive_empty_windows(monkeypatch):
+    class FakeVector:
+        def destroy(self):
+            pass
+
+    class FakeMatrix:
+        def createVecRight(self):
+            return FakeVector()
+
+    class FakePEP:
+        def solve(self):
+            pass
+
+        def getConverged(self):
+            return 0
+
+        def getConvergedReason(self):
+            return "empty"
+
+        def getIterationNumber(self):
+            return 2
+
+        def getST(self):
+            return SimpleNamespace(getType=lambda: "sinvert")
+
+    wrapper = object.__new__(solver5_module.QuadraticPEPSolver)
+    wrapper.pep = FakePEP()
+    wrapper.mats = [FakeMatrix()]
+    wrapper.size = 3
+    wrapper.scalar_type = np.dtype(np.complex128)
+    wrapper.compute_residuals = True
+    wrapper.target_s = 1.0
+    wrapper.verbose = False
+    monkeypatch.setattr(solver5_module, "_require_petsc", lambda: SimpleNamespace())
+    monkeypatch.setattr(solver5_module, "_require_slepc", lambda: SimpleNamespace())
+
+    result = wrapper.solve(allow_empty=True)
+
+    assert result.nconv == 0
+    assert result.eigenvalues.shape == (0,)
+    assert result.eigenvectors.shape == (0, 3)
+    assert wrapper.last_backward_errors.shape == (0,)
+    assert wrapper.last_slepc_backward_errors.shape == (0,)
+
+    with pytest.raises(RuntimeError, match="converged no eigenpairs"):
+        wrapper.solve()
+
+
 def test_solve_pep_forwards_signed_harmonics_to_result_packing(monkeypatch):
     expected = xr.Dataset({"eigenvalue": ("eigenpair", [1.0 + 0.0j])})
 
