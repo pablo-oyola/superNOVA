@@ -21,6 +21,169 @@ SPEC.loader.exec_module(MODULE)
 
 
 class WindowSolverMultigridScriptTests(unittest.TestCase):
+    def test_reacquisition_selection_is_eligible_global_and_ranked(self):
+        from supernova.core.solver5_multigrid_evidence import (
+            ReacquisitionOptions,
+            select_reacquisition_candidates,
+        )
+
+        tracks = xr.Dataset(
+            {
+                "present": (("track", "level"), [[True, False]] * 3 + [[True, True]]),
+                "width_over_h": (
+                    ("track", "level"),
+                    [[4.0, np.nan], [1.0, np.nan], [5.0, np.nan], [4.0, 4.0]],
+                ),
+                "coarse_space_retention": (
+                    ("track", "level"),
+                    [[0.2, np.nan], [0.8, np.nan], [0.9, np.nan], [0.7, 0.7]],
+                ),
+            },
+            coords={"track": np.arange(4), "level": [0, 1]},
+        )
+        selected = select_reacquisition_candidates(
+            tracks,
+            1,
+            ReacquisitionOptions(max_candidates_per_level=1),
+            eligible=np.asarray([True, True, False, True]),
+        )
+
+        np.testing.assert_array_equal(selected, [1])
+        with self.assertRaisesRegex(ValueError, "one Boolean value per track"):
+            select_reacquisition_candidates(
+                tracks,
+                1,
+                ReacquisitionOptions(),
+                eligible=np.asarray([True]),
+            )
+
+    def test_reacquisition_eligibility_survives_track_reordering(self):
+        from supernova.core.solver5_multigrid import (
+            _track_mask_from_root_identities,
+            _track_root_identities,
+        )
+
+        levels = [
+            xr.Dataset(
+                {"source_eigenpair": ("eigenpair", [10.0, 11.0])},
+                coords={"eigenpair": [0, 1]},
+            ),
+            xr.Dataset(
+                {"source_eigenpair": ("eigenpair", [20.0, 21.0, np.nan])},
+                coords={"eigenpair": [0, 1, 2]},
+            ),
+        ]
+        original = xr.Dataset(
+            {
+                "present": (("track", "level"), [[True, False], [True, True]]),
+                "mode_index": (("track", "level"), [[0, -1], [1, 0]]),
+            },
+            coords={"track": [0, 1], "level": [0, 1]},
+        )
+        identities = _track_root_identities(
+            original,
+            levels,
+            np.asarray([False, True]),
+        )
+        retracked = xr.Dataset(
+            {
+                "present": (
+                    ("track", "level"),
+                    [[True, True], [False, True], [True, True]],
+                ),
+                "mode_index": (
+                    ("track", "level"),
+                    [[0, 2], [-1, 1], [1, 0]],
+                ),
+            },
+            coords={"track": [0, 1, 2], "level": [0, 1]},
+        )
+
+        np.testing.assert_array_equal(
+            _track_mask_from_root_identities(retracked, levels, identities),
+            [False, False, True],
+        )
+
+    def test_reacquire_dry_run_selects_without_slepc(self):
+        tracks = xr.Dataset(
+            {
+                "omega": (
+                    ("track", "level"),
+                    np.asarray(
+                        [
+                            [1.2 + 0.0j, np.nan + 0.0j, np.nan + 0.0j],
+                            [1.4 + 0.0j, 1.41 + 0.0j, np.nan + 0.0j],
+                            [1.6 + 0.0j, np.nan + 0.0j, np.nan + 0.0j],
+                        ]
+                    ),
+                ),
+                "present": (
+                    ("track", "level"),
+                    [[True, False, False], [True, True, False], [True, False, False]],
+                ),
+                "width_over_h": (
+                    ("track", "level"),
+                    [[4.0, np.nan, np.nan], [4.0, 5.0, np.nan], [4.0, np.nan, np.nan]],
+                ),
+                "coarse_space_retention": (
+                    ("track", "level"),
+                    [[0.6, np.nan, np.nan], [0.7, 0.7, np.nan], [0.8, np.nan, np.nan]],
+                ),
+            },
+            coords={"track": [0, 1, 2], "level": [0, 1, 2]},
+        )
+        classification = xr.Dataset(
+            {
+                "label": ("track", ["unresolved", "unresolved", "physical_gap"]),
+                "discrete_valid": ("track", ["true", "true", "true"]),
+            },
+            coords={"track": [0, 1, 2]},
+        )
+        continuum = xr.Dataset(
+            {
+                "omega": (("psi", "branch"), [[1.0 + 0.0j], [2.0 + 0.0j]]),
+                "frequency_khz": (("psi", "branch"), [[50.0], [100.0]]),
+                "branch_assignment_ambiguous": (
+                    ("psi", "branch"),
+                    np.zeros((2, 1), dtype=bool),
+                ),
+            },
+            coords={"psi": [0.0, 1.0], "branch": [0]},
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            MODULE._write_dataset(tracks, output / "mode_tracks_evidence_v2.nc")
+            MODULE._write_dataset(
+                classification,
+                output / "classification_evidence_v2.nc",
+            )
+            MODULE._write_dataset(continuum, output / "continuum.nc")
+            (output / "manifest.json").write_text(
+                json.dumps({"configuration": {}}),
+                encoding="utf-8",
+            )
+
+            MODULE._run_reacquire(
+                SimpleNamespace(
+                    artifact_dir=output,
+                    execute=False,
+                    max_candidates_per_level=24,
+                    nev_multiplier=4,
+                    relative_half_width=3.0e-3,
+                    minimum_overlap=0.90,
+                    verbose=False,
+                )
+            )
+
+            report = json.loads((output / "reacquisition_dry_run.json").read_text())
+            self.assertIs(report["slepc_was_run"], False)
+            self.assertEqual(report["selected_window_count_before_cascades"], 2)
+            self.assertEqual(report["selected_by_target_level"], {"1": 1, "2": 1})
+            self.assertFalse(
+                (output / "manifest_reacquired_evidence_v2.json").exists()
+            )
+
     def test_reclassify_rebuilds_tracks_from_raw_levels_without_slepc(self):
         from supernova.core.solver5_multigrid import _nested_bspline_levels
         from supernova.core.solver5_multigrid_evidence import (

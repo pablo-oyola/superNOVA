@@ -612,9 +612,12 @@ def test_missing_root_reacquisition_uses_prolonged_initial_space(monkeypatch):
         def solve(self, *, allow_empty):
             assert allow_empty is True
             return NEPResult(
-                eigenvalues=np.asarray([1.0 + 0.0j]),
-                eigenvectors=np.asarray([[1.0, 2.0]], dtype=np.complex128),
-                nconv=1,
+                eigenvalues=np.asarray([1.0 + 0.0j, 1.0 + 0.0j]),
+                eigenvectors=np.asarray(
+                    [[3.0, 4.0], [1.0, 2.0]],
+                    dtype=np.complex128,
+                ),
+                nconv=2,
                 reason="fake-converged",
                 iterations=3,
             )
@@ -693,24 +696,34 @@ def test_missing_root_reacquisition_uses_prolonged_initial_space(monkeypatch):
     def fake_pack_window_result(**kwargs):
         return xr.Dataset(
             {
-                "s": ("eigenpair", np.asarray([1.0 + 0.0j])),
-                "omega": ("eigenpair", np.asarray([1.0 + 0.0j])),
+                "s": ("eigenpair", np.asarray([1.0 + 0.0j, 1.0 + 0.0j])),
+                "omega": ("eigenpair", np.asarray([1.0 + 0.0j, 1.0 + 0.0j])),
                 "eigenvector": (
                     ("eigenpair", "dof"),
-                    np.asarray([[1.0 + 0.0j, 2.0 + 0.0j]]),
+                    np.asarray(
+                        [[3.0 + 0.0j, 4.0 + 0.0j], [1.0 + 0.0j, 2.0 + 0.0j]]
+                    ),
                 ),
                 "xi_psi": (
                     ("eigenpair", "psi", "m_pol"),
-                    np.ones((1, 2, 1), dtype=np.complex128),
+                    np.ones((2, 2, 1), dtype=np.complex128),
                 ),
-                "window_id": ("eigenpair", np.asarray([kwargs["window"]])),
-                "slepc_backward_error": ("eigenpair", np.asarray([1.0e-12])),
+                "window_id": (
+                    "eigenpair",
+                    np.asarray([kwargs["window"], kwargs["window"]]),
+                ),
+                "slepc_backward_error": (
+                    "eigenpair",
+                    np.asarray([1.0e-2, 1.0e-12]),
+                ),
             },
-            coords={"eigenpair": [0], "dof": [0, 1], "psi": [0.25, 0.75], "m_pol": [4]},
+            coords={"eigenpair": [0, 1], "dof": [0, 1], "psi": [0.25, 0.75], "m_pol": [4]},
         )
 
     def fake_retrack(solutions, weights, thresholds, **kwargs):
         assert solutions[1].sizes["eigenpair"] == 1
+        assert solutions[1]["slepc_backward_error"].item() == 1.0e-12
+        assert solutions[1]["reacquisition_status"].item() == "reacquired"
         updated = tracks.copy(deep=True)
         updated["present"].values[0, 1] = True
         updated["mode_index"].values[0, 1] = 0

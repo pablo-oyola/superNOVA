@@ -47,6 +47,7 @@ REACQUISITION_STATUSES = (
     "not_attempted",
     "reacquired",
     "search_failed",
+    "partial",
     "not_found_in_locally_complete_search",
     "capacity_limited",
 )
@@ -205,6 +206,41 @@ class ReacquisitionOptions:
             raise ValueError("relative_half_width must be finite and positive.")
         if not 0.0 <= self.minimum_overlap <= 1.0:
             raise ValueError("minimum_overlap must lie in [0, 1].")
+
+
+def select_reacquisition_candidates(
+    tracks: xr.Dataset,
+    level: int,
+    options: ReacquisitionOptions,
+    eligible: np.ndarray | None = None,
+) -> np.ndarray:
+    """Select and rank tracks present on ``level-1`` but absent on ``level``."""
+    nlevels = tracks.sizes.get("level", 0)
+    if not 1 <= int(level) < nlevels:
+        raise ValueError(f"level must lie in [1, {nlevels - 1}]")
+    present = np.asarray(tracks["present"].values, dtype=bool)
+    width_over_h = np.asarray(tracks["width_over_h"].values, dtype=float)
+    retention = np.asarray(tracks["coarse_space_retention"].values, dtype=float)
+    if eligible is None:
+        eligible = np.ones(present.shape[0], dtype=bool)
+    else:
+        eligible = np.asarray(eligible, dtype=bool)
+        if eligible.shape != (present.shape[0],):
+            raise ValueError("eligible must contain one Boolean value per track")
+    missing = present[:, level - 1] & ~present[:, level]
+    global_candidate = (
+        width_over_h[:, level - 1] >= options.global_width_over_h_min
+    ) | (retention[:, level - 1] >= options.global_coarse_retention_min)
+    candidates = np.flatnonzero(eligible & missing & global_candidate)
+    if candidates.size == 0:
+        return candidates
+    ranking = np.nan_to_num(retention[candidates, level - 1], nan=-np.inf)
+    width_ranking = np.nan_to_num(
+        width_over_h[candidates, level - 1],
+        nan=-np.inf,
+    )
+    order = np.lexsort((candidates, -width_ranking, -ranking))
+    return candidates[order][: options.max_candidates_per_level]
 
 
 def empirical_candidate_stability(
@@ -1642,7 +1678,11 @@ def classify_tracks_evidence_v2(
         targeted_absence = tri_state(
             np.any(reacquisition == "not_found_in_locally_complete_search")
         )
-        if np.any(reacquisition == "capacity_limited") and targeted_absence != TRUE:
+        inconclusive_reacquisition = np.isin(
+            reacquisition,
+            ("capacity_limited", "partial", "search_failed"),
+        )
+        if np.any(inconclusive_reacquisition) and targeted_absence != TRUE:
             targeted_absence = UNKNOWN
         enriched = _level_history(tracks, "enriched_residual", track, nlevels).astype(float)
         finite_enriched = enriched[np.isfinite(enriched)]

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import operator
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 import xarray as xr
@@ -39,6 +39,7 @@ from .solver5_multigrid_evidence import (
     fixed_coarse_space_retention,
     mixed_space_prolongation,
     radial_power_diagnostics,
+    select_reacquisition_candidates,
     weighted_principal_angle_cosines,
     window_catalog_status,
 )
@@ -959,6 +960,58 @@ def _attach_enriched_residuals(
         distinction="not the SLEPc residual in the same discrete space",
     )
     return output
+
+
+def _root_identity(
+    level_solutions: Sequence[xr.Dataset],
+    level: int,
+    index: int,
+) -> tuple[str, int, int]:
+    """Identify a saved root independently of later track-row reordering."""
+    dataset = level_solutions[level]
+    if "source_eigenpair" in dataset:
+        source = dataset["source_eigenpair"].values[index]
+        if np.isfinite(source):
+            return "source", int(level), int(source)
+    return "index", int(level), int(index)
+
+
+def _track_root_identities(
+    tracks: xr.Dataset,
+    level_solutions: Sequence[xr.Dataset],
+    selected: np.ndarray,
+) -> set[tuple[str, int, int]]:
+    """Collect persistent root identities for selected input tracks."""
+    selected = np.asarray(selected, dtype=bool)
+    if selected.shape != (tracks.sizes.get("track", 0),):
+        raise ValueError("selected must contain one Boolean value per input track")
+    present = np.asarray(tracks["present"].values, dtype=bool)
+    indices = np.asarray(tracks["mode_index"].values, dtype=int)
+    identities: set[tuple[str, int, int]] = set()
+    for track in np.flatnonzero(selected):
+        for level in np.flatnonzero(present[track]):
+            identities.add(
+                _root_identity(level_solutions, int(level), int(indices[track, level]))
+            )
+    return identities
+
+
+def _track_mask_from_root_identities(
+    tracks: xr.Dataset,
+    level_solutions: Sequence[xr.Dataset],
+    identities: set[tuple[str, int, int]],
+) -> np.ndarray:
+    """Remap eligibility after deduplication or cross-level retracking."""
+    present = np.asarray(tracks["present"].values, dtype=bool)
+    indices = np.asarray(tracks["mode_index"].values, dtype=int)
+    selected = np.zeros(present.shape[0], dtype=bool)
+    for track in range(present.shape[0]):
+        selected[track] = any(
+            _root_identity(level_solutions, int(level), int(indices[track, level]))
+            in identities
+            for level in np.flatnonzero(present[track])
+        )
+    return selected
 
 
 def _continuum_vector_overlaps(
@@ -2198,35 +2251,47 @@ class superSolver5Multigrid:
         options: ReacquisitionOptions,
         bc_tol: float | None,
         verbose: bool,
+        candidate_mask: np.ndarray | None = None,
     ) -> tuple[xr.Dataset, list[_WindowRecord]]:
         """Selectively continue global candidates missing on an adjacent mesh."""
         if not options.enabled or self.levels < 2:
             return tracks, []
+        if candidate_mask is not None:
+            candidate_mask = np.asarray(candidate_mask, dtype=bool)
+            if candidate_mask.shape != (tracks.sizes.get("track", 0),):
+                raise ValueError(
+                    "candidate_mask must contain one Boolean value per input track"
+                )
+
+        eligible_roots: set[tuple[str, int, int]] | None = None
+        if candidate_mask is not None:
+            eligible_roots = _track_root_identities(
+                tracks,
+                level_solutions,
+                candidate_mask,
+            )
+
+        def current_candidate_mask(current_tracks: xr.Dataset) -> np.ndarray | None:
+            if eligible_roots is None:
+                return None
+            return _track_mask_from_root_identities(
+                current_tracks,
+                level_solutions,
+                eligible_roots,
+            )
+
         attempt_records: list[_WindowRecord] = []
-        negative_status: list[tuple[int, float, str]] = []
+        negative_status: list[tuple[int, int, str]] = []
         for level in range(1, self.levels):
             present = np.asarray(tracks["present"].values, dtype=bool)
-            missing = present[:, level - 1] & ~present[:, level]
-            width_over_h = np.asarray(tracks["width_over_h"].values, dtype=float)
-            retention = np.asarray(
-                tracks["coarse_space_retention"].values,
-                dtype=float,
+            candidates = select_reacquisition_candidates(
+                tracks,
+                level,
+                options,
+                eligible=current_candidate_mask(tracks),
             )
-            global_candidate = (
-                width_over_h[:, level - 1] >= options.global_width_over_h_min
-            ) | (
-                retention[:, level - 1] >= options.global_coarse_retention_min
-            )
-            candidates = np.flatnonzero(missing & global_candidate)
             if candidates.size == 0:
                 continue
-            ranking = np.nan_to_num(
-                retention[candidates, level - 1],
-                nan=-np.inf,
-            )
-            candidates = candidates[np.argsort(ranking)[::-1]][
-                : options.max_candidates_per_level
-            ]
             T0, T1, Tminus1 = projected[level]
             transfer = mixed_space_prolongation(
                 self.mixed_levels[level - 1],
@@ -2341,7 +2406,27 @@ class superSolver5Multigrid:
                         tracks["xi_psi"].values[track, level - 1],
                         dtype=np.complex128,
                     )
+                    packed_omega = np.asarray(
+                        packed["omega"].values,
+                        dtype=np.complex128,
+                    )
+                    packed_error = _best_error(packed)
+                    imaginary_ratio = np.abs(packed_omega.imag) / np.maximum(
+                        np.abs(packed_omega.real),
+                        np.finfo(float).tiny,
+                    )
+                    algebraically_valid = (
+                        np.isfinite(packed_error)
+                        & (packed_error <= thresholds.backward_error)
+                        & np.isfinite(imaginary_ratio)
+                        & (
+                            imaginary_ratio
+                            <= thresholds.imaginary_frequency_ratio
+                        )
+                    )
                     for candidate in range(packed.sizes.get("eigenpair", 0)):
+                        if not algebraically_valid[candidate]:
+                            continue
                         overlap = _weighted_xi_overlap(
                             previous_shape,
                             packed["xi_psi"].values[candidate],
@@ -2360,16 +2445,21 @@ class superSolver5Multigrid:
                             "eigenpair",
                             np.asarray([best_overlap]),
                         )
+                        selected["source_eigenpair"] = (
+                            "eigenpair",
+                            np.asarray([np.nan]),
+                        )
                         additions.append(selected)
                         reacquisition_status = "reacquired"
                     else:
-                        reacquisition_status = (
-                            "capacity_limited"
-                            if status == "capacity_limited"
-                            else "search_failed"
-                        )
+                        if status == "capacity_limited":
+                            reacquisition_status = "capacity_limited"
+                        elif status == "solver_failed":
+                            reacquisition_status = "search_failed"
+                        else:
+                            reacquisition_status = "partial"
                         negative_status.append(
-                            (level, previous_omega.real, reacquisition_status)
+                            (level, previous_index, reacquisition_status)
                         )
                     attempt_records.append(
                         _WindowRecord(
@@ -2397,6 +2487,17 @@ class superSolver5Multigrid:
                 if pep is not None:
                     pep.destroy()
             if additions:
+                if "reacquisition_status" not in level_solutions[level]:
+                    level_solutions[level] = level_solutions[level].assign(
+                        reacquisition_status=(
+                            "eigenpair",
+                            np.full(
+                                level_solutions[level].sizes.get("eigenpair", 0),
+                                "not_attempted",
+                                dtype="U48",
+                            ),
+                        )
+                    )
                 level_solutions[level] = xr.concat(
                     [level_solutions[level], *additions],
                     dim="eigenpair",
@@ -2426,16 +2527,16 @@ class superSolver5Multigrid:
         if negative_status:
             status_values = np.asarray(tracks["reacquisition_status"].values).astype("U48")
             present = np.asarray(tracks["present"].values, dtype=bool)
-            omega = np.asarray(tracks["omega"].values, dtype=np.complex128)
-            for level, previous_omega, status in negative_status:
-                candidates = np.flatnonzero(present[:, level - 1] & ~present[:, level])
+            mode_index = np.asarray(tracks["mode_index"].values, dtype=int)
+            for level, previous_index, status in negative_status:
+                candidates = np.flatnonzero(
+                    present[:, level - 1]
+                    & ~present[:, level]
+                    & (mode_index[:, level - 1] == previous_index)
+                )
                 if candidates.size == 0:
                     continue
-                distance = np.abs(omega[candidates, level - 1].real - previous_omega)
-                track = int(candidates[int(np.argmin(distance))])
-                scale = max(abs(previous_omega), np.finfo(float).tiny)
-                if np.min(distance) / scale <= search.dedup_relative_s:
-                    status_values[track, level] = status
+                status_values[int(candidates[0]), level] = status
             tracks = tracks.copy()
             tracks["reacquisition_status"] = (
                 ("track", "level"),

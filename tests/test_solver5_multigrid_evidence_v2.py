@@ -270,6 +270,17 @@ def test_capacity_limited_reacquisition_does_not_make_artifact():
     assert result["label"].item() == "unresolved"
 
 
+def test_partial_reacquisition_keeps_targeted_absence_unknown():
+    tracks = _track(present=(True, True, False))
+    tracks["reacquisition_status"] = (
+        ("track", "level"),
+        np.asarray([["not_attempted", "not_attempted", "partial"]], dtype="U48"),
+    )
+    result = _classify(tracks, _continuum([[1.0], [1.0]]))
+    assert result["targeted_absence_confirmed"].item() == "unknown"
+    assert result["label"].item() == "unresolved"
+
+
 def test_nonpersistence_needs_targeted_absence_and_independent_evidence():
     tracks = _track(present=(True, True, False))
     tracks["reacquisition_status"] = (
