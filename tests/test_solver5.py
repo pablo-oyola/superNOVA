@@ -404,7 +404,7 @@ def test_solve_pep_destroys_pep_after_success(monkeypatch):
     assert pep.destroy_calls == 1
 
 
-def test_quadratic_pep_allow_empty_supports_adaptive_empty_windows(monkeypatch):
+def test_quadratic_pep_allow_empty_supports_empty_frequency_windows(monkeypatch):
     class FakeVector:
         def destroy(self):
             pass

@@ -372,7 +372,8 @@ def test_public_defaults_and_result_xarray_topology():
     search = MultigridSearchOptions()
     thresholds = ModeClassificationThresholds()
     assert (search.nev, search.tol, search.maxit) == (8, 1.0e-8, 200)
-    assert (search.window_overlap, search.max_depth) == (0.10, 8)
+    assert (search.window_count, search.window_padding) == (40, 0.10)
+    assert search.region_vscale == pytest.approx(0.25)
     assert search.dedup_relative_s == pytest.approx(1.0e-6)
     assert search.dedup_overlap == pytest.approx(0.99)
     assert thresholds.frequency_gate == pytest.approx(0.02)
@@ -401,8 +402,10 @@ def test_public_defaults_and_result_xarray_topology():
             window=0,
             parent=-1,
             depth=0,
-            omega_min=1.8,
-            omega_max=2.2,
+            core_omega_min=1.8,
+            core_omega_max=2.2,
+            solve_omega_min=1.76,
+            solve_omega_max=2.24,
             target_s=4.0 + 0.0j,
             nconv=1,
             nreturned=1,
@@ -441,6 +444,7 @@ def test_public_defaults_and_result_xarray_topology():
     assert supernova.MultigridPEPResult is MultigridPEPResult
     assert supernova.superSolver5Multigrid is multigrid.superSolver5Multigrid
     assert set(multigrid.__all__) == {
+        "EvidenceV2Config",
         "ModeClassificationThresholds",
         "MultigridPEPResult",
         "MultigridSearchOptions",

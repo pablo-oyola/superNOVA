@@ -8,7 +8,7 @@ quadratic PEP solves.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import operator
 from typing import Mapping
 
@@ -23,6 +23,25 @@ from ._solver_kernel2 import mu_0
 from .solver3 import _build_local_M_split
 from .solver4 import MixedRadialData, _build_mixed_radial_data
 from .solver5 import QuadraticPEPSolver, superSolver5
+from .solver5_multigrid_evidence import (
+    CLASSIFICATION_VERSION,
+    AdaptiveDiscoveryOptions,
+    EVIDENCE_LABELS,
+    EvidenceV2Config,
+    MeshPerturbationOptions,
+    ReacquisitionOptions,
+    aggregate_catalog_status,
+    classify_tracks_evidence_v2,
+    cluster_aware_mode_assignment,
+    deterministic_shifted_bspline,
+    enriched_residual,
+    empirical_candidate_stability,
+    fixed_coarse_space_retention,
+    mixed_space_prolongation,
+    radial_power_diagnostics,
+    weighted_principal_angle_cosines,
+    window_catalog_status,
+)
 
 
 _LABELS = (
@@ -35,16 +54,16 @@ _LABELS = (
 
 @dataclass(frozen=True)
 class MultigridSearchOptions:
-    """Adaptive TOAR/SINVERT frequency-window search controls."""
+    """Fixed-window TOAR/SINVERT frequency search controls."""
 
     nev: int = 8
     tol: float = 1.0e-8
     maxit: int = 200
-    window_overlap: float = 0.10
-    max_depth: int = 8
+    window_count: int = 40
+    window_padding: float = 0.10
     dedup_relative_s: float = 1.0e-6
     dedup_overlap: float = 0.99
-    region_vscale: float = 0.10
+    region_vscale: float = 0.25
     root_filter_tolerance: float = 1.0e-10
     pep_type: str = "TOAR"
     st_type: str = "SINVERT"
@@ -59,10 +78,18 @@ class MultigridSearchOptions:
             raise ValueError("tol must be finite and positive.")
         if int(self.maxit) < 1:
             raise ValueError("maxit must be positive.")
-        if not 0.0 <= self.window_overlap < 1.0:
-            raise ValueError("window_overlap must lie in [0, 1).")
-        if int(self.max_depth) < 0:
-            raise ValueError("max_depth must be non-negative.")
+        try:
+            window_count = int(self.window_count)
+        except (TypeError, ValueError, OverflowError):
+            window_count = 0
+        if (
+            isinstance(self.window_count, bool)
+            or window_count != self.window_count
+            or window_count < 1
+        ):
+            raise ValueError("window_count must be a positive integer.")
+        if not np.isfinite(self.window_padding) or self.window_padding < 0.0:
+            raise ValueError("window_padding must be finite and non-negative.")
         for name in ("dedup_relative_s", "root_filter_tolerance"):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0.0:
@@ -136,8 +163,10 @@ class _WindowRecord:
     window: int
     parent: int
     depth: int
-    omega_min: float
-    omega_max: float
+    core_omega_min: float
+    core_omega_max: float
+    solve_omega_min: float
+    solve_omega_max: float
     target_s: complex
     nconv: int
     nreturned: int
@@ -147,6 +176,51 @@ class _WindowRecord:
     reason: str
     iterations: int
     effective_nev: int = -1
+    catalog_status: str = "partial"
+
+
+def _fixed_frequency_windows(
+    omega_range: tuple[float, float],
+    window_count: int,
+    padding: float,
+) -> np.ndarray:
+    """Return contiguous cores and clipped padded solve bounds.
+
+    ``padding`` is the fraction of one core width added on each side.  The
+    returned columns are ``core_min``, ``core_max``, ``solve_min``, and
+    ``solve_max``.
+    """
+    omega_min, omega_max = _validate_omega_range(omega_range)
+    try:
+        count = int(window_count)
+    except (TypeError, ValueError, OverflowError):
+        count = 0
+    if isinstance(window_count, bool) or count != window_count:
+        raise ValueError("window_count must be a positive integer.")
+    if count < 1:
+        raise ValueError("window_count must be a positive integer.")
+    if not np.isfinite(padding) or padding < 0.0:
+        raise ValueError("padding must be finite and non-negative.")
+    edges = np.linspace(omega_min, omega_max, count + 1)
+    core_min = edges[:-1]
+    core_max = edges[1:]
+    width = core_max - core_min
+    solve_min = np.maximum(omega_min, core_min - padding * width)
+    solve_max = np.minimum(omega_max, core_max + padding * width)
+    return np.column_stack((core_min, core_max, solve_min, solve_max))
+
+
+def _core_ownership_mask(
+    omega: np.ndarray,
+    core_min: float,
+    core_max: float,
+    *,
+    final_window: bool,
+) -> np.ndarray:
+    """Assign shared core edges uniquely to the window on their right."""
+    real = np.asarray(omega, dtype=np.complex128).real
+    upper = real <= core_max if final_window else real < core_max
+    return np.isfinite(real) & (real >= core_min) & upper
 
 
 def _coerce_options(value, cls):
@@ -295,34 +369,86 @@ def _deduplicate_window_dataset(
     windows = np.asarray(dataset["window_id"].values, dtype=np.int64)
     fields = np.asarray(dataset["xi_psi"].values, dtype=np.complex128)
     quality = _best_error(dataset)
-    order = np.arange(size, dtype=np.int64)
-    order = order[
-        np.lexsort(
-            (
-                np.nan_to_num(roots.imag[order], nan=np.inf),
-                np.nan_to_num(roots.real[order], nan=np.inf),
-                np.nan_to_num(quality[order], nan=np.inf),
-            )
-        )
-    ]
+    core_owned = (
+        np.asarray(dataset["core_owned"].values, dtype=bool)
+        if "core_owned" in dataset
+        else np.ones(size, dtype=bool)
+    )
+    spectral = _relative_complex_distance(roots[:, None], roots[None, :]) <= relative_s
+    visited = np.zeros(size, dtype=bool)
     keep: list[int] = []
-    for index in order:
-        duplicate = False
-        for retained in keep:
-            if windows[index] == windows[retained]:
+    for seed in range(size):
+        if visited[seed]:
+            continue
+        pending = [seed]
+        component: list[int] = []
+        while pending:
+            index = pending.pop()
+            if visited[index]:
                 continue
-            if _relative_complex_distance(roots[index], roots[retained]) > relative_s:
-                continue
-            overlap = _weighted_xi_overlap(
-                fields[index],
-                fields[retained],
-                weights,
+            visited[index] = True
+            component.append(index)
+            pending.extend(
+                int(value)
+                for value in np.flatnonzero(spectral[index] & ~visited)
             )
-            if overlap >= minimum_overlap:
-                duplicate = True
-                break
-        if not duplicate:
-            keep.append(int(index))
+        component_array = np.asarray(component, dtype=int)
+        groups = {
+            int(window): component_array[windows[component_array] == window]
+            for window in np.unique(windows[component_array])
+        }
+        if len(groups) == 1:
+            keep.extend(component)
+            continue
+
+        def group_priority(indices: np.ndarray):
+            return (
+                -int(np.count_nonzero(core_owned[indices])),
+                float(np.nanmin(np.nan_to_num(quality[indices], nan=np.inf))),
+                int(np.min(indices)),
+            )
+
+        ordered_groups = sorted(groups.values(), key=group_priority)
+        retained_groups: list[np.ndarray] = []
+        for indices in ordered_groups:
+            duplicate_basis = False
+            for retained in retained_groups:
+                if indices.size == retained.size:
+                    cosines = weighted_principal_angle_cosines(
+                        fields[retained],
+                        fields[indices],
+                        weights,
+                    )
+                    if (
+                        cosines.size == indices.size
+                        and np.min(cosines) >= minimum_overlap
+                    ):
+                        duplicate_basis = True
+                        break
+            if not duplicate_basis:
+                retained_indices = []
+                for index in indices:
+                    individual_duplicate = False
+                    for retained in retained_groups:
+                        for retained_index in retained:
+                            if (
+                                _weighted_xi_overlap(
+                                    fields[index],
+                                    fields[retained_index],
+                                    weights,
+                                )
+                                >= minimum_overlap
+                            ):
+                                individual_duplicate = True
+                                break
+                        if individual_duplicate:
+                            break
+                    if not individual_duplicate:
+                        retained_indices.append(int(index))
+                if retained_indices:
+                    retained_array = np.asarray(retained_indices, dtype=int)
+                    retained_groups.append(retained_array)
+                    keep.extend(retained_indices)
     keep_array = np.asarray(keep, dtype=np.int64)
     if keep_array.size:
         omega = np.asarray(dataset["omega"].values)[keep_array]
@@ -447,8 +573,9 @@ def _track_level_solutions(
     level_solutions: tuple[xr.Dataset, ...],
     weights: np.ndarray,
     thresholds: ModeClassificationThresholds,
+    radial_levels: tuple[BSplineFE, ...] | None = None,
 ) -> xr.Dataset:
-    """Build adjacent-level maximum-cardinality mode chains."""
+    """Build adjacent-level chains with cluster-aware eigenspace matching."""
     nlevels = len(level_solutions)
     if nlevels == 0:
         raise ValueError("At least one level solution is required.")
@@ -467,6 +594,12 @@ def _track_level_solutions(
     transition_overlap: dict[tuple[int, int], float] = {}
     transition_frequency: dict[tuple[int, int], float] = {}
     transition_ambiguity: dict[tuple[int, int], bool] = {}
+    transition_cluster_id: dict[tuple[int, int], int] = {}
+    transition_cluster_reference_dimension: dict[tuple[int, int], int] = {}
+    transition_cluster_candidate_dimension: dict[tuple[int, int], int] = {}
+    transition_cluster_min: dict[tuple[int, int], float] = {}
+    transition_cluster_mean: dict[tuple[int, int], float] = {}
+    transition_cluster_rms: dict[tuple[int, int], float] = {}
 
     for level in range(1, nlevels):
         reference_tracks = [
@@ -497,38 +630,21 @@ def _track_level_solutions(
             level_solutions[level]["xi_psi"].values,
             dtype=np.complex128,
         )
-        overlaps = np.zeros(
-            (reference_indices.size, candidate_indices.size),
-            dtype=np.float64,
-        )
-        for row in range(reference_indices.size):
-            for column in range(candidate_indices.size):
-                overlaps[row, column] = _weighted_xi_overlap(
-                    reference_xi[row],
-                    candidate_xi[column],
-                    weights,
-                )
-        rows, columns, frequency_change, ambiguous = (
-            _maximum_cardinality_overlap_assignment(
-                reference_omega.real,
-                candidate_omega.real,
-                overlaps,
-                frequency_gate=thresholds.frequency_gate,
-                ambiguity_delta=thresholds.assignment_ambiguity,
-            )
-        )
-        reference_ambiguous, candidate_ambiguous = _assignment_ambiguity_masks(
+        assignment = cluster_aware_mode_assignment(
             reference_omega.real,
             candidate_omega.real,
-            overlaps,
-            rows,
-            columns,
+            reference_xi,
+            candidate_xi,
+            weights,
             frequency_gate=thresholds.frequency_gate,
-            ambiguity_delta=thresholds.assignment_ambiguity,
+            tie_delta=thresholds.assignment_ambiguity,
         )
-        for row, is_ambiguous in enumerate(reference_ambiguous):
-            if is_ambiguous:
-                transition_ambiguity[(reference_tracks[row], level - 1)] = True
+        rows = assignment["rows"]
+        columns = assignment["columns"]
+        reference_ambiguous = assignment["reference_dimension_ambiguous"]
+        candidate_ambiguous = assignment["candidate_dimension_ambiguous"]
+        for row in np.flatnonzero(reference_ambiguous):
+            transition_ambiguity[(reference_tracks[int(row)], level - 1)] = True
         matched_candidates: set[int] = set()
         candidate_tracks: dict[int, int] = {}
         for pair, (row, column) in enumerate(zip(rows, columns)):
@@ -537,11 +653,33 @@ def _track_level_solutions(
             tracks[track_index][level] = candidate_index
             matched_candidates.add(candidate_index)
             candidate_tracks[candidate_index] = track_index
-            transition_overlap[(track_index, level)] = float(overlaps[row, column])
-            transition_frequency[(track_index, level)] = float(
-                frequency_change[pair]
+            transition_overlap[(track_index, level)] = float(
+                assignment["individual_overlap"][pair]
             )
-            transition_ambiguity[(track_index, level)] = bool(ambiguous[pair])
+            transition_frequency[(track_index, level)] = float(
+                assignment["frequency_change"][pair]
+            )
+            transition_ambiguity[(track_index, level)] = bool(
+                assignment["cluster_dimension_ambiguous"][pair]
+            )
+            transition_cluster_id[(track_index, level)] = int(
+                assignment["cluster_id"][pair]
+            )
+            transition_cluster_reference_dimension[(track_index, level)] = int(
+                assignment["cluster_reference_dimension"][pair]
+            )
+            transition_cluster_candidate_dimension[(track_index, level)] = int(
+                assignment["cluster_candidate_dimension"][pair]
+            )
+            transition_cluster_min[(track_index, level)] = float(
+                assignment["cluster_min_cosine"][pair]
+            )
+            transition_cluster_mean[(track_index, level)] = float(
+                assignment["cluster_mean_cosine"][pair]
+            )
+            transition_cluster_rms[(track_index, level)] = float(
+                assignment["cluster_rms_cosine"][pair]
+            )
 
         for candidate_index in candidate_indices:
             candidate_index = int(candidate_index)
@@ -562,11 +700,28 @@ def _track_level_solutions(
     residual = np.full((ntracks, nlevels), np.nan)
     backward = np.full((ntracks, nlevels), np.nan)
     peak = np.full((ntracks, nlevels), np.nan)
+    mean_radius = np.full((ntracks, nlevels), np.nan)
     width = np.full((ntracks, nlevels), np.nan)
     ipr = np.full((ntracks, nlevels), np.nan)
+    kr = np.full((ntracks, nlevels), np.nan)
+    h_peak = np.full((ntracks, nlevels), np.nan)
+    width_over_h = np.full((ntracks, nlevels), np.nan)
+    h_times_ipr = np.full((ntracks, nlevels), np.nan)
+    h_times_kr = np.full((ntracks, nlevels), np.nan)
+    coarse_retention = np.full((ntracks, nlevels), np.nan)
     overlap = np.full((ntracks, nlevels), np.nan)
     frequency_change = np.full((ntracks, nlevels), np.nan)
     ambiguous = np.zeros((ntracks, nlevels), dtype=bool)
+    cluster_id = np.full((ntracks, nlevels), -1, dtype=np.int64)
+    cluster_reference_dimension = np.full((ntracks, nlevels), -1, dtype=np.int64)
+    cluster_candidate_dimension = np.full((ntracks, nlevels), -1, dtype=np.int64)
+    cluster_min = np.full((ntracks, nlevels), np.nan)
+    cluster_mean = np.full((ntracks, nlevels), np.nan)
+    cluster_rms = np.full((ntracks, nlevels), np.nan)
+    cluster_dimension_ambiguous = np.zeros((ntracks, nlevels), dtype=bool)
+    reacquisition_status = np.full(
+        (ntracks, nlevels), "not_attempted", dtype="U48"
+    )
     xi = np.full(
         (ntracks, nlevels, psi.size, m_pol.size),
         np.nan + 1.0j * np.nan,
@@ -585,9 +740,46 @@ def _track_level_solutions(
                 residual[track_index, level] = dataset["residual_norm"].values[index]
             backward[track_index, level] = _best_error(dataset)[index]
             xi[track_index, level] = dataset["xi_psi"].values[index]
-            peak[track_index, level], width[track_index, level], ipr[
-                track_index, level
-            ] = _shape_metrics(xi[track_index, level], psi, weights)
+            derivative = None
+            breakpoints = None
+            if radial_levels is not None and level < len(radial_levels):
+                radial = radial_levels[level]
+                breakpoints = np.unique(np.asarray(radial.knots, dtype=float))
+                if "xi_psi_coefficient" in dataset:
+                    coefficient = np.asarray(
+                        dataset["xi_psi_coefficient"].values[index],
+                        dtype=np.complex128,
+                    )
+                    derivative = np.einsum(
+                        "qd,dm->qm",
+                        np.asarray(radial.eval_basis_derivative(psi), dtype=float).T,
+                        coefficient,
+                        optimize=True,
+                    )
+            shape = radial_power_diagnostics(
+                xi[track_index, level],
+                psi,
+                weights,
+                derivative=derivative,
+                breakpoints=breakpoints,
+                metric="xi_psi_proxy",
+            )
+            peak[track_index, level] = float(shape["peak_radius"])
+            mean_radius[track_index, level] = float(shape["mean_radius"])
+            width[track_index, level] = float(shape["rms_width"])
+            ipr[track_index, level] = float(shape["ipr"])
+            kr[track_index, level] = float(shape["kr"])
+            h_peak[track_index, level] = float(shape["h_peak"])
+            width_over_h[track_index, level] = float(shape["width_over_h"])
+            h_times_ipr[track_index, level] = float(shape["h_times_ipr"])
+            h_times_kr[track_index, level] = float(shape["h_times_kr"])
+            if radial_levels is not None:
+                coarse_retention[track_index, level] = fixed_coarse_space_retention(
+                    xi[track_index, level],
+                    psi,
+                    weights,
+                    radial_levels[0],
+                )
             overlap[track_index, level] = transition_overlap.get(
                 (track_index, level), np.nan
             )
@@ -597,6 +789,31 @@ def _track_level_solutions(
             ambiguous[track_index, level] = transition_ambiguity.get(
                 (track_index, level), False
             )
+            cluster_id[track_index, level] = transition_cluster_id.get(
+                (track_index, level), -1
+            )
+            cluster_reference_dimension[track_index, level] = (
+                transition_cluster_reference_dimension.get((track_index, level), -1)
+            )
+            cluster_candidate_dimension[track_index, level] = (
+                transition_cluster_candidate_dimension.get((track_index, level), -1)
+            )
+            cluster_min[track_index, level] = transition_cluster_min.get(
+                (track_index, level), np.nan
+            )
+            cluster_mean[track_index, level] = transition_cluster_mean.get(
+                (track_index, level), np.nan
+            )
+            cluster_rms[track_index, level] = transition_cluster_rms.get(
+                (track_index, level), np.nan
+            )
+            cluster_dimension_ambiguous[track_index, level] = ambiguous[
+                track_index, level
+            ]
+            if "reacquisition_status" in dataset:
+                reacquisition_status[track_index, level] = str(
+                    dataset["reacquisition_status"].values[index]
+                )
 
     return xr.Dataset(
         data_vars={
@@ -609,9 +826,39 @@ def _track_level_solutions(
             "xi_psi_overlap": (("track", "level"), overlap),
             "frequency_change": (("track", "level"), frequency_change),
             "assignment_ambiguous": (("track", "level"), ambiguous),
+            "cluster_id": (("track", "level"), cluster_id),
+            "cluster_reference_dimension": (
+                ("track", "level"),
+                cluster_reference_dimension,
+            ),
+            "cluster_candidate_dimension": (
+                ("track", "level"),
+                cluster_candidate_dimension,
+            ),
+            "cluster_min_principal_cosine": (("track", "level"), cluster_min),
+            "cluster_mean_principal_cosine": (("track", "level"), cluster_mean),
+            "cluster_rms_principal_cosine": (("track", "level"), cluster_rms),
+            "cluster_dimension_ambiguous": (
+                ("track", "level"),
+                cluster_dimension_ambiguous,
+            ),
+            "reacquisition_status": (
+                ("track", "level"),
+                reacquisition_status,
+            ),
             "peak_radius": (("track", "level"), peak),
+            "power_weighted_mean_radius": (("track", "level"), mean_radius),
             "rms_width": (("track", "level"), width),
             "ipr": (("track", "level"), ipr),
+            "kr": (("track", "level"), kr),
+            "h_peak": (("track", "level"), h_peak),
+            "width_over_h": (("track", "level"), width_over_h),
+            "h_times_ipr": (("track", "level"), h_times_ipr),
+            "h_times_kr": (("track", "level"), h_times_kr),
+            "coarse_space_retention": (
+                ("track", "level"),
+                coarse_retention,
+            ),
             "xi_psi": (("track", "level", "psi", "m_pol"), xi),
         },
         coords={
@@ -625,9 +872,93 @@ def _track_level_solutions(
             "overlap_measure": (
                 "phase-invariant harmonic-resolved composite-Gauss dpsi L2"
             ),
-            "assignment_priority": "maximum cardinality, then xi_psi overlap",
+            "overlap_metric": "xi_psi_proxy",
+            "power_density_metric": "xi_psi_proxy",
+            "ipr_convention": "integral(P^2)dpsi/(integral(P)dpsi)^2",
+            "assignment_priority": (
+                "maximum cardinality; isolated xi_psi overlap; nearly tied "
+                "components use weighted principal angles"
+            ),
         },
     )
+
+
+def _attach_enriched_residuals(
+    tracks: xr.Dataset,
+    level_solutions: tuple[xr.Dataset, ...],
+    projected_matrices: tuple[tuple, ...],
+    mixed_levels: tuple[MixedRadialData, ...],
+    solver,
+    sb,
+    *,
+    bc_tol: float | None,
+) -> xr.Dataset:
+    """Evaluate each coarse eigenpair in the adjacent finer operator."""
+    ntracks = tracks.sizes.get("track", 0)
+    nlevels = tracks.sizes.get("level", 0)
+    values = np.full((ntracks, nlevels), np.nan)
+    if nlevels < 2 or "eigenvector" not in level_solutions[0]:
+        return tracks.assign(
+            enriched_residual=(("track", "level"), values)
+        )
+    transfers = [
+        mixed_space_prolongation(
+            mixed_levels[level],
+            mixed_levels[level + 1],
+            tracks.sizes.get("m_pol", 0),
+        )
+        for level in range(nlevels - 1)
+    ]
+    fine_boundary = []
+    for level in range(1, nlevels):
+        bc = solver._build_nep_boundary_condition(
+            sb,
+            bc_kind="full",
+            mixed=mixed_levels[level],
+        )
+        bc.get_sparse_prolongation(tol=bc_tol)
+        fine_boundary.append(bc)
+    mode_index = np.asarray(tracks["mode_index"].values, dtype=int)
+    present = np.asarray(tracks["present"].values, dtype=bool)
+    for track in range(ntracks):
+        for coarse_level in range(nlevels - 1):
+            if not present[track, coarse_level]:
+                continue
+            index = int(mode_index[track, coarse_level])
+            full_coarse = np.asarray(
+                level_solutions[coarse_level]["eigenvector"].values[index],
+                dtype=np.complex128,
+            )
+            full_fine = transfers[coarse_level] @ full_coarse
+            bc = fine_boundary[coarse_level]
+            free = np.asarray(bc.sparse_free, dtype=int)
+            reduced_fine = np.asarray(full_fine[free], dtype=np.complex128)
+            prolongation = bc.get_sparse_prolongation(tol=bc_tol)
+            reconstruction = prolongation @ reduced_fine
+            relative_constraint_error = np.linalg.norm(reconstruction - full_fine) / max(
+                np.linalg.norm(full_fine), np.finfo(float).tiny
+            )
+            if relative_constraint_error > 1.0e-8:
+                # The prolonged coarse mode should satisfy the same endpoint
+                # constraints.  If it does not, retain unknown rather than
+                # evaluating a different projected vector.
+                continue
+            s = complex(level_solutions[coarse_level]["s"].values[index])
+            values[track, coarse_level + 1] = enriched_residual(
+                projected_matrices[coarse_level + 1],
+                s,
+                reduced_fine,
+            )
+    output = tracks.copy()
+    output["enriched_residual"] = (("track", "level"), values)
+    output["enriched_residual"].attrs.update(
+        definition=(
+            "fine-operator residual of the exactly knot-inserted coarse full "
+            "vector, normalized by the sum of polynomial-term norms"
+        ),
+        distinction="not the SLEPc residual in the same discrete space",
+    )
+    return output
 
 
 def _continuum_vector_overlaps(
@@ -926,7 +1257,7 @@ def _continuum_evidence(
     return crossing, clearance, power_fraction, coverage_complete
 
 
-def _classify_tracks(
+def _classify_tracks_legacy(
     tracks: xr.Dataset,
     continuum: xr.Dataset,
     weights: np.ndarray,
@@ -1141,6 +1472,48 @@ def _classify_tracks(
     )
 
 
+def _classify_tracks(
+    tracks: xr.Dataset,
+    continuum: xr.Dataset,
+    weights: np.ndarray,
+    level_complete: np.ndarray,
+    thresholds: ModeClassificationThresholds,
+    *,
+    classification_version: str = "legacy",
+    evidence_config: EvidenceV2Config | None = None,
+    catalog_status: str | np.ndarray | None = None,
+) -> xr.Dataset:
+    """Dispatch the preserved legacy classifier or the evidence-v2 pipeline."""
+    version = str(classification_version).strip().lower()
+    if version == "legacy":
+        result = _classify_tracks_legacy(
+            tracks,
+            continuum,
+            weights,
+            level_complete,
+            thresholds,
+        )
+        result.attrs["classification_version"] = "legacy"
+        return result
+    if version != CLASSIFICATION_VERSION:
+        raise ValueError(
+            f"classification_version must be 'legacy' or {CLASSIFICATION_VERSION!r}."
+        )
+    if catalog_status is None:
+        catalog_status = np.where(
+            np.asarray(level_complete, dtype=bool),
+            "certified_complete",
+            "partial",
+        )
+    return classify_tracks_evidence_v2(
+        tracks,
+        continuum,
+        weights,
+        catalog_status,
+        evidence_config,
+    )
+
+
 def _window_diagnostics_dataset(
     records: list[_WindowRecord],
     nlevels: int,
@@ -1163,7 +1536,15 @@ def _window_diagnostics_dataset(
     }
     floating = {
         name: np.full(shape, np.nan)
-        for name in ("omega_min", "omega_max")
+        for name in (
+            "core_omega_min",
+            "core_omega_max",
+            "solve_omega_min",
+            "solve_omega_max",
+            # Compatibility aliases for the PEP solve bounds.
+            "omega_min",
+            "omega_max",
+        )
     }
     target = np.full(shape, np.nan + 1.0j * np.nan, dtype=np.complex128)
     boolean = {
@@ -1171,6 +1552,7 @@ def _window_diagnostics_dataset(
         for name in ("saturated", "leaf", "complete")
     }
     reason = np.full(shape, "", dtype="U64")
+    catalog_status = np.full(shape, "partial", dtype="U24")
     for level, items in enumerate(grouped):
         for column, record in enumerate(items):
             valid[level, column] = True
@@ -1181,13 +1563,18 @@ def _window_diagnostics_dataset(
             integer["nreturned"][level, column] = record.nreturned
             integer["iterations"][level, column] = record.iterations
             integer["effective_nev"][level, column] = record.effective_nev
-            floating["omega_min"][level, column] = record.omega_min
-            floating["omega_max"][level, column] = record.omega_max
+            floating["core_omega_min"][level, column] = record.core_omega_min
+            floating["core_omega_max"][level, column] = record.core_omega_max
+            floating["solve_omega_min"][level, column] = record.solve_omega_min
+            floating["solve_omega_max"][level, column] = record.solve_omega_max
+            floating["omega_min"][level, column] = record.solve_omega_min
+            floating["omega_max"][level, column] = record.solve_omega_max
             target[level, column] = record.target_s
             boolean["saturated"][level, column] = record.saturated
             boolean["leaf"][level, column] = record.leaf
             boolean["complete"][level, column] = record.complete
             reason[level, column] = record.reason
+            catalog_status[level, column] = record.catalog_status
     data_vars = {"valid": (("level", "window"), valid)}
     data_vars.update(
         {name: (("level", "window"), value) for name, value in integer.items()}
@@ -1200,6 +1587,7 @@ def _window_diagnostics_dataset(
     )
     data_vars["target_s"] = (("level", "window"), target)
     data_vars["reason"] = (("level", "window"), reason)
+    data_vars["catalog_status"] = (("level", "window"), catalog_status)
     return xr.Dataset(
         data_vars=data_vars,
         coords={
@@ -1248,6 +1636,22 @@ class superSolver5Multigrid:
             for radialfe in self.radial_levels
         )
         self.solver = superSolver5(equ, cont, self.finest_radialfe)
+
+    def build_shifted_mesh_variant(
+        self,
+        options: MeshPerturbationOptions | Mapping[str, object] | None = None,
+    ) -> "superSolver5Multigrid":
+        """Return a one-level same-resolution solver for selective mesh checks.
+
+        The axis, edge, degree, and number of B-splines match the production
+        finest space.  This method only prepares the deterministic variant;
+        callers choose a small candidate set and narrow frequency windows.
+        """
+        options = _coerce_options(options, MeshPerturbationOptions)
+        shifted = deterministic_shifted_bspline(self.finest_radialfe, options)
+        variant = type(self)(self.equ, self.cont, shifted, levels=1)
+        variant.mesh_perturbation = options
+        return variant
 
     @staticmethod
     def _window_region(
@@ -1313,8 +1717,11 @@ class superSolver5Multigrid:
         level: int,
         window: int,
         depth: int,
-        omega_min: float,
-        omega_max: float,
+        core_omega_min: float,
+        core_omega_max: float,
+        solve_omega_min: float,
+        solve_omega_max: float,
+        final_window: bool,
         bc_tol: float | None,
     ) -> xr.Dataset:
         layout = self.solver._mixed_layout(sb, mixed=mixed)
@@ -1363,10 +1770,17 @@ class superSolver5Multigrid:
             optimize=True,
         )
         roots = np.asarray(result.eigenvalues, dtype=np.complex128)[indices]
+        omega = np.sqrt(roots)
+        core_owned = _core_ownership_mask(
+            omega,
+            core_omega_min,
+            core_omega_max,
+            final_window=final_window,
+        )
         return xr.Dataset(
             data_vars={
                 "s": ("eigenpair", roots),
-                "omega": ("eigenpair", np.sqrt(roots)),
+                "omega": ("eigenpair", omega),
                 "eigenvector": (("eigenpair", "dof"), full_vectors),
                 "p1_coefficient": (
                     ("eigenpair", "radial_dof_high", "m_pol"),
@@ -1419,6 +1833,7 @@ class superSolver5Multigrid:
                 ),
                 "window_id": ("eigenpair", np.full(count, window, dtype=np.int64)),
                 "window_depth": ("eigenpair", np.full(count, depth, dtype=np.int64)),
+                "core_owned": ("eigenpair", core_owned),
             },
             coords={
                 "eigenpair": np.arange(count, dtype=np.int64),
@@ -1436,8 +1851,12 @@ class superSolver5Multigrid:
                 "omega_is_species_mass_normalized": True,
                 "density_includes_species_mass": True,
                 "species_mass_amu": self.solver._species_mass_amu(),
-                "omega_min": omega_min,
-                "omega_max": omega_max,
+                "core_omega_min": core_omega_min,
+                "core_omega_max": core_omega_max,
+                "solve_omega_min": solve_omega_min,
+                "solve_omega_max": solve_omega_max,
+                "omega_min": solve_omega_min,
+                "omega_max": solve_omega_max,
                 "nconv_raw": int(result.nconv),
                 "iterations": int(result.iterations),
                 "reason": str(result.reason),
@@ -1461,19 +1880,36 @@ class superSolver5Multigrid:
         search: MultigridSearchOptions,
         bc_tol: float | None,
         verbose: bool,
+        target_offset: float = 0.0,
     ) -> tuple[xr.Dataset, list[_WindowRecord], bool]:
         T0, T1, Tminus1 = matrices
-        pending = [(omega_range[0], omega_range[1], 0, -1)]
+        windows = _fixed_frequency_windows(
+            omega_range,
+            search.window_count,
+            search.window_padding,
+        )
         records: list[_WindowRecord] = []
-        window_datasets: dict[int, xr.Dataset] = {}
+        window_datasets: list[xr.Dataset] = []
         pep = None
-        next_window = 0
         try:
-            while pending:
-                omega_min, omega_max, depth, parent = pending.pop()
-                window = next_window
-                next_window += 1
-                target_s, region = self._window_region(omega_min, omega_max, search)
+            for window, bounds in enumerate(windows):
+                (
+                    core_omega_min,
+                    core_omega_max,
+                    solve_omega_min,
+                    solve_omega_max,
+                ) = (float(value) for value in bounds)
+                target_s, region = self._window_region(
+                    solve_omega_min,
+                    solve_omega_max,
+                    search,
+                )
+                if target_offset:
+                    target_omega = 0.5 * (core_omega_min + core_omega_max)
+                    target_omega += float(target_offset) * (
+                        core_omega_max - core_omega_min
+                    )
+                    target_s = complex(target_omega**2)
                 if pep is None:
                     pep = QuadraticPEPSolver(
                         A0=Tminus1,
@@ -1497,8 +1933,8 @@ class superSolver5Multigrid:
                 result = pep.solve(allow_empty=True)
                 indices = self._root_indices_in_window(
                     result.eigenvalues,
-                    omega_min,
-                    omega_max,
+                    solve_omega_min,
+                    solve_omega_max,
                     region,
                     search.root_filter_tolerance,
                 )
@@ -1510,74 +1946,57 @@ class superSolver5Multigrid:
                     indices=indices,
                     level=level,
                     window=window,
-                    depth=depth,
-                    omega_min=omega_min,
-                    omega_max=omega_max,
+                    depth=0,
+                    core_omega_min=core_omega_min,
+                    core_omega_max=core_omega_max,
+                    solve_omega_min=solve_omega_min,
+                    solve_omega_max=solve_omega_max,
+                    final_window=window == len(windows) - 1,
                     bc_tol=bc_tol,
                 )
-                window_datasets[window] = packed
+                window_datasets.append(packed)
                 effective_nev = int(getattr(pep, "effective_nev", search.nev))
                 if effective_nev < 1:
                     raise RuntimeError(
                         f"SLEPc reported an invalid effective nev={effective_nev}."
                     )
-                saturated = int(result.nconv) >= effective_nev
-                leaf = not saturated or depth >= search.max_depth
                 reason_converged = _is_converged_reason(result.reason)
-                complete = bool(leaf and not saturated and reason_converged)
+                catalog_status = window_catalog_status(
+                    nconv=int(result.nconv),
+                    effective_nev=effective_nev,
+                    solver_converged=reason_converged,
+                )
+                saturated = catalog_status == "capacity_limited"
+                # Targeted TOAR/SINVERT has no all-roots-in-interval guarantee.
+                complete = catalog_status == "certified_complete"
                 records.append(
                     _WindowRecord(
                         level=level,
                         window=window,
-                        parent=parent,
-                        depth=depth,
-                        omega_min=omega_min,
-                        omega_max=omega_max,
+                        parent=-1,
+                        depth=0,
+                        core_omega_min=core_omega_min,
+                        core_omega_max=core_omega_max,
+                        solve_omega_min=solve_omega_min,
+                        solve_omega_max=solve_omega_max,
                         target_s=target_s,
                         nconv=int(result.nconv),
                         nreturned=int(indices.size),
                         saturated=saturated,
-                        leaf=leaf,
+                        leaf=True,
                         complete=complete,
                         reason=str(result.reason),
                         iterations=int(result.iterations),
                         effective_nev=effective_nev,
+                        catalog_status=catalog_status,
                     )
                 )
-                if leaf:
-                    continue
-                midpoint = 0.5 * (omega_min + omega_max)
-                half_overlap = 0.5 * search.window_overlap * (omega_max - omega_min)
-                left = (omega_min, midpoint + half_overlap, depth + 1, window)
-                right = (midpoint - half_overlap, omega_max, depth + 1, window)
-                pending.append(right)
-                pending.append(left)
         finally:
             if pep is not None:
                 pep.destroy()
 
-        leaf_records = [record for record in records if record.leaf]
-        if not leaf_records:
-            raise RuntimeError("Adaptive search produced no leaf windows.")
-        record_by_window = {record.window: record for record in records}
-        fallback_windows: set[int] = set()
-        for record in leaf_records:
-            if record.complete:
-                continue
-            parent = record.parent
-            while parent >= 0:
-                fallback_windows.add(parent)
-                parent = record_by_window[parent].parent
-        retained_windows = {
-            record.window for record in leaf_records
-        } | fallback_windows
-        retained_datasets = [
-            window_datasets[record.window]
-            for record in records
-            if record.window in retained_windows
-        ]
         combined = xr.concat(
-            retained_datasets,
+            window_datasets,
             dim="eigenpair",
             data_vars="all",
             coords="minimal",
@@ -1587,7 +2006,7 @@ class superSolver5Multigrid:
             eigenpair=np.arange(
                 sum(
                     dataset.sizes.get("eigenpair", 0)
-                    for dataset in retained_datasets
+                    for dataset in window_datasets
                 ),
                 dtype=np.int64,
             )
@@ -1598,21 +2017,431 @@ class superSolver5Multigrid:
             relative_s=search.dedup_relative_s,
             minimum_overlap=search.dedup_overlap,
         )
-        complete = all(record.complete for record in records if record.leaf)
+        level_catalog_status = aggregate_catalog_status(
+            record.catalog_status for record in records
+        )
+        complete = level_catalog_status == "certified_complete"
         combined.attrs.update(
             {
                 "level": level,
                 "search_complete": bool(complete),
-                "window_count": len(records),
-                "leaf_window_count": len(leaf_records),
-                "ancestor_fallback_window_count": len(fallback_windows),
-                "saturated_leaf_count": sum(
-                    record.leaf and record.saturated for record in records
+                "catalog_status": level_catalog_status,
+                "catalog_completion_semantics": (
+                    "targeted search; capacity_limited is not solver failure and "
+                    "partial is not certified interval completeness"
                 ),
+                "window_count": len(records),
+                "leaf_window_count": len(records),
+                "ancestor_fallback_window_count": 0,
+                "saturated_leaf_count": sum(record.saturated for record in records),
+                "search_strategy": "fixed_padded_windows",
+                "window_padding_fraction": float(search.window_padding),
                 "quadrature_source_level": self.levels - 1,
+                "target_offset_window_fraction": float(target_offset),
             }
         )
         return combined, records, bool(complete)
+
+    def _adaptive_discovery_level(
+        self,
+        *,
+        level: int,
+        matrices: tuple,
+        sb,
+        mixed: MixedRadialData,
+        omega_range: tuple[float, float],
+        search: MultigridSearchOptions,
+        discovery: AdaptiveDiscoveryOptions,
+        bc_tol: float | None,
+        verbose: bool,
+    ) -> tuple[xr.Dataset, list[_WindowRecord], bool]:
+        """Run K/offset discovery passes and stop on global-candidate stability."""
+        pass_datasets: list[xr.Dataset] = []
+        records: list[_WindowRecord] = []
+        previous_signature = None
+        stable_count = 0
+        last_record_start = 0
+        for pass_index, nev in enumerate(discovery.nev_passes):
+            offset_datasets = []
+            last_record_start = len(records)
+            for offset_index, offset in enumerate(discovery.target_offsets):
+                dataset, offset_records, _ = self._search_level(
+                    level=level,
+                    matrices=matrices,
+                    sb=sb,
+                    mixed=mixed,
+                    omega_range=omega_range,
+                    search=replace(search, nev=int(nev)),
+                    bc_tol=bc_tol,
+                    verbose=verbose,
+                    target_offset=float(offset),
+                )
+                unique_offset = (
+                    pass_index * len(discovery.target_offsets) + offset_index
+                ) * search.window_count
+                if "window_id" in dataset:
+                    dataset = dataset.copy()
+                    dataset["window_id"] = dataset["window_id"] + unique_offset
+                offset_records = [
+                    replace(record, window=record.window + unique_offset)
+                    for record in offset_records
+                ]
+                offset_datasets.append(dataset)
+                records.extend(offset_records)
+            pass_dataset = xr.concat(
+                offset_datasets,
+                dim="eigenpair",
+                data_vars="all",
+                coords="minimal",
+                compat="override",
+                combine_attrs="drop_conflicts",
+            ).assign_coords(
+                eigenpair=np.arange(
+                    sum(item.sizes.get("eigenpair", 0) for item in offset_datasets)
+                )
+            )
+            pass_dataset = _deduplicate_window_dataset(
+                pass_dataset,
+                self.master_weights,
+                relative_s=search.dedup_relative_s,
+                minimum_overlap=search.dedup_overlap,
+            )
+            breakpoints = np.unique(np.asarray(self.radial_levels[level].knots))
+            h = float(np.median(np.diff(breakpoints)))
+            global_mask = np.zeros(pass_dataset.sizes.get("eigenpair", 0), dtype=bool)
+            for index in range(global_mask.size):
+                _, width, _ = _shape_metrics(
+                    pass_dataset["xi_psi"].values[index],
+                    self.master_points,
+                    self.master_weights,
+                )
+                retention = fixed_coarse_space_retention(
+                    pass_dataset["xi_psi"].values[index],
+                    self.master_points,
+                    self.master_weights,
+                    self.radial_levels[0],
+                )
+                global_mask[index] = bool(
+                    (np.isfinite(width) and width / h >= discovery.global_width_over_h_min)
+                    or (
+                        np.isfinite(retention)
+                        and retention >= discovery.global_coarse_retention_min
+                    )
+                )
+            signature = np.asarray(
+                pass_dataset["omega"].values.real[global_mask],
+                dtype=float,
+            )
+            if previous_signature is not None and empirical_candidate_stability(
+                previous_signature,
+                signature,
+                relative_gate=search.dedup_relative_s,
+            ):
+                stable_count += 1
+            else:
+                stable_count = 0
+            previous_signature = signature
+            pass_datasets.append(pass_dataset)
+            if stable_count >= discovery.stable_passes:
+                break
+
+        combined = xr.concat(
+            pass_datasets,
+            dim="eigenpair",
+            data_vars="all",
+            coords="minimal",
+            compat="override",
+            combine_attrs="drop_conflicts",
+        ).assign_coords(
+            eigenpair=np.arange(
+                sum(item.sizes.get("eigenpair", 0) for item in pass_datasets)
+            )
+        )
+        combined = _deduplicate_window_dataset(
+            combined,
+            self.master_weights,
+            relative_s=search.dedup_relative_s,
+            minimum_overlap=search.dedup_overlap,
+        )
+        stable = stable_count >= discovery.stable_passes
+        for index, record in enumerate(records):
+            leaf = index >= last_record_start
+            status = "empirically_stable" if stable and leaf else record.catalog_status
+            records[index] = replace(
+                record,
+                leaf=leaf,
+                complete=False,
+                catalog_status=status,
+            )
+        combined.attrs.update(
+            search_strategy="adaptive_discovery",
+            discovery_nev_passes=repr(discovery.nev_passes),
+            discovery_target_offsets=repr(discovery.target_offsets),
+            physical_candidate_catalog_stable=bool(stable),
+            catalog_status="empirically_stable"
+            if stable
+            else aggregate_catalog_status(
+                record.catalog_status for record in records if record.leaf
+            ),
+        )
+        return combined, records, False
+
+    def _reacquire_missing_roots(
+        self,
+        *,
+        tracks: xr.Dataset,
+        level_solutions: list[xr.Dataset],
+        projected: tuple[tuple, ...],
+        sb,
+        search: MultigridSearchOptions,
+        thresholds: ModeClassificationThresholds,
+        options: ReacquisitionOptions,
+        bc_tol: float | None,
+        verbose: bool,
+    ) -> tuple[xr.Dataset, list[_WindowRecord]]:
+        """Selectively continue global candidates missing on an adjacent mesh."""
+        if not options.enabled or self.levels < 2:
+            return tracks, []
+        attempt_records: list[_WindowRecord] = []
+        negative_status: list[tuple[int, float, str]] = []
+        for level in range(1, self.levels):
+            present = np.asarray(tracks["present"].values, dtype=bool)
+            missing = present[:, level - 1] & ~present[:, level]
+            width_over_h = np.asarray(tracks["width_over_h"].values, dtype=float)
+            retention = np.asarray(
+                tracks["coarse_space_retention"].values,
+                dtype=float,
+            )
+            global_candidate = (
+                width_over_h[:, level - 1] >= options.global_width_over_h_min
+            ) | (
+                retention[:, level - 1] >= options.global_coarse_retention_min
+            )
+            candidates = np.flatnonzero(missing & global_candidate)
+            if candidates.size == 0:
+                continue
+            ranking = np.nan_to_num(
+                retention[candidates, level - 1],
+                nan=-np.inf,
+            )
+            candidates = candidates[np.argsort(ranking)[::-1]][
+                : options.max_candidates_per_level
+            ]
+            T0, T1, Tminus1 = projected[level]
+            transfer = mixed_space_prolongation(
+                self.mixed_levels[level - 1],
+                self.mixed_levels[level],
+                tracks.sizes.get("m_pol", 0),
+            )
+            fine_bc = self.solver._build_nep_boundary_condition(
+                sb,
+                bc_kind="full",
+                mixed=self.mixed_levels[level],
+            )
+            fine_prolongation = fine_bc.get_sparse_prolongation(tol=bc_tol)
+            free = np.asarray(fine_bc.sparse_free, dtype=int)
+            local_search = replace(
+                search,
+                nev=max(int(search.nev) * options.nev_multiplier, int(search.nev) + 4),
+            )
+            pep = None
+            additions: list[xr.Dataset] = []
+            try:
+                for ordinal, track in enumerate(candidates):
+                    previous_index = int(tracks["mode_index"].values[track, level - 1])
+                    previous_omega = complex(
+                        tracks["omega"].values[track, level - 1]
+                    )
+                    predicted = previous_omega.real
+                    if level >= 2 and present[track, level - 2]:
+                        coarser = complex(tracks["omega"].values[track, level - 2])
+                        predicted += 0.5 * (previous_omega.real - coarser.real)
+                    half_width = max(
+                        abs(predicted) * options.relative_half_width,
+                        np.finfo(float).eps,
+                    )
+                    omega_min = max(np.finfo(float).tiny, predicted - half_width)
+                    omega_max = predicted + half_width
+                    target_s, region = self._window_region(
+                        omega_min,
+                        omega_max,
+                        local_search,
+                    )
+                    if pep is None:
+                        pep = QuadraticPEPSolver(
+                            A0=Tminus1,
+                            A1=T0,
+                            A2=T1,
+                            target_s=target_s,
+                            region=region,
+                            prefix=f"{search.prefix}_reacq_l{level}_",
+                            pep_type=search.pep_type,
+                            st_type=search.st_type,
+                            which=search.which,
+                            nev=local_search.nev,
+                            tol=search.tol,
+                            maxit=search.maxit,
+                            options=dict(search.options),
+                            verbose=verbose,
+                            compute_residuals=True,
+                        )
+                    else:
+                        pep.retarget(target_s, region)
+                    full_previous = np.asarray(
+                        level_solutions[level - 1]["eigenvector"].values[
+                            previous_index
+                        ],
+                        dtype=np.complex128,
+                    )
+                    full_initial = transfer @ full_previous
+                    reduced_initial = np.asarray(full_initial[free], dtype=np.complex128)
+                    constraint_error = np.linalg.norm(
+                        fine_prolongation @ reduced_initial - full_initial
+                    ) / max(np.linalg.norm(full_initial), np.finfo(float).tiny)
+                    if (
+                        options.use_initial_space
+                        and constraint_error <= 1.0e-8
+                        and hasattr(pep, "set_initial_space")
+                    ):
+                        pep.set_initial_space(reduced_initial)
+                    result = pep.solve(allow_empty=True)
+                    indices = self._root_indices_in_window(
+                        result.eigenvalues,
+                        omega_min,
+                        omega_max,
+                        region,
+                        search.root_filter_tolerance,
+                    )
+                    window = 1_000_000 + level * 100_000 + int(track)
+                    packed = self._pack_window_result(
+                        sb=sb,
+                        mixed=self.mixed_levels[level],
+                        result=result,
+                        pep=pep,
+                        indices=indices,
+                        level=level,
+                        window=window,
+                        depth=-1,
+                        core_omega_min=omega_min,
+                        core_omega_max=omega_max,
+                        solve_omega_min=omega_min,
+                        solve_omega_max=omega_max,
+                        final_window=True,
+                        bc_tol=bc_tol,
+                    )
+                    effective_nev = int(getattr(pep, "effective_nev", local_search.nev))
+                    status = window_catalog_status(
+                        nconv=int(result.nconv),
+                        effective_nev=effective_nev,
+                        solver_converged=_is_converged_reason(result.reason),
+                    )
+                    best = -1
+                    best_overlap = -np.inf
+                    previous_shape = np.asarray(
+                        tracks["xi_psi"].values[track, level - 1],
+                        dtype=np.complex128,
+                    )
+                    for candidate in range(packed.sizes.get("eigenpair", 0)):
+                        overlap = _weighted_xi_overlap(
+                            previous_shape,
+                            packed["xi_psi"].values[candidate],
+                            self.master_weights,
+                        )
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best = candidate
+                    if best >= 0 and best_overlap >= options.minimum_overlap:
+                        selected = packed.isel(eigenpair=[best]).assign_coords(eigenpair=[0])
+                        selected["reacquisition_status"] = (
+                            "eigenpair",
+                            np.asarray(["reacquired"], dtype="U48"),
+                        )
+                        selected["reacquisition_overlap"] = (
+                            "eigenpair",
+                            np.asarray([best_overlap]),
+                        )
+                        additions.append(selected)
+                        reacquisition_status = "reacquired"
+                    else:
+                        reacquisition_status = (
+                            "capacity_limited"
+                            if status == "capacity_limited"
+                            else "search_failed"
+                        )
+                        negative_status.append(
+                            (level, previous_omega.real, reacquisition_status)
+                        )
+                    attempt_records.append(
+                        _WindowRecord(
+                            level=level,
+                            window=window,
+                            parent=int(track),
+                            depth=-1,
+                            core_omega_min=omega_min,
+                            core_omega_max=omega_max,
+                            solve_omega_min=omega_min,
+                            solve_omega_max=omega_max,
+                            target_s=target_s,
+                            nconv=int(result.nconv),
+                            nreturned=int(indices.size),
+                            saturated=status == "capacity_limited",
+                            leaf=False,
+                            complete=False,
+                            reason=f"{result.reason};reacquisition={reacquisition_status}",
+                            iterations=int(result.iterations),
+                            effective_nev=effective_nev,
+                            catalog_status=status,
+                        )
+                    )
+            finally:
+                if pep is not None:
+                    pep.destroy()
+            if additions:
+                level_solutions[level] = xr.concat(
+                    [level_solutions[level], *additions],
+                    dim="eigenpair",
+                    data_vars="all",
+                    coords="minimal",
+                    compat="override",
+                    combine_attrs="drop_conflicts",
+                ).assign_coords(
+                    eigenpair=np.arange(
+                        level_solutions[level].sizes.get("eigenpair", 0)
+                        + len(additions)
+                    )
+                )
+                level_solutions[level] = _deduplicate_window_dataset(
+                    level_solutions[level],
+                    self.master_weights,
+                    relative_s=search.dedup_relative_s,
+                    minimum_overlap=search.dedup_overlap,
+                )
+                tracks = _track_level_solutions(
+                    tuple(level_solutions),
+                    self.master_weights,
+                    thresholds,
+                    radial_levels=self.radial_levels,
+                )
+
+        if negative_status:
+            status_values = np.asarray(tracks["reacquisition_status"].values).astype("U48")
+            present = np.asarray(tracks["present"].values, dtype=bool)
+            omega = np.asarray(tracks["omega"].values, dtype=np.complex128)
+            for level, previous_omega, status in negative_status:
+                candidates = np.flatnonzero(present[:, level - 1] & ~present[:, level])
+                if candidates.size == 0:
+                    continue
+                distance = np.abs(omega[candidates, level - 1].real - previous_omega)
+                track = int(candidates[int(np.argmin(distance))])
+                scale = max(abs(previous_omega), np.finfo(float).tiny)
+                if np.min(distance) / scale <= search.dedup_relative_s:
+                    status_values[track, level] = status
+            tracks = tracks.copy()
+            tracks["reacquisition_status"] = (
+                ("track", "level"),
+                status_values,
+            )
+        return tracks, attempt_records
 
     def solve_pep(
         self,
@@ -1627,6 +2456,10 @@ class superSolver5Multigrid:
         bc_tol: float | None = None,
         search: MultigridSearchOptions | Mapping[str, object] | None = None,
         thresholds: ModeClassificationThresholds | Mapping[str, object] | None = None,
+        classification_version: str = CLASSIFICATION_VERSION,
+        evidence_config: EvidenceV2Config | Mapping[str, object] | None = None,
+        adaptive_discovery: AdaptiveDiscoveryOptions | Mapping[str, object] | None = None,
+        reacquisition: ReacquisitionOptions | Mapping[str, object] | None = None,
         verbose: bool = False,
     ) -> MultigridPEPResult:
         """Search a normalized-omega band and classify all multigrid tracks."""
@@ -1634,6 +2467,17 @@ class superSolver5Multigrid:
         omega_range = _validate_omega_range(omega_range)
         search = _coerce_options(search, MultigridSearchOptions)
         thresholds = _coerce_options(thresholds, ModeClassificationThresholds)
+        evidence_config = _coerce_options(evidence_config, EvidenceV2Config)
+        discovery = (
+            None
+            if adaptive_discovery is None
+            else _coerce_options(adaptive_discovery, AdaptiveDiscoveryOptions)
+        )
+        reacquisition_options = (
+            None
+            if reacquisition is None
+            else _coerce_options(reacquisition, ReacquisitionOptions)
+        )
 
         # These are deliberately the only local block/tensor construction calls.
         sb = self.solver.build_solver_blocks(
@@ -1659,7 +2503,9 @@ class superSolver5Multigrid:
         records: list[_WindowRecord] = []
         complete: list[bool] = []
         for level, (matrices, mixed) in enumerate(zip(projected, self.mixed_levels)):
-            dataset, level_records, level_complete = self._search_level(
+            use_discovery = discovery is not None and level < min(2, self.levels)
+            search_method = self._adaptive_discovery_level if use_discovery else self._search_level
+            search_kwargs = dict(
                 level=level,
                 matrices=matrices,
                 sb=sb,
@@ -1669,6 +2515,9 @@ class superSolver5Multigrid:
                 bc_tol=bc_tol,
                 verbose=verbose,
             )
+            if use_discovery:
+                search_kwargs["discovery"] = discovery
+            dataset, level_records, level_complete = search_method(**search_kwargs)
             dataset.attrs.update(
                 {
                     "regularizer": float(regularizer),
@@ -1679,8 +2528,13 @@ class superSolver5Multigrid:
                     "search_requested_nev": int(search.nev),
                     "search_tolerance": float(search.tol),
                     "search_max_iterations": int(search.maxit),
-                    "search_window_overlap": float(search.window_overlap),
-                    "search_max_depth": int(search.max_depth),
+                    "search_window_count": int(search.window_count),
+                    "search_window_padding": float(search.window_padding),
+                    "search_region_vscale": float(search.region_vscale),
+                    "search_strategy": (
+                        "adaptive_discovery" if use_discovery else "fixed_padded_windows"
+                    ),
+                    "adaptive_discovery": repr(discovery),
                 }
             )
             level_solutions.append(dataset)
@@ -1705,6 +2559,41 @@ class superSolver5Multigrid:
             level_tuple,
             self.master_weights,
             thresholds,
+            radial_levels=getattr(self, "radial_levels", None),
+        )
+        if reacquisition_options is not None:
+            tracks, reacquisition_records = self._reacquire_missing_roots(
+                tracks=tracks,
+                level_solutions=level_solutions,
+                projected=projected,
+                sb=sb,
+                search=search,
+                thresholds=thresholds,
+                options=reacquisition_options,
+                bc_tol=bc_tol,
+                verbose=verbose,
+            )
+            records.extend(reacquisition_records)
+            level_tuple = tuple(level_solutions)
+        tracks = _attach_enriched_residuals(
+            tracks,
+            level_tuple,
+            projected,
+            self.mixed_levels,
+            self.solver,
+            sb,
+            bc_tol=bc_tol,
+        )
+        level_catalog_status = np.asarray(
+            [
+                aggregate_catalog_status(
+                    record.catalog_status
+                    for record in records
+                    if record.level == level and record.leaf
+                )
+                for level in range(self.levels)
+            ],
+            dtype="U24",
         )
         classification = _classify_tracks(
             tracks,
@@ -1712,17 +2601,33 @@ class superSolver5Multigrid:
             self.master_weights,
             np.asarray(complete, dtype=bool),
             thresholds,
+            classification_version=classification_version,
+            evidence_config=evidence_config,
+            catalog_status=level_catalog_status,
         )
         diagnostics = _window_diagnostics_dataset(records, self.levels)
         diagnostics["level_complete"] = (
             "level",
             np.asarray(complete, dtype=bool),
         )
+        diagnostics["level_catalog_status"] = (
+            "level",
+            level_catalog_status,
+        )
         diagnostics.attrs.update(
             {
                 "search": repr(search),
                 "omega_min": omega_range[0],
                 "omega_max": omega_range[1],
+                "run_catalog_status": aggregate_catalog_status(level_catalog_status),
+                "classification_version": str(classification_version),
+                "reacquisition": repr(reacquisition_options),
+                "spectrum_slicing_applicable": False,
+                "spectrum_slicing_reason": (
+                    "solver5 currently declares a GENERAL quadratic PEP; "
+                    "Hermitian/hyperbolic structure and definiteness have not "
+                    "been certified, so all-in-interval slicing is disabled"
+                ),
             }
         )
         return MultigridPEPResult(
@@ -1735,6 +2640,7 @@ class superSolver5Multigrid:
 
 
 __all__ = [
+    "EvidenceV2Config",
     "ModeClassificationThresholds",
     "MultigridPEPResult",
     "MultigridSearchOptions",

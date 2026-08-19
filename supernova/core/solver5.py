@@ -23,6 +23,7 @@ from ._petsc_helpers import (
     _require_petsc,
     _require_slepc,
     _vec_read_array,
+    _vec_write_array,
     apply_petsc_options,
     scipy_csr_to_petsc,
 )
@@ -335,6 +336,29 @@ class QuadraticPEPSolver:
             if vi is not None:
                 vi.destroy()
         return NEPResult(eigenvalues, eigenvectors, nconv, reason, iterations)
+
+    def set_initial_space(self, vectors: np.ndarray) -> None:
+        """Supply one or more reduced-space starting vectors to SLEPc PEP."""
+        values = np.asarray(vectors, dtype=np.complex128)
+        if values.ndim == 1:
+            values = values[None, :]
+        if values.ndim != 2 or values.shape[1] != self.size:
+            raise ValueError(
+                f"Initial vectors must have shape (n, {self.size}), got {values.shape}."
+            )
+        petsc_vectors = []
+        try:
+            for value in values:
+                vector = self.mats[0].createVecRight()
+                writable = _vec_write_array(vector)
+                writable[...] = np.asarray(value, dtype=self.scalar_type)
+                vector.assemblyBegin()
+                vector.assemblyEnd()
+                petsc_vectors.append(vector)
+            self.pep.setInitialSpace(petsc_vectors)
+        finally:
+            for vector in petsc_vectors:
+                vector.destroy()
 
     def destroy(self) -> None:
         if getattr(self, "pep", None) is not None:
