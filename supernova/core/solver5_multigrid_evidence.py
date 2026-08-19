@@ -57,6 +57,132 @@ FALSE = "false"
 UNKNOWN = "unknown"
 
 
+@dataclass(frozen=True)
+class PhysicalDisplacementMetric:
+    r"""Quadrature data for the resolved perpendicular kinetic-energy norm.
+
+    The stored harmonics represent the two positive geometry factors in
+
+    ``sqrt(g) * (|xi^psi|^2/g^{psi psi} + g^{psi psi}|xi^s|^2/B^2)``.
+
+    ``xi^b`` is not part of the solver5 state and is therefore deliberately
+    excluded.  The public metric name remains ``kinetic_energy`` so matching
+    results use the evidence-v2 vocabulary, while ``parallel_component_included``
+    and ``definition`` make the resolved-component limitation machine readable.
+    """
+
+    points: np.ndarray
+    m_pol: np.ndarray
+    mass_density: np.ndarray
+    radial_geometry_harmonics: np.ndarray
+    tangential_geometry_harmonics: np.ndarray
+    metric_name: str = "kinetic_energy"
+    parallel_component_included: bool = False
+    definition: str = (
+        "resolved perpendicular kinetic energy: integral rho*sqrt(g)*"
+        "(conj(xi_psi)*xi_psi/gpsi_psi + "
+        "gpsi_psi*conj(xi_s)*xi_s/B0**2) dpsi dtheta"
+    )
+
+    def __post_init__(self) -> None:
+        points = np.asarray(self.points, dtype=float)
+        modes = np.asarray(self.m_pol)
+        density = np.asarray(self.mass_density, dtype=float)
+        radial = np.asarray(self.radial_geometry_harmonics, dtype=np.complex128)
+        tangential = np.asarray(
+            self.tangential_geometry_harmonics,
+            dtype=np.complex128,
+        )
+        if points.ndim != 1 or points.size == 0 or np.any(~np.isfinite(points)):
+            raise ValueError("metric points must be a finite one-dimensional array.")
+        if np.any(np.diff(points) <= 0.0):
+            raise ValueError("metric points must be strictly increasing.")
+        if modes.ndim != 1 or modes.size == 0 or np.unique(modes).size != modes.size:
+            raise ValueError("metric m_pol must contain unique mode numbers.")
+        if density.shape != points.shape or np.any(~np.isfinite(density)):
+            raise ValueError("mass_density must be finite and match metric points.")
+        if np.any(density <= 0.0):
+            raise ValueError("mass_density must be strictly positive.")
+        if radial.ndim != 2 or radial.shape[0] != points.size:
+            raise ValueError("radial geometry harmonics must have shape (psi, delta_m).")
+        if tangential.shape != radial.shape or radial.shape[1] == 0:
+            raise ValueError("radial and tangential harmonics must have equal nonempty shape.")
+        if np.any(~np.isfinite(radial)) or np.any(~np.isfinite(tangential)):
+            raise ValueError("physical metric harmonics must be finite.")
+        if self.metric_name not in ("kinetic_energy", "full_displacement"):
+            raise ValueError("metric_name must be 'kinetic_energy' or 'full_displacement'.")
+        object.__setattr__(self, "points", points)
+        object.__setattr__(self, "m_pol", modes)
+        object.__setattr__(self, "mass_density", density)
+        object.__setattr__(self, "radial_geometry_harmonics", radial)
+        object.__setattr__(self, "tangential_geometry_harmonics", tangential)
+
+    @property
+    def max_delta_m(self) -> int:
+        return int(self.radial_geometry_harmonics.shape[1] - 1)
+
+    def to_dataset(self) -> xr.Dataset:
+        """Return a portable xarray representation of the metric provider."""
+        return xr.Dataset(
+            data_vars={
+                "mass_density": ("psi", self.mass_density),
+                "radial_geometry_harmonic": (
+                    ("psi", "delta_m"),
+                    self.radial_geometry_harmonics,
+                ),
+                "tangential_geometry_harmonic": (
+                    ("psi", "delta_m"),
+                    self.tangential_geometry_harmonics,
+                ),
+            },
+            coords={
+                "psi": self.points,
+                "delta_m": np.arange(self.max_delta_m + 1, dtype=np.int64),
+                "m_pol": self.m_pol,
+            },
+            attrs={
+                "metric_name": self.metric_name,
+                "definition": self.definition,
+                "parallel_component_included": self.parallel_component_included,
+                "pressure_component_included": False,
+                "fourier_harmonic_convention": (
+                    "zero mode unchanged; positive one-sided amplitudes are halved "
+                    "when forming the two-sided multiplication matrix"
+                ),
+            },
+        )
+
+    @classmethod
+    def from_dataset(cls, dataset: xr.Dataset) -> "PhysicalDisplacementMetric":
+        """Restore a metric saved by :meth:`to_dataset`."""
+        required = {
+            "mass_density",
+            "radial_geometry_harmonic",
+            "tangential_geometry_harmonic",
+        }
+        missing = sorted(required.difference(dataset.data_vars))
+        if missing:
+            raise ValueError(f"Physical metric dataset is missing {missing}.")
+        return cls(
+            points=np.asarray(dataset.coords["psi"].values, dtype=float),
+            m_pol=np.asarray(dataset.coords["m_pol"].values),
+            mass_density=np.asarray(dataset["mass_density"].values, dtype=float),
+            radial_geometry_harmonics=np.asarray(
+                dataset["radial_geometry_harmonic"].values,
+                dtype=np.complex128,
+            ),
+            tangential_geometry_harmonics=np.asarray(
+                dataset["tangential_geometry_harmonic"].values,
+                dtype=np.complex128,
+            ),
+            metric_name=str(dataset.attrs.get("metric_name", "kinetic_energy")),
+            parallel_component_included=bool(
+                dataset.attrs.get("parallel_component_included", False)
+            ),
+            definition=str(dataset.attrs.get("definition", cls.definition)),
+        )
+
+
 def tri_state(value) -> str:
     """Return the serializable three-valued evidence representation."""
     if value is None:
@@ -430,6 +556,369 @@ def weighted_principal_angle_cosines(
     return np.clip(np.asarray(singular.real, dtype=float), 0.0, 1.0)
 
 
+def _validate_physical_displacement_fields(
+    radial: np.ndarray,
+    tangential: np.ndarray,
+    metric: PhysicalDisplacementMetric,
+    *,
+    name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    radial = np.asarray(radial, dtype=np.complex128)
+    tangential = np.asarray(tangential, dtype=np.complex128)
+    expected_tail = (metric.points.size, metric.m_pol.size)
+    if radial.ndim != 3 or radial.shape[1:] != expected_tail:
+        raise ValueError(
+            f"{name} radial displacement must have shape (mode, {expected_tail[0]}, "
+            f"{expected_tail[1]})."
+        )
+    if tangential.shape != radial.shape:
+        raise ValueError(f"{name} tangential displacement must match radial displacement.")
+    return radial, tangential
+
+
+def _harmonic_metric_pair_inner_products(
+    left: np.ndarray,
+    right: np.ndarray,
+    harmonics: np.ndarray,
+    m_pol: np.ndarray,
+    radial_weights: np.ndarray,
+) -> np.ndarray:
+    """Evaluate paired Fourier-Galerkin products without forming dense matrices."""
+    if left.shape != right.shape or left.ndim != 3:
+        raise ValueError("Paired fields must have equal shape (pair, psi, m_pol).")
+    pair_count, point_count, mode_count = left.shape
+    if harmonics.shape[0] != point_count or m_pol.shape != (mode_count,):
+        raise ValueError("Metric harmonics or mode numbers do not match the fields.")
+    weighted_zero = radial_weights * harmonics[:, 0]
+    result = np.einsum(
+        "pqi,q,pqi->p",
+        left.conjugate(),
+        weighted_zero,
+        right,
+        optimize=True,
+    )
+    differences = m_pol[:, None] - m_pol[None, :]
+    maximum = min(int(harmonics.shape[1] - 1), int(np.max(np.abs(differences))))
+    for delta in range(1, maximum + 1):
+        rows, columns = np.nonzero(differences == delta)
+        if rows.size == 0:
+            continue
+        positive = 0.5 * radial_weights * harmonics[:, delta]
+        result += np.einsum(
+            "pqi,q,pqi->p",
+            left[:, :, rows].conjugate(),
+            positive,
+            right[:, :, columns],
+            optimize=True,
+        )
+        result += np.einsum(
+            "pqi,q,pqi->p",
+            left[:, :, columns].conjugate(),
+            positive.conjugate(),
+            right[:, :, rows],
+            optimize=True,
+        )
+    return np.asarray(result, dtype=np.complex128).reshape(pair_count)
+
+
+def _harmonic_metric_action(
+    fields: np.ndarray,
+    harmonics: np.ndarray,
+    m_pol: np.ndarray,
+    radial_weights: np.ndarray,
+) -> np.ndarray:
+    """Apply a weighted Fourier multiplication metric to many fields once."""
+    fields = np.asarray(fields, dtype=np.complex128)
+    if fields.ndim != 3:
+        raise ValueError("fields must have shape (mode, psi, m_pol).")
+    if harmonics.shape[0] != fields.shape[1] or m_pol.shape != (fields.shape[2],):
+        raise ValueError("Metric harmonics or mode numbers do not match the fields.")
+    output = fields * (radial_weights * harmonics[:, 0])[None, :, None]
+    differences = m_pol[:, None] - m_pol[None, :]
+    maximum = min(int(harmonics.shape[1] - 1), int(np.max(np.abs(differences))))
+    for delta in range(1, maximum + 1):
+        rows, columns = np.nonzero(differences == delta)
+        if rows.size == 0:
+            continue
+        positive = 0.5 * radial_weights * harmonics[:, delta]
+        output[:, :, rows] += fields[:, :, columns] * positive[None, :, None]
+        output[:, :, columns] += fields[:, :, rows] * positive.conjugate()[None, :, None]
+    return output
+
+
+def _physical_metric_action(
+    radial: np.ndarray,
+    tangential: np.ndarray,
+    weights: np.ndarray,
+    metric: PhysicalDisplacementMetric,
+) -> tuple[np.ndarray, np.ndarray]:
+    radial, tangential = _validate_physical_displacement_fields(
+        radial,
+        tangential,
+        metric,
+        name="metric-action",
+    )
+    weights = np.asarray(weights, dtype=float)
+    if weights.shape != metric.points.shape or np.any(~np.isfinite(weights)):
+        raise ValueError("Quadrature weights must be finite and match metric points.")
+    radial_weights = weights * metric.mass_density
+    return (
+        _harmonic_metric_action(
+            radial,
+            metric.radial_geometry_harmonics,
+            metric.m_pol,
+            radial_weights,
+        ),
+        _harmonic_metric_action(
+            tangential,
+            metric.tangential_geometry_harmonics,
+            metric.m_pol,
+            radial_weights,
+        ),
+    )
+
+
+def physical_displacement_pair_inner_products(
+    left_radial: np.ndarray,
+    left_tangential: np.ndarray,
+    right_radial: np.ndarray,
+    right_tangential: np.ndarray,
+    weights: np.ndarray,
+    metric: PhysicalDisplacementMetric,
+) -> np.ndarray:
+    r"""Return paired resolved-displacement kinetic-energy inner products.
+
+    Pressure and ``div_xi`` are intentionally absent from this API.  The only
+    accepted fields are the two displacement components whose geometry factors
+    follow directly from the Cheng--Chance decomposition.
+    """
+    left_radial, left_tangential = _validate_physical_displacement_fields(
+        left_radial,
+        left_tangential,
+        metric,
+        name="left",
+    )
+    right_radial, right_tangential = _validate_physical_displacement_fields(
+        right_radial,
+        right_tangential,
+        metric,
+        name="right",
+    )
+    if right_radial.shape != left_radial.shape:
+        raise ValueError("Left and right physical displacement batches must match.")
+    weights = np.asarray(weights, dtype=float)
+    if weights.shape != metric.points.shape or np.any(~np.isfinite(weights)):
+        raise ValueError("Quadrature weights must be finite and match metric points.")
+    radial_weights = weights * metric.mass_density
+    radial = _harmonic_metric_pair_inner_products(
+        left_radial,
+        right_radial,
+        metric.radial_geometry_harmonics,
+        metric.m_pol,
+        radial_weights,
+    )
+    tangential = _harmonic_metric_pair_inner_products(
+        left_tangential,
+        right_tangential,
+        metric.tangential_geometry_harmonics,
+        metric.m_pol,
+        radial_weights,
+    )
+    return radial + tangential
+
+
+def physical_displacement_cross_gram(
+    left_radial: np.ndarray,
+    left_tangential: np.ndarray,
+    right_radial: np.ndarray,
+    right_tangential: np.ndarray,
+    weights: np.ndarray,
+    metric: PhysicalDisplacementMetric,
+) -> np.ndarray:
+    """Return ``<left_i,right_j>`` for two resolved-displacement bases."""
+    left_radial, left_tangential = _validate_physical_displacement_fields(
+        left_radial,
+        left_tangential,
+        metric,
+        name="left",
+    )
+    right_radial, right_tangential = _validate_physical_displacement_fields(
+        right_radial,
+        right_tangential,
+        metric,
+        name="right",
+    )
+    rows = np.repeat(np.arange(left_radial.shape[0]), right_radial.shape[0])
+    columns = np.tile(np.arange(right_radial.shape[0]), left_radial.shape[0])
+    values = physical_displacement_pair_inner_products(
+        left_radial[rows],
+        left_tangential[rows],
+        right_radial[columns],
+        right_tangential[columns],
+        weights,
+        metric,
+    )
+    return values.reshape(left_radial.shape[0], right_radial.shape[0])
+
+
+def physical_displacement_overlaps(
+    left_radial: np.ndarray,
+    left_tangential: np.ndarray,
+    right_radial: np.ndarray,
+    right_tangential: np.ndarray,
+    weights: np.ndarray,
+    metric: PhysicalDisplacementMetric,
+) -> np.ndarray:
+    """Return all phase-invariant normalized physical-displacement overlaps."""
+    cross = physical_displacement_cross_gram(
+        left_radial,
+        left_tangential,
+        right_radial,
+        right_tangential,
+        weights,
+        metric,
+    )
+    left_norm = np.real(
+        physical_displacement_pair_inner_products(
+            left_radial,
+            left_tangential,
+            left_radial,
+            left_tangential,
+            weights,
+            metric,
+        )
+    )
+    right_norm = np.real(
+        physical_displacement_pair_inner_products(
+            right_radial,
+            right_tangential,
+            right_radial,
+            right_tangential,
+            weights,
+            metric,
+        )
+    )
+    denominator = np.sqrt(
+        np.maximum(left_norm[:, None], 0.0) * np.maximum(right_norm[None, :], 0.0)
+    )
+    return np.clip(
+        np.divide(
+            np.abs(cross),
+            denominator,
+            out=np.zeros_like(denominator, dtype=float),
+            where=denominator > np.finfo(float).tiny,
+        ),
+        0.0,
+        1.0,
+    )
+
+
+def physical_displacement_paired_overlaps(
+    left_radial: np.ndarray,
+    left_tangential: np.ndarray,
+    right_radial: np.ndarray,
+    right_tangential: np.ndarray,
+    weights: np.ndarray,
+    metric: PhysicalDisplacementMetric,
+) -> np.ndarray:
+    """Return one normalized overlap for every paired input row."""
+    inner = physical_displacement_pair_inner_products(
+        left_radial,
+        left_tangential,
+        right_radial,
+        right_tangential,
+        weights,
+        metric,
+    )
+    left_norm = np.real(
+        physical_displacement_pair_inner_products(
+            left_radial,
+            left_tangential,
+            left_radial,
+            left_tangential,
+            weights,
+            metric,
+        )
+    )
+    right_norm = np.real(
+        physical_displacement_pair_inner_products(
+            right_radial,
+            right_tangential,
+            right_radial,
+            right_tangential,
+            weights,
+            metric,
+        )
+    )
+    denominator = np.sqrt(np.maximum(left_norm, 0.0) * np.maximum(right_norm, 0.0))
+    return np.clip(
+        np.divide(
+            np.abs(inner),
+            denominator,
+            out=np.zeros_like(denominator, dtype=float),
+            where=denominator > np.finfo(float).tiny,
+        ),
+        0.0,
+        1.0,
+    )
+
+
+def _gram_whitener(
+    gram: np.ndarray,
+    *,
+    rank_tolerance: float = 1.0e-12,
+) -> tuple[np.ndarray, int]:
+    gram = np.asarray(gram, dtype=np.complex128)
+    values, vectors = eigh(0.5 * (gram + gram.conjugate().T))
+    maximum = max(float(np.max(values).real), np.finfo(float).tiny)
+    keep = values > rank_tolerance * maximum
+    if not np.any(keep):
+        return np.empty((gram.shape[0], 0), dtype=np.complex128), 0
+    return vectors[:, keep] / np.sqrt(values[keep])[None, :], int(np.count_nonzero(keep))
+
+
+def physical_principal_angle_cosines(
+    coarse_radial: np.ndarray,
+    coarse_tangential: np.ndarray,
+    fine_radial: np.ndarray,
+    fine_tangential: np.ndarray,
+    weights: np.ndarray,
+    metric: PhysicalDisplacementMetric,
+) -> np.ndarray:
+    """Return principal cosines in the resolved kinetic-energy metric."""
+    coarse_gram = physical_displacement_cross_gram(
+        coarse_radial,
+        coarse_tangential,
+        coarse_radial,
+        coarse_tangential,
+        weights,
+        metric,
+    )
+    fine_gram = physical_displacement_cross_gram(
+        fine_radial,
+        fine_tangential,
+        fine_radial,
+        fine_tangential,
+        weights,
+        metric,
+    )
+    cross = physical_displacement_cross_gram(
+        coarse_radial,
+        coarse_tangential,
+        fine_radial,
+        fine_tangential,
+        weights,
+        metric,
+    )
+    coarse_whitener, coarse_rank = _gram_whitener(coarse_gram)
+    fine_whitener, fine_rank = _gram_whitener(fine_gram)
+    if coarse_rank == 0 or fine_rank == 0:
+        return np.empty(0, dtype=float)
+    whitened_cross = coarse_whitener.conjugate().T @ cross @ fine_whitener
+    singular = np.linalg.svd(whitened_cross, compute_uv=False)
+    return np.clip(np.asarray(singular.real, dtype=float), 0.0, 1.0)
+
+
 def cluster_aware_mode_assignment(
     reference_frequency: np.ndarray,
     candidate_frequency: np.ndarray,
@@ -439,6 +928,9 @@ def cluster_aware_mode_assignment(
     *,
     frequency_gate: float,
     tie_delta: float,
+    reference_tangential: np.ndarray | None = None,
+    candidate_tangential: np.ndarray | None = None,
+    physical_metric: PhysicalDisplacementMetric | None = None,
 ) -> dict[str, np.ndarray]:
     """Match isolated modes and compare near-degenerate components as subspaces.
 
@@ -482,30 +974,109 @@ def cluster_aware_mode_assignment(
     ) / scale
     allowed = np.isfinite(frequency_change) & (frequency_change <= frequency_gate)
     overlaps = np.zeros((nreference, ncandidate), dtype=float)
-    flattened_reference = reference_vectors.reshape(nreference, -1)
-    flattened_candidate = candidate_vectors.reshape(ncandidate, -1)
-    repeated_weights = np.repeat(np.asarray(weights, dtype=float), reference_vectors.shape[2])
-    reference_norm = np.sqrt(
-        np.sum(repeated_weights[None, :] * np.abs(flattened_reference) ** 2, axis=1)
-    )
-    candidate_norm = np.sqrt(
-        np.sum(repeated_weights[None, :] * np.abs(flattened_candidate) ** 2, axis=1)
-    )
-    for row in range(nreference):
-        columns = np.flatnonzero(allowed[row])
-        if columns.size == 0 or reference_norm[row] <= np.finfo(float).tiny:
-            continue
-        numerator = np.abs(
-            (flattened_reference[row].conjugate() * repeated_weights)
-            @ flattened_candidate[columns].T
+    use_physical = physical_metric is not None
+    if use_physical:
+        if reference_tangential is None or candidate_tangential is None:
+            raise ValueError(
+                "Physical mode assignment requires both tangential displacement arrays."
+            )
+        reference_tangential = np.asarray(reference_tangential, dtype=np.complex128)
+        candidate_tangential = np.asarray(candidate_tangential, dtype=np.complex128)
+        reference_action = _physical_metric_action(
+            reference_vectors,
+            reference_tangential,
+            weights,
+            physical_metric,
         )
-        denominator = reference_norm[row] * candidate_norm[columns]
-        overlaps[row, columns] = np.divide(
-            numerator,
-            denominator,
-            out=np.zeros(columns.size, dtype=float),
-            where=denominator > np.finfo(float).tiny,
+        reference_norm_squared = np.real(
+            np.einsum(
+                "mqk,mqk->m",
+                reference_vectors.conjugate(),
+                reference_action[0],
+                optimize=True,
+            )
+            + np.einsum(
+                "mqk,mqk->m",
+                reference_tangential.conjugate(),
+                reference_action[1],
+                optimize=True,
+            )
         )
+        del reference_action
+        candidate_action = _physical_metric_action(
+            candidate_vectors,
+            candidate_tangential,
+            weights,
+            physical_metric,
+        )
+        candidate_norm_squared = np.real(
+            np.einsum(
+                "mqk,mqk->m",
+                candidate_vectors.conjugate(),
+                candidate_action[0],
+                optimize=True,
+            )
+            + np.einsum(
+                "mqk,mqk->m",
+                candidate_tangential.conjugate(),
+                candidate_action[1],
+                optimize=True,
+            )
+        )
+        for row in range(nreference):
+            columns = np.flatnonzero(allowed[row])
+            if columns.size == 0:
+                continue
+            pair_inner = np.einsum(
+                "qk,cqk->c",
+                reference_vectors[row].conjugate(),
+                candidate_action[0][columns],
+                optimize=True,
+            )
+            pair_inner += np.einsum(
+                "qk,cqk->c",
+                reference_tangential[row].conjugate(),
+                candidate_action[1][columns],
+                optimize=True,
+            )
+            denominator = np.sqrt(
+                max(reference_norm_squared[row], 0.0)
+                * np.maximum(candidate_norm_squared[columns], 0.0)
+            )
+            overlaps[row, columns] = np.divide(
+                np.abs(pair_inner),
+                denominator,
+                out=np.zeros(columns.size, dtype=float),
+                where=denominator > np.finfo(float).tiny,
+            )
+    else:
+        flattened_reference = reference_vectors.reshape(nreference, -1)
+        flattened_candidate = candidate_vectors.reshape(ncandidate, -1)
+        repeated_weights = np.repeat(
+            np.asarray(weights, dtype=float),
+            reference_vectors.shape[2],
+        )
+        reference_norm = np.sqrt(
+            np.sum(repeated_weights[None, :] * np.abs(flattened_reference) ** 2, axis=1)
+        )
+        candidate_norm = np.sqrt(
+            np.sum(repeated_weights[None, :] * np.abs(flattened_candidate) ** 2, axis=1)
+        )
+        for row in range(nreference):
+            columns = np.flatnonzero(allowed[row])
+            if columns.size == 0 or reference_norm[row] <= np.finfo(float).tiny:
+                continue
+            numerator = np.abs(
+                (flattened_reference[row].conjugate() * repeated_weights)
+                @ flattened_candidate[columns].T
+            )
+            denominator = reference_norm[row] * candidate_norm[columns]
+            overlaps[row, columns] = np.divide(
+                numerator,
+                denominator,
+                out=np.zeros(columns.size, dtype=float),
+                where=denominator > np.finfo(float).tiny,
+            )
     overlaps = np.clip(overlaps, 0.0, 1.0)
     size = nreference + ncandidate
     unmatched = float(size + 2)
@@ -594,11 +1165,21 @@ def cluster_aware_mode_assignment(
         candidate_dimension[pair] = component_columns.size
         dimension_ambiguous[pair] = component_rows.size != component_columns.size
         if component_rows.size > 1 or component_columns.size > 1:
-            cosines = weighted_principal_angle_cosines(
-                reference_vectors[component_rows],
-                candidate_vectors[component_columns],
-                weights,
-            )
+            if use_physical:
+                cosines = physical_principal_angle_cosines(
+                    reference_vectors[component_rows],
+                    reference_tangential[component_rows],
+                    candidate_vectors[component_columns],
+                    candidate_tangential[component_columns],
+                    weights,
+                    physical_metric,
+                )
+            else:
+                cosines = weighted_principal_angle_cosines(
+                    reference_vectors[component_rows],
+                    candidate_vectors[component_columns],
+                    weights,
+                )
             summary = principal_cosine_summary(cosines)
             minimum[pair] = summary["minimum"]
             mean[pair] = summary["mean"]
@@ -1454,11 +2035,18 @@ def classify_tracks_evidence_v2(
             tracks, "cluster_min_principal_cosine", track, nlevels
         ).astype(float)
         chosen_overlap = cluster_overlap[final] if np.isfinite(cluster_overlap[final]) else individual_overlap[final]
-        overlap_metric[track] = (
-            "xi_psi_proxy_subspace"
-            if np.isfinite(cluster_overlap[final])
-            else "xi_psi_proxy"
-        )
+        if "overlap_metric" in tracks:
+            stored_metric = str(tracks["overlap_metric"].values[track, final])
+            overlap_metric[track] = (
+                stored_metric if stored_metric and stored_metric != "unknown" else "unknown"
+            )
+        else:
+            overlap_metric[track] = str(
+                tracks.attrs.get(
+                    "overlap_metric",
+                    "xi_psi_proxy" if np.isfinite(chosen_overlap) else "unknown",
+                )
+            )
         floats["fine_frequency_change"][track] = frequency_change[final]
         floats["medium_fine_overlap"][track] = chosen_overlap
         frequency_converged = (
@@ -1854,6 +2442,7 @@ __all__ = [
     "EVIDENCE_LABELS",
     "EvidenceV2Config",
     "MeshPerturbationOptions",
+    "PhysicalDisplacementMetric",
     "REACQUISITION_STATUSES",
     "ReacquisitionOptions",
     "VERIFICATION_LEVELS",
@@ -1870,6 +2459,11 @@ __all__ = [
     "mesh_perturbation_evidence",
     "migrate_legacy_mode_dataset",
     "principal_cosine_summary",
+    "physical_displacement_cross_gram",
+    "physical_displacement_overlaps",
+    "physical_displacement_pair_inner_products",
+    "physical_displacement_paired_overlaps",
+    "physical_principal_angle_cosines",
     "radial_power_diagnostics",
     "refinement_scaling_evidence",
     "resonance_power_evidence",

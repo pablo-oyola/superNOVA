@@ -29,6 +29,7 @@ from .solver5_multigrid_evidence import (
     EVIDENCE_LABELS,
     EvidenceV2Config,
     MeshPerturbationOptions,
+    PhysicalDisplacementMetric,
     ReacquisitionOptions,
     aggregate_catalog_status,
     classify_tracks_evidence_v2,
@@ -38,6 +39,8 @@ from .solver5_multigrid_evidence import (
     empirical_candidate_stability,
     fixed_coarse_space_retention,
     mixed_space_prolongation,
+    physical_displacement_paired_overlaps,
+    physical_principal_angle_cosines,
     radial_power_diagnostics,
     select_reacquisition_candidates,
     weighted_principal_angle_cosines,
@@ -310,6 +313,121 @@ def _nested_bspline_levels(
     return tuple(output)
 
 
+def build_resolved_kinetic_energy_metric(
+    solver,
+    points: np.ndarray,
+    m_pol: np.ndarray,
+    *,
+    max_delta_m: int | None = None,
+) -> PhysicalDisplacementMetric:
+    r"""Build the resolved perpendicular kinetic-energy matching metric.
+
+    The Cheng--Chance displacement components are orthogonal, giving the
+    geometry factors ``sqrt(g)/g^{psi psi}`` for ``xi^psi`` and
+    ``sqrt(g)*g^{psi psi}/B^2`` for ``xi^s``.  In Boozer coordinates these are
+    ``h/(B^2*g^{psi psi})`` and the continuum profile ``J`` respectively.
+    The solver's normalized mass density supplies the radial kinetic weight.
+    """
+    points = np.asarray(points, dtype=float)
+    m_pol = np.asarray(m_pol)
+    if points.ndim != 1 or points.size == 0 or np.any(np.diff(points) <= 0.0):
+        raise ValueError("Metric points must be a strictly increasing array.")
+    if m_pol.ndim != 1 or m_pol.size == 0 or np.unique(m_pol).size != m_pol.size:
+        raise ValueError("Metric m_pol must contain unique mode numbers.")
+    maximum_difference = int(np.max(np.abs(m_pol[:, None] - m_pol[None, :])))
+    if max_delta_m is None:
+        max_delta_m = maximum_difference
+    max_delta_m = int(max_delta_m)
+    if max_delta_m < 0:
+        raise ValueError("max_delta_m must be non-negative.")
+    max_delta_m = min(max_delta_m, maximum_difference)
+
+    radial_profile = solver.equ("h/(B0**2*gpsi_psi)", normalize=True)
+    radial_data = radial_profile.data.interp(x=points)
+    tangential_data = solver.J.data.interp(x=points)
+
+    def harmonics(data) -> np.ndarray:
+        values = data.reindex(
+            mpol=np.arange(max_delta_m + 1, dtype=np.int32),
+            ntor=np.asarray([0], dtype=np.int32),
+            fill_value=0.0 + 0.0j,
+        ).transpose("x", "mpol", "ntor")
+        return np.ascontiguousarray(values.values[:, :, 0], dtype=np.complex128)
+
+    radial = harmonics(radial_data)
+    tangential = harmonics(tangential_data)
+    orientation_samples = np.concatenate(
+        (
+            radial[:, 0].real[np.isfinite(radial[:, 0].real)],
+            tangential[:, 0].real[np.isfinite(tangential[:, 0].real)],
+        )
+    )
+    orientation = float(np.sign(np.median(orientation_samples)))
+    if orientation == 0.0 or not np.isfinite(orientation):
+        raise ValueError("Could not determine the Boozer-Jacobian orientation.")
+    radial *= orientation
+    tangential *= orientation
+    tolerance = 1.0e-10 * max(
+        1.0,
+        float(np.max(np.abs(radial[:, 0]))),
+        float(np.max(np.abs(tangential[:, 0]))),
+    )
+    if np.any(np.abs(radial[:, 0].imag) > tolerance) or np.any(
+        np.abs(tangential[:, 0].imag) > tolerance
+    ):
+        raise ValueError("Physical metric zero harmonics must be real.")
+    if np.any(radial[:, 0].real <= 0.0) or np.any(tangential[:, 0].real <= 0.0):
+        raise ValueError("Physical metric zero harmonics must be positive.")
+
+    def assert_positive_metric(harmonic_values: np.ndarray, name: str) -> None:
+        differences = m_pol[:, None] - m_pol[None, :]
+        absolute = np.abs(differences)
+        matrices = np.zeros(
+            (points.size, m_pol.size, m_pol.size),
+            dtype=np.complex128,
+        )
+        available = absolute <= max_delta_m
+        for row, column in zip(*np.nonzero(available)):
+            delta = int(differences[row, column])
+            coefficient = harmonic_values[:, abs(delta)]
+            if delta != 0:
+                coefficient = 0.5 * (
+                    coefficient if delta > 0 else coefficient.conjugate()
+                )
+            matrices[:, row, column] = coefficient
+        eigenvalues = np.linalg.eigvalsh(matrices)
+        scale = np.maximum(np.max(np.abs(eigenvalues), axis=1), 1.0)
+        invalid = eigenvalues[:, 0] < -1.0e-10 * scale
+        if np.any(invalid):
+            raise ValueError(
+                f"{name} physical metric is not positive semidefinite at "
+                f"{np.count_nonzero(invalid)} radial quadrature points; retain all "
+                "harmonic differences rather than applying the operator max_dm cutoff."
+            )
+
+    assert_positive_metric(radial, "radial")
+    assert_positive_metric(tangential, "tangential")
+
+    density_data = solver.density.data.interp(x=points).reindex(
+        mpol=np.asarray([0], dtype=np.int32),
+        ntor=np.asarray([0], dtype=np.int32),
+        fill_value=np.nan,
+    ).transpose("x", "mpol", "ntor")
+    density_complex = np.asarray(density_data.values[:, 0, 0], dtype=np.complex128)
+    density_tolerance = 1.0e-12 * np.maximum(1.0, np.abs(density_complex.real))
+    if np.any(np.abs(density_complex.imag) > density_tolerance):
+        raise ValueError("Mass density must be real for the kinetic-energy metric.")
+    mass_amu = float(solver.cont.mass.to("amu").v)
+    mass_density = density_complex.real * mass_amu
+    return PhysicalDisplacementMetric(
+        points=points,
+        m_pol=m_pol,
+        mass_density=mass_density,
+        radial_geometry_harmonics=radial,
+        tangential_geometry_harmonics=tangential,
+    )
+
+
 def _relative_complex_distance(left, right) -> np.ndarray:
     """Symmetric relative distance appropriate for small complex ``s`` roots."""
     left = np.asarray(left, dtype=np.complex128)
@@ -361,6 +479,8 @@ def _deduplicate_window_dataset(
     *,
     relative_s: float,
     minimum_overlap: float,
+    physical_metric: PhysicalDisplacementMetric | None = None,
+    tangential_fields: np.ndarray | None = None,
 ) -> xr.Dataset:
     """Deduplicate only cross-window roots meeting both spectral/shape gates."""
     size = dataset.sizes.get("eigenpair", 0)
@@ -369,6 +489,19 @@ def _deduplicate_window_dataset(
     roots = np.asarray(dataset["s"].values, dtype=np.complex128)
     windows = np.asarray(dataset["window_id"].values, dtype=np.int64)
     fields = np.asarray(dataset["xi_psi"].values, dtype=np.complex128)
+    if tangential_fields is not None:
+        tangential = np.asarray(tangential_fields, dtype=np.complex128)
+        if tangential.shape != fields.shape:
+            raise ValueError("tangential_fields must match the reconstructed xi_psi array.")
+    else:
+        tangential = (
+            np.asarray(dataset["xi_s"].values, dtype=np.complex128)
+            if physical_metric is not None and "xi_s" in dataset
+            else None
+        )
+    if tangential is not None and physical_metric is None:
+        raise ValueError("tangential_fields require a physical_metric.")
+    use_physical = tangential is not None and physical_metric is not None
     quality = _best_error(dataset)
     core_owned = (
         np.asarray(dataset["core_owned"].values, dtype=bool)
@@ -415,11 +548,21 @@ def _deduplicate_window_dataset(
             duplicate_basis = False
             for retained in retained_groups:
                 if indices.size == retained.size:
-                    cosines = weighted_principal_angle_cosines(
-                        fields[retained],
-                        fields[indices],
-                        weights,
-                    )
+                    if use_physical:
+                        cosines = physical_principal_angle_cosines(
+                            fields[retained],
+                            tangential[retained],
+                            fields[indices],
+                            tangential[indices],
+                            weights,
+                            physical_metric,
+                        )
+                    else:
+                        cosines = weighted_principal_angle_cosines(
+                            fields[retained],
+                            fields[indices],
+                            weights,
+                        )
                     if (
                         cosines.size == indices.size
                         and np.min(cosines) >= minimum_overlap
@@ -432,14 +575,22 @@ def _deduplicate_window_dataset(
                     individual_duplicate = False
                     for retained in retained_groups:
                         for retained_index in retained:
-                            if (
-                                _weighted_xi_overlap(
+                            if use_physical:
+                                overlap = physical_displacement_paired_overlaps(
+                                    fields[index : index + 1],
+                                    tangential[index : index + 1],
+                                    fields[retained_index : retained_index + 1],
+                                    tangential[retained_index : retained_index + 1],
+                                    weights,
+                                    physical_metric,
+                                )[0]
+                            else:
+                                overlap = _weighted_xi_overlap(
                                     fields[index],
                                     fields[retained_index],
                                     weights,
                                 )
-                                >= minimum_overlap
-                            ):
+                            if overlap >= minimum_overlap:
                                 individual_duplicate = True
                                 break
                         if individual_duplicate:
@@ -454,9 +605,15 @@ def _deduplicate_window_dataset(
     if keep_array.size:
         omega = np.asarray(dataset["omega"].values)[keep_array]
         keep_array = keep_array[np.argsort(omega.real)]
-    return dataset.isel(eigenpair=keep_array).assign_coords(
+    output = dataset.isel(eigenpair=keep_array).assign_coords(
         eigenpair=np.arange(keep_array.size, dtype=np.int64)
     )
+    output.attrs.update(
+        dedup_overlap_metric=(
+            physical_metric.metric_name if use_physical else "xi_psi_proxy"
+        )
+    )
+    return output
 
 
 def _maximum_cardinality_overlap_assignment(
@@ -570,11 +727,34 @@ def _shape_metrics(
     return peak, width, ipr
 
 
+def _reconstruct_tangential_displacement(
+    dataset: xr.Dataset,
+    mixed: MixedRadialData | None,
+) -> np.ndarray | None:
+    """Reconstruct ``xi_s`` on the shared quadrature, or report unavailable."""
+    if "xi_s" in dataset:
+        return np.asarray(dataset["xi_s"].values, dtype=np.complex128)
+    if mixed is None or "xi_s_coefficient" not in dataset:
+        return None
+    coefficients = np.asarray(
+        dataset["xi_s_coefficient"].values,
+        dtype=np.complex128,
+    )
+    return np.einsum(
+        "qd,edm->eqm",
+        np.asarray(mixed.phi_low_q, dtype=float),
+        coefficients,
+        optimize=True,
+    )
+
+
 def _track_level_solutions(
     level_solutions: tuple[xr.Dataset, ...],
     weights: np.ndarray,
     thresholds: ModeClassificationThresholds,
     radial_levels: tuple[BSplineFE, ...] | None = None,
+    mixed_levels: tuple[MixedRadialData, ...] | None = None,
+    physical_metric: PhysicalDisplacementMetric | None = None,
 ) -> xr.Dataset:
     """Build adjacent-level chains with cluster-aware eigenspace matching."""
     nlevels = len(level_solutions)
@@ -587,6 +767,13 @@ def _track_level_solutions(
             raise ValueError("All levels must use the identical master psi grid.")
         if not np.array_equal(dataset.coords["m_pol"].values, m_pol):
             raise ValueError("All levels must use the identical harmonic contract.")
+    if mixed_levels is not None and len(mixed_levels) != nlevels:
+        raise ValueError("mixed_levels must match the number of level solutions.")
+    if physical_metric is not None:
+        if not np.array_equal(physical_metric.points, psi):
+            raise ValueError("Physical metric points do not match the master quadrature.")
+        if not np.array_equal(physical_metric.m_pol, m_pol):
+            raise ValueError("Physical metric harmonics do not match the level solutions.")
 
     tracks: list[list[int]] = [
         [index] + [-1] * (nlevels - 1)
@@ -601,6 +788,7 @@ def _track_level_solutions(
     transition_cluster_min: dict[tuple[int, int], float] = {}
     transition_cluster_mean: dict[tuple[int, int], float] = {}
     transition_cluster_rms: dict[tuple[int, int], float] = {}
+    transition_metric: dict[tuple[int, int], str] = {}
 
     for level in range(1, nlevels):
         reference_tracks = [
@@ -631,6 +819,21 @@ def _track_level_solutions(
             level_solutions[level]["xi_psi"].values,
             dtype=np.complex128,
         )
+        reference_tangential = None
+        candidate_tangential = None
+        transition_physical_metric = None
+        if physical_metric is not None:
+            reference_tangential_all = _reconstruct_tangential_displacement(
+                level_solutions[level - 1],
+                None if mixed_levels is None else mixed_levels[level - 1],
+            )
+            candidate_tangential = _reconstruct_tangential_displacement(
+                level_solutions[level],
+                None if mixed_levels is None else mixed_levels[level],
+            )
+            if reference_tangential_all is not None and candidate_tangential is not None:
+                reference_tangential = reference_tangential_all[reference_indices]
+                transition_physical_metric = physical_metric
         assignment = cluster_aware_mode_assignment(
             reference_omega.real,
             candidate_omega.real,
@@ -639,6 +842,14 @@ def _track_level_solutions(
             weights,
             frequency_gate=thresholds.frequency_gate,
             tie_delta=thresholds.assignment_ambiguity,
+            reference_tangential=reference_tangential,
+            candidate_tangential=candidate_tangential,
+            physical_metric=transition_physical_metric,
+        )
+        metric_name = (
+            physical_metric.metric_name
+            if transition_physical_metric is not None
+            else "xi_psi_proxy"
         )
         rows = assignment["rows"]
         columns = assignment["columns"]
@@ -681,6 +892,7 @@ def _track_level_solutions(
             transition_cluster_rms[(track_index, level)] = float(
                 assignment["cluster_rms_cosine"][pair]
             )
+            transition_metric[(track_index, level)] = metric_name
 
         for candidate_index in candidate_indices:
             candidate_index = int(candidate_index)
@@ -719,6 +931,7 @@ def _track_level_solutions(
     cluster_min = np.full((ntracks, nlevels), np.nan)
     cluster_mean = np.full((ntracks, nlevels), np.nan)
     cluster_rms = np.full((ntracks, nlevels), np.nan)
+    overlap_metric = np.full((ntracks, nlevels), "unknown", dtype="U32")
     cluster_dimension_ambiguous = np.zeros((ntracks, nlevels), dtype=bool)
     reacquisition_status = np.full(
         (ntracks, nlevels), "not_attempted", dtype="U48"
@@ -808,6 +1021,9 @@ def _track_level_solutions(
             cluster_rms[track_index, level] = transition_cluster_rms.get(
                 (track_index, level), np.nan
             )
+            overlap_metric[track_index, level] = transition_metric.get(
+                (track_index, level), "unknown"
+            )
             cluster_dimension_ambiguous[track_index, level] = ambiguous[
                 track_index, level
             ]
@@ -839,6 +1055,7 @@ def _track_level_solutions(
             "cluster_min_principal_cosine": (("track", "level"), cluster_min),
             "cluster_mean_principal_cosine": (("track", "level"), cluster_mean),
             "cluster_rms_principal_cosine": (("track", "level"), cluster_rms),
+            "overlap_metric": (("track", "level"), overlap_metric),
             "cluster_dimension_ambiguous": (
                 ("track", "level"),
                 cluster_dimension_ambiguous,
@@ -871,9 +1088,21 @@ def _track_level_solutions(
         attrs={
             "frequency_gate": thresholds.frequency_gate,
             "overlap_measure": (
-                "phase-invariant harmonic-resolved composite-Gauss dpsi L2"
+                physical_metric.definition
+                if physical_metric is not None
+                else "phase-invariant harmonic-resolved composite-Gauss dpsi L2"
             ),
-            "overlap_metric": "xi_psi_proxy",
+            "overlap_metric": (
+                physical_metric.metric_name
+                if physical_metric is not None
+                else "xi_psi_proxy"
+            ),
+            "overlap_metric_fallback": "xi_psi_proxy",
+            "parallel_displacement_in_overlap": (
+                bool(physical_metric.parallel_component_included)
+                if physical_metric is not None
+                else False
+            ),
             "power_density_metric": "xi_psi_proxy",
             "ipr_convention": "integral(P^2)dpsi/(integral(P)dpsi)^2",
             "assignment_priority": (
@@ -2252,6 +2481,7 @@ class superSolver5Multigrid:
         bc_tol: float | None,
         verbose: bool,
         candidate_mask: np.ndarray | None = None,
+        physical_metric: PhysicalDisplacementMetric | None = None,
     ) -> tuple[xr.Dataset, list[_WindowRecord]]:
         """Selectively continue global candidates missing on an adjacent mesh."""
         if not options.enabled or self.levels < 2:
@@ -2516,12 +2746,19 @@ class superSolver5Multigrid:
                     self.master_weights,
                     relative_s=search.dedup_relative_s,
                     minimum_overlap=search.dedup_overlap,
+                    physical_metric=physical_metric,
+                    tangential_fields=_reconstruct_tangential_displacement(
+                        level_solutions[level],
+                        self.mixed_levels[level],
+                    ) if physical_metric is not None else None,
                 )
                 tracks = _track_level_solutions(
                     tuple(level_solutions),
                     self.master_weights,
                     thresholds,
                     radial_levels=self.radial_levels,
+                    mixed_levels=self.mixed_levels,
+                    physical_metric=physical_metric,
                 )
 
         if negative_status:
@@ -2586,6 +2823,16 @@ class superSolver5Multigrid:
             mmax=mmax,
             max_dm=max_dm,
         )
+        physical_metric = None
+        physical_metric_fallback_reason = "none"
+        try:
+            physical_metric = build_resolved_kinetic_energy_metric(
+                self.solver,
+                self.master_points,
+                np.asarray(sb.m_range),
+            )
+        except (FloatingPointError, ValueError) as error:
+            physical_metric_fallback_reason = f"{type(error).__name__}: {error}"
         local_split = _build_local_M_split(sb, regularizer=regularizer)
         projected = tuple(
             self.solver._assemble_split_matrices_from_local(
@@ -2661,6 +2908,11 @@ class superSolver5Multigrid:
             self.master_weights,
             thresholds,
             radial_levels=getattr(self, "radial_levels", None),
+            mixed_levels=getattr(self, "mixed_levels", None),
+            physical_metric=physical_metric,
+        )
+        tracks.attrs["overlap_metric_fallback_reason"] = (
+            physical_metric_fallback_reason
         )
         if reacquisition_options is not None:
             tracks, reacquisition_records = self._reacquire_missing_roots(
@@ -2673,6 +2925,7 @@ class superSolver5Multigrid:
                 options=reacquisition_options,
                 bc_tol=bc_tol,
                 verbose=verbose,
+                physical_metric=physical_metric,
             )
             records.extend(reacquisition_records)
             level_tuple = tuple(level_solutions)
@@ -2723,6 +2976,14 @@ class superSolver5Multigrid:
                 "run_catalog_status": aggregate_catalog_status(level_catalog_status),
                 "classification_version": str(classification_version),
                 "reacquisition": repr(reacquisition_options),
+                "overlap_metric": (
+                    physical_metric.metric_name
+                    if physical_metric is not None
+                    else "xi_psi_proxy"
+                ),
+                "overlap_metric_fallback_reason": (
+                    physical_metric_fallback_reason
+                ),
                 "spectrum_slicing_applicable": False,
                 "spectrum_slicing_reason": (
                     "solver5 currently declares a GENERAL quadratic PEP; "
@@ -2745,5 +3006,6 @@ __all__ = [
     "ModeClassificationThresholds",
     "MultigridPEPResult",
     "MultigridSearchOptions",
+    "build_resolved_kinetic_energy_metric",
     "superSolver5Multigrid",
 ]

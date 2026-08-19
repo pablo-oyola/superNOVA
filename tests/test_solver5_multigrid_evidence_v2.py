@@ -1,5 +1,10 @@
 """PETSc-free regression tests for the evidence-v2 mode pipeline."""
 
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -7,11 +12,15 @@ import xarray as xr
 from supernova.core.solver5_multigrid_evidence import (
     EvidenceV2Config,
     MeshPerturbationOptions,
+    PhysicalDisplacementMetric,
     aggregate_catalog_status,
     bspline_prolongation_matrix,
     classify_tracks_evidence_v2,
     deterministic_shifted_bspline,
     migrate_legacy_mode_dataset,
+    physical_displacement_cross_gram,
+    physical_displacement_paired_overlaps,
+    physical_principal_angle_cosines,
     refinement_scaling_evidence,
     weighted_principal_angle_cosines,
     window_catalog_status,
@@ -22,6 +31,7 @@ from supernova.core.solver5_multigrid import (
     _track_level_solutions,
 )
 from supernova.radial import BSplineFE
+from supernova.core.solver4 import _build_mixed_radial_data
 
 
 def _continuum(values, *, ambiguous=None):
@@ -122,6 +132,133 @@ def test_rotated_degenerate_eigenspace_has_unit_principal_cosines():
     np.testing.assert_allclose(cosines, np.ones(2), atol=1.0e-12)
 
 
+def _physical_metric(points, m_pol, *, radial=2.0, tangential=3.0):
+    points = np.asarray(points, dtype=float)
+    return PhysicalDisplacementMetric(
+        points=points,
+        m_pol=np.asarray(m_pol),
+        mass_density=np.linspace(1.0, 2.0, points.size),
+        radial_geometry_harmonics=np.full((points.size, 1), radial, dtype=complex),
+        tangential_geometry_harmonics=np.full(
+            (points.size, 1), tangential, dtype=complex
+        ),
+    )
+
+
+def test_physical_overlap_is_normalized_and_phase_invariant():
+    points = np.asarray([0.2, 0.7])
+    weights = np.asarray([0.4, 0.6])
+    metric = _physical_metric(points, [3, 4])
+    radial = np.asarray([[[1.0, 2.0j], [0.5, -1.0]]], dtype=complex)
+    tangential = np.asarray([[[0.2j, 1.0], [2.0, -0.4j]]], dtype=complex)
+    phase = 1.7 * np.exp(0.63j)
+    overlap = physical_displacement_paired_overlaps(
+        radial,
+        tangential,
+        phase * radial,
+        phase * tangential,
+        weights,
+        metric,
+    )
+    np.testing.assert_allclose(overlap, [1.0], atol=2.0e-14)
+
+
+def test_physical_cross_gram_includes_nonzero_geometry_harmonics():
+    points = np.asarray([0.2, 0.7])
+    modes = np.asarray([3, 4])
+    density = np.asarray([1.1, 1.7])
+    weights = np.asarray([0.4, 0.6])
+    radial_harmonics = np.asarray(
+        [[2.0, 0.4 + 0.2j], [2.3, -0.3 + 0.1j]],
+        dtype=complex,
+    )
+    tangential_harmonics = np.asarray(
+        [[3.0, -0.2 + 0.3j], [2.7, 0.25 - 0.15j]],
+        dtype=complex,
+    )
+    metric = PhysicalDisplacementMetric(
+        points=points,
+        m_pol=modes,
+        mass_density=density,
+        radial_geometry_harmonics=radial_harmonics,
+        tangential_geometry_harmonics=tangential_harmonics,
+    )
+    left_radial = np.asarray(
+        [[[1.0, 0.2j], [0.4, -0.5]], [[-0.3j, 0.7], [0.6j, 0.1]]]
+    )
+    left_tangential = 0.7 * left_radial + (0.1 - 0.2j)
+    right_radial = np.asarray(
+        [
+            [[0.2, 0.8j], [-0.4j, 0.3]],
+            [[1.1j, -0.2], [0.5, 0.4j]],
+            [[-0.6, 0.1j], [0.2j, -0.9]],
+        ]
+    )
+    right_tangential = -0.4j * right_radial + 0.3
+
+    actual = physical_displacement_cross_gram(
+        left_radial,
+        left_tangential,
+        right_radial,
+        right_tangential,
+        weights,
+        metric,
+    )
+
+    expected = np.zeros((left_radial.shape[0], right_radial.shape[0]), complex)
+    for point in range(points.size):
+        radial_matrix = np.asarray(
+            [
+                [radial_harmonics[point, 0], 0.5 * radial_harmonics[point, 1].conjugate()],
+                [0.5 * radial_harmonics[point, 1], radial_harmonics[point, 0]],
+            ]
+        )
+        tangential_matrix = np.asarray(
+            [
+                [
+                    tangential_harmonics[point, 0],
+                    0.5 * tangential_harmonics[point, 1].conjugate(),
+                ],
+                [
+                    0.5 * tangential_harmonics[point, 1],
+                    tangential_harmonics[point, 0],
+                ],
+            ]
+        )
+        expected += weights[point] * density[point] * (
+            left_radial[:, point].conjugate()
+            @ radial_matrix
+            @ right_radial[:, point].T
+            + left_tangential[:, point].conjugate()
+            @ tangential_matrix
+            @ right_tangential[:, point].T
+        )
+    np.testing.assert_allclose(actual, expected, atol=2.0e-14)
+
+
+def test_physical_principal_angles_accept_rotated_degenerate_subspace():
+    points = np.linspace(0.05, 0.95, 11)
+    metric = _physical_metric(points, [7])
+    radial = np.stack((np.sin(np.pi * points), np.sin(2.0 * np.pi * points)))[
+        :, :, None
+    ]
+    tangential = np.stack((np.cos(np.pi * points), np.cos(2.0 * np.pi * points)))[
+        :, :, None
+    ]
+    rotation = np.asarray([[1.0, 1.0], [-1.0, 1.0]]) / np.sqrt(2.0)
+    fine_radial = np.einsum("ij,jpk->ipk", rotation, radial)
+    fine_tangential = np.einsum("ij,jpk->ipk", rotation, tangential)
+    cosines = physical_principal_angle_cosines(
+        radial,
+        tangential,
+        fine_radial,
+        fine_tangential,
+        np.ones(points.size),
+        metric,
+    )
+    np.testing.assert_allclose(cosines, np.ones(2), atol=2.0e-12)
+
+
 def test_rotated_degenerate_cluster_tracks_by_subspace_not_individual_vectors():
     psi = np.linspace(0.0, 1.0, 17)
     basis = np.stack((np.sin(np.pi * psi), np.sin(2.0 * np.pi * psi)))[:, :, None]
@@ -180,6 +317,80 @@ def test_exact_knot_insertion_prolongation_preserves_coarse_field():
     coarse_field = coarse.eval_basis(points).T @ coefficient
     fine_field = fine.eval_basis(points).T @ (transfer @ coefficient)
     np.testing.assert_allclose(fine_field, coarse_field, atol=2.0e-13)
+
+
+def test_nested_tracking_uses_physical_metric_and_has_explicit_proxy_fallback():
+    order = 3
+    base = BSplineFE(
+        knots=np.concatenate(
+            (np.repeat(0.0, order), [0.45], np.repeat(1.0, order))
+        ),
+        order=order,
+        domain=(0.0, 1.0),
+        quad_order=4,
+        build_matrices=False,
+    )
+    coarse, fine = _nested_bspline_levels(base, levels=2)
+    points, weights = fine.get_quadrature_points()
+    mixed = tuple(
+        _build_mixed_radial_data(level, points, weights)
+        for level in (coarse, fine)
+    )
+    high_coarse = np.linspace(0.2, 1.0, coarse.dofs)
+    low_coarse = np.linspace(-0.4, 0.7, mixed[0].pair.low.dofs)
+    high_fine = bspline_prolongation_matrix(coarse, fine) @ high_coarse
+    low_fine = (
+        bspline_prolongation_matrix(mixed[0].pair.low, mixed[1].pair.low)
+        @ low_coarse
+    )
+
+    def level(index, high, low, radial, phase=1.0):
+        xi_psi = phase * (radial.eval_basis(points).T @ high)[:, None]
+        return xr.Dataset(
+            {
+                "s": ("eigenpair", np.asarray([(1.0 + 1.0e-4 * index) ** 2], complex)),
+                "omega": ("eigenpair", np.asarray([1.0 + 1.0e-4 * index], complex)),
+                "xi_psi": (("eigenpair", "psi", "m_pol"), xi_psi[None, :, :]),
+                "xi_s_coefficient": (
+                    ("eigenpair", "radial_dof_low", "m_pol"),
+                    (phase * low)[None, :, None],
+                ),
+                "slepc_backward_error": ("eigenpair", [1.0e-12]),
+            },
+            coords={
+                "eigenpair": [0],
+                "psi": points,
+                "m_pol": [8],
+                "radial_dof_low": np.arange(low.size),
+            },
+        )
+
+    levels = (
+        level(1, high_coarse, low_coarse, coarse),
+        level(0, high_fine, low_fine, fine, phase=np.exp(0.51j)),
+    )
+    metric = _physical_metric(points, [8])
+    tracks = _track_level_solutions(
+        levels,
+        weights,
+        ModeClassificationThresholds(),
+        radial_levels=(coarse, fine),
+        mixed_levels=mixed,
+        physical_metric=metric,
+    )
+    assert tracks["overlap_metric"].values[0, 1] == "kinetic_energy"
+    np.testing.assert_allclose(tracks["xi_psi_overlap"].values[0, 1], 1.0, atol=2.0e-12)
+
+    proxy_levels = tuple(dataset.drop_vars("xi_s_coefficient") for dataset in levels)
+    fallback = _track_level_solutions(
+        proxy_levels,
+        weights,
+        ModeClassificationThresholds(),
+        radial_levels=(coarse, fine),
+        mixed_levels=mixed,
+        physical_metric=metric,
+    )
+    assert fallback["overlap_metric"].values[0, 1] == "xi_psi_proxy"
 
 
 def test_deterministic_shifted_mesh_preserves_topology_and_records_seed():
@@ -385,3 +596,46 @@ def test_legacy_serialized_mode_schema_can_be_migrated_and_reclassified():
     )
     assert result.attrs["classification_version"] == "evidence_v2"
     assert result["label"].item() == "physical_gap"
+
+
+def test_explorer_prefers_validated_full_physical_artifacts():
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "no_sync"
+        / "window_solver_multigrid.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "window_solver_multigrid_test_module",
+        script_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with tempfile.TemporaryDirectory() as directory:
+        artifact_dir = Path(directory)
+        manifests = {
+            "manifest.json": "modes.nc",
+            "manifest_physical_evidence_v2.json": "modes_physical_evidence_v2.nc",
+            "manifest_physical_full_evidence_v2.json": (
+                "modes_physical_full_evidence_v2.nc"
+            ),
+        }
+        for manifest_name, modes_name in manifests.items():
+            (artifact_dir / manifest_name).write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "artifacts": {"modes": modes_name},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (artifact_dir / modes_name).touch()
+
+        manifest = module._load_manifest(artifact_dir)
+        assert manifest["artifacts"]["modes"] == (
+            "modes_physical_full_evidence_v2.nc"
+        )
+        assert module._mode_artifact_path(artifact_dir).name == (
+            "modes_physical_full_evidence_v2.nc"
+        )

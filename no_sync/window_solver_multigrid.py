@@ -496,6 +496,7 @@ def _reconstruct_modes_from_levels(
         "residual_norm",
         "backward_error",
         "xi_psi_overlap",
+        "overlap_metric",
         "frequency_change",
         "assignment_ambiguous",
         "cluster_id",
@@ -650,8 +651,19 @@ def _load_portable_dataset(path: Path, names: Iterable[str]) -> xr.Dataset:
     return dataset
 
 
-def _raw_level_paths(artifact_dir: Path, expected_levels: int) -> tuple[Path, ...]:
-    paths = tuple(artifact_dir / f"level_{level}.nc" for level in range(expected_levels))
+def _raw_level_paths(
+    artifact_dir: Path,
+    expected_levels: int,
+    *,
+    variant: str = "base",
+) -> tuple[Path, ...]:
+    if variant not in ("base", "reacquired"):
+        raise ValueError("raw level variant must be 'base' or 'reacquired'.")
+    suffix = "_reacquired" if variant == "reacquired" else ""
+    paths = tuple(
+        artifact_dir / f"level_{level}{suffix}.nc"
+        for level in range(expected_levels)
+    )
     missing = [path for path in paths if not path.is_file()]
     if missing:
         raise FileNotFoundError(
@@ -659,6 +671,104 @@ def _raw_level_paths(artifact_dir: Path, expected_levels: int) -> tuple[Path, ..
             + ", ".join(str(path) for path in missing)
         )
     return paths
+
+
+def _physical_metric_path(artifact_dir: Path) -> Path:
+    return Path(artifact_dir) / "physical_overlap_metric_full.nc"
+
+
+def _load_physical_overlap_metric(path: Path):
+    from supernova.core.solver5_multigrid_evidence import PhysicalDisplacementMetric
+
+    dataset = _load_portable_dataset(
+        path,
+        (
+            "mass_density",
+            "radial_geometry_harmonic",
+            "tangential_geometry_harmonic",
+        ),
+    )
+    with xr.open_dataset(path, engine="netcdf4") as source:
+        dataset = dataset.assign_coords(
+            m_pol=np.asarray(source.coords["m_pol"].values),
+        )
+        dataset.attrs.update(source.attrs)
+    return PhysicalDisplacementMetric.from_dataset(dataset)
+
+
+def _build_physical_overlap_metric(
+    artifact_dir: Path,
+    manifest: Mapping[str, object],
+    level_paths: tuple[Path, ...],
+):
+    """Build and cache the resolved kinetic metric without invoking SLEPc."""
+    import supernova as sn
+    from supernova.core.solver5_multigrid import (
+        build_resolved_kinetic_energy_metric,
+    )
+
+    configuration = dict(manifest.get("configuration", {}))
+    with xr.open_dataset(level_paths[0], engine="netcdf4") as source:
+        m_pol = np.asarray(source.coords["m_pol"].values)
+    case_args = argparse.Namespace(
+        equilibrium=Path(configuration["equilibrium"]),
+        density=Path(configuration["density"]),
+        cocos_in=int(configuration["cocos_in"]),
+        profile_points=int(configuration["profile_points"]),
+        gamma_s=float(configuration["gamma_s"]),
+        species=str(configuration["species"]),
+    )
+    equilibrium, continuum_solver = _load_case(case_args)
+    multigrid = sn.superSolver5Multigrid(
+        equilibrium,
+        continuum_solver,
+        _base_spline(
+            int(configuration["base_spans"]),
+            int(configuration["order"]),
+            int(configuration["quadrature_order"]),
+        ),
+        levels=int(configuration["levels"]),
+    )
+    metric = build_resolved_kinetic_energy_metric(
+        multigrid.solver,
+        multigrid.master_points,
+        m_pol,
+    )
+    dataset = metric.to_dataset()
+    dataset.attrs.update(
+        source_equilibrium=str(Path(configuration["equilibrium"]).resolve()),
+        source_density=str(Path(configuration["density"]).resolve()),
+        gamma_s=float(configuration["gamma_s"]),
+        species=str(configuration["species"]),
+        angular_harmonic_cutoff=int(metric.max_delta_m),
+        harmonic_cutoff_basis=(
+            "all harmonic differences required by the retained displacement space; "
+            "operator max_dm is not applied to a positive inner product"
+        ),
+        slepc_was_run=False,
+    )
+    path = _physical_metric_path(artifact_dir)
+    _write_dataset(dataset, path)
+    return metric, path
+
+
+def _load_or_build_physical_overlap_metric(
+    artifact_dir: Path,
+    manifest: Mapping[str, object],
+    level_paths: tuple[Path, ...],
+):
+    path = _physical_metric_path(artifact_dir)
+    if path.is_file():
+        return _load_physical_overlap_metric(path), path, False, None
+    try:
+        metric, path = _build_physical_overlap_metric(
+            artifact_dir,
+            manifest,
+            level_paths,
+        )
+    except (KeyError, FileNotFoundError, OSError, ValueError) as error:
+        return None, None, False, f"{type(error).__name__}: {error}"
+    return metric, path, True, None
 
 
 def _load_raw_level(path: Path, *, include_eigenvector: bool = False) -> xr.Dataset:
@@ -679,6 +789,7 @@ def _load_raw_level(path: Path, *, include_eigenvector: bool = False) -> xr.Data
         "p1_coefficient",
         "xi_s_coefficient",
         "div_xi_coefficient",
+        "source_eigenpair",
     ]
     if include_eigenvector:
         fields.append("eigenvector")
@@ -690,10 +801,11 @@ def _load_raw_level(path: Path, *, include_eigenvector: bool = False) -> xr.Data
     if missing:
         raise ValueError(f"{path} is missing raw retracking variables: {missing}")
     count = dataset.sizes.get("eigenpair", 0)
-    dataset["source_eigenpair"] = (
-        "eigenpair",
-        np.asarray(dataset.coords["eigenpair"].values, dtype=np.int64),
-    )
+    if "source_eigenpair" not in dataset:
+        dataset["source_eigenpair"] = (
+            "eigenpair",
+            np.asarray(dataset.coords["eigenpair"].values, dtype=np.int64),
+        )
     dataset = dataset.assign_coords(eigenpair=np.arange(count, dtype=np.int64))
     return dataset
 
@@ -732,6 +844,8 @@ def _retrack_raw_levels(
     manifest: Mapping[str, object],
     *,
     include_eigenvectors: bool = False,
+    level_paths: tuple[Path, ...] | None = None,
+    physical_metric=None,
 ):
     """Rebuild nested spaces, deduplicate saved roots, and rematch all levels."""
     from supernova.core.solver4 import _build_mixed_radial_data
@@ -740,6 +854,7 @@ def _retrack_raw_levels(
         MultigridSearchOptions,
         _deduplicate_window_dataset,
         _nested_bspline_levels,
+        _reconstruct_tangential_displacement,
         _track_level_solutions,
     )
 
@@ -763,29 +878,48 @@ def _retrack_raw_levels(
     )
     search = MultigridSearchOptions()
     thresholds = ModeClassificationThresholds()
+    if level_paths is None:
+        level_paths = _raw_level_paths(
+            artifact_dir,
+            expected_levels=levels,
+            variant="base",
+        )
+    if len(level_paths) != levels:
+        raise ValueError("level_paths must match the manifest level count.")
     raw_levels = tuple(
         _load_raw_level(path, include_eigenvector=include_eigenvectors)
-        for path in _raw_level_paths(artifact_dir, expected_levels=levels)
+        for path in level_paths
     )
     for level, dataset in enumerate(raw_levels):
         if not np.array_equal(np.asarray(dataset.coords["psi"].values), points):
             raise ValueError(
                 f"level_{level}.nc psi grid does not match reconstructed finest quadrature"
             )
-    deduplicated = tuple(
-        _deduplicate_window_dataset(
-            dataset,
-            weights,
-            relative_s=search.dedup_relative_s,
-            minimum_overlap=search.dedup_overlap,
+    deduplicated = []
+    for level, dataset in enumerate(raw_levels):
+        tangential = (
+            _reconstruct_tangential_displacement(dataset, mixed_levels[level])
+            if physical_metric is not None
+            else None
         )
-        for dataset in raw_levels
-    )
+        deduplicated.append(
+            _deduplicate_window_dataset(
+                dataset,
+                weights,
+                relative_s=search.dedup_relative_s,
+                minimum_overlap=search.dedup_overlap,
+                physical_metric=physical_metric,
+                tangential_fields=tangential,
+            )
+        )
+    deduplicated = tuple(deduplicated)
     tracks = _track_level_solutions(
         deduplicated,
         weights,
         thresholds,
         radial_levels=radial_levels,
+        mixed_levels=mixed_levels,
+        physical_metric=physical_metric,
     )
     tracks = _attach_source_mode_indices(tracks, deduplicated)
     tracks.attrs.update(
@@ -797,6 +931,12 @@ def _retrack_raw_levels(
             dataset.sizes.get("eigenpair", 0) for dataset in deduplicated
         ),
         slepc_was_run=False,
+        overlap_metric=(
+            physical_metric.metric_name
+            if physical_metric is not None
+            else "xi_psi_proxy"
+        ),
+        raw_level_files=tuple(path.name for path in level_paths),
     )
     return deduplicated, tracks, radial_levels, mixed_levels, points, weights
 
@@ -982,10 +1122,15 @@ def _run_reclassify(args: argparse.Namespace) -> None:
         diagnostics = source.load()
     level_status, run_status = catalog_status_from_diagnostics(diagnostics)
     expected_levels = int(dict(manifest.get("configuration", {})).get("levels", 0))
-    raw_available = expected_levels > 0 and all(
+    base_raw_available = expected_levels > 0 and all(
         (artifact_dir / f"level_{level}.nc").is_file()
         for level in range(expected_levels)
     )
+    reacquired_raw_available = expected_levels > 0 and all(
+        (artifact_dir / f"level_{level}_reacquired.nc").is_file()
+        for level in range(expected_levels)
+    )
+    raw_available = base_raw_available or reacquired_raw_available
     source_choice = getattr(args, "source", "auto")
     use_raw = source_choice == "raw" or (
         source_choice == "auto" and raw_available
@@ -995,7 +1140,29 @@ def _run_reclassify(args: argparse.Namespace) -> None:
 
     modes_for_table = modes
     identical_legacy_histories = None
+    physical_metric = None
+    metric_path = None
+    metric_built = False
+    metric_fallback_reason = None
+    raw_variant = "reacquired" if reacquired_raw_available else "base"
+    raw_tracking_source = (
+        "raw_level_retracking_reacquired"
+        if raw_variant == "reacquired"
+        else "raw_level_retracking"
+    )
     if use_raw:
+        level_paths = _raw_level_paths(
+            artifact_dir,
+            expected_levels,
+            variant=raw_variant,
+        )
+        physical_metric, metric_path, metric_built, metric_fallback_reason = (
+            _load_or_build_physical_overlap_metric(
+                artifact_dir,
+                manifest,
+                level_paths,
+            )
+        )
         (
             level_solutions,
             tracks,
@@ -1003,13 +1170,30 @@ def _run_reclassify(args: argparse.Namespace) -> None:
             mixed_levels,
             _points,
             weights,
-        ) = _retrack_raw_levels(artifact_dir, manifest)
+        ) = _retrack_raw_levels(
+            artifact_dir,
+            manifest,
+            level_paths=level_paths,
+            physical_metric=physical_metric,
+        )
         classification_continuum = continuum[["omega", "branch_assignment_ambiguous"]]
     else:
         tracks, weights = _legacy_modes_to_tracks(modes)
         classification_continuum = continuum[
             ["frequency_khz", "branch_assignment_ambiguous"]
         ].rename({"frequency_khz": "omega"})
+
+    physical_active = use_raw and physical_metric is not None
+    mode_tracks_name = (
+        "mode_tracks_physical_full_evidence_v2.nc"
+        if physical_active
+        else "mode_tracks_evidence_v2.nc"
+    )
+    modes_name = (
+        "modes_physical_full_evidence_v2.nc"
+        if physical_active
+        else "modes_evidence_v2.nc"
+    )
 
     evidence = classify_tracks_evidence_v2(
         tracks,
@@ -1020,11 +1204,16 @@ def _run_reclassify(args: argparse.Namespace) -> None:
     )
     evidence.attrs.update(
         source_artifact_directory=str(artifact_dir.resolve()),
-        source_modes="level_*.nc" if use_raw else "modes.nc",
+        source_modes=(
+            f"level_*_{raw_variant}.nc" if raw_variant == "reacquired" else "level_*.nc"
+        ) if use_raw else "modes.nc",
         source_continuum="continuum.nc",
         source_window_diagnostics="window_diagnostics.nc",
         run_catalog_status=run_status,
-        tracking_source="raw_level_retracking" if use_raw else "legacy_modes_tracks",
+        tracking_source=raw_tracking_source if use_raw else "legacy_modes_tracks",
+        overlap_metric=(
+            physical_metric.metric_name if physical_metric is not None else "xi_psi_proxy"
+        ),
         slepc_was_run=False,
     )
 
@@ -1062,18 +1251,47 @@ def _run_reclassify(args: argparse.Namespace) -> None:
         )
         modes_for_table.attrs.update(
             source_artifact_directory=str(artifact_dir.resolve()),
-            source_modes="level_*.nc",
-            tracking_source="raw_level_retracking",
+            source_modes=(
+                "level_*_reacquired.nc" if raw_variant == "reacquired" else "level_*.nc"
+            ),
+            tracking_source=raw_tracking_source,
             classification_version="evidence_v2",
+            overlap_metric=(
+                physical_metric.metric_name
+                if physical_metric is not None
+                else "xi_psi_proxy"
+            ),
+            overlap_metric_fallback_reason=(metric_fallback_reason or "none"),
             slepc_was_run=False,
         )
         compact_tracks = tracks.drop_vars("xi_psi", errors="ignore")
-        _write_dataset(compact_tracks, output_dir / "mode_tracks_evidence_v2.nc")
-        _write_dataset(modes_for_table, output_dir / "modes_evidence_v2.nc")
+        _write_dataset(
+            compact_tracks,
+            output_dir / mode_tracks_name,
+        )
+        _write_dataset(
+            modes_for_table,
+            output_dir / modes_name,
+        )
 
-    _write_dataset(evidence, output_dir / "classification_evidence_v2.nc")
+    classification_name = (
+        "classification_physical_full_evidence_v2.nc"
+        if physical_active
+        else "classification_evidence_v2.nc"
+    )
+    summary_name = (
+        "summary_physical_full_evidence_v2.csv"
+        if physical_active
+        else "summary_evidence_v2.csv"
+    )
+    report_name = (
+        "reclassification_report_physical_full.json"
+        if physical_active
+        else "reclassification_report.json"
+    )
+    _write_dataset(evidence, output_dir / classification_name)
     rows = _reclassification_table(modes_for_table, tracks, evidence)
-    _write_summary_csv(rows, output_dir / "summary_evidence_v2.csv")
+    _write_summary_csv(rows, output_dir / summary_name)
 
     before = Counter(np.asarray(modes["label"].values).astype(str).tolist())
     after = Counter(np.asarray(evidence["label"].values).astype(str).tolist())
@@ -1110,7 +1328,21 @@ def _run_reclassify(args: argparse.Namespace) -> None:
         "solver_rejected_count": int(after.get("solver_rejected", 0)),
         "catalog_status_is_per_mode_veto": False,
         "slepc_was_run": False,
-        "tracking_source": "raw_level_retracking" if use_raw else "legacy_modes_tracks",
+        "tracking_source": raw_tracking_source if use_raw else "legacy_modes_tracks",
+        "overlap_metric": (
+            physical_metric.metric_name if physical_metric is not None else "xi_psi_proxy"
+        ),
+        "parallel_displacement_in_overlap": (
+            bool(physical_metric.parallel_component_included)
+            if physical_metric is not None
+            else False
+        ),
+        "physical_metric_artifact": (
+            None if metric_path is None else str(metric_path.resolve())
+        ),
+        "physical_metric_built_this_run": metric_built,
+        "physical_metric_fallback_reason": metric_fallback_reason,
+        "raw_level_variant": raw_variant if use_raw else None,
         "legacy_track_count": int(modes.sizes.get("track", 0)),
         "retracked_track_count": int(evidence.sizes.get("track", 0)),
     }
@@ -1136,21 +1368,38 @@ def _run_reclassify(args: argparse.Namespace) -> None:
             classification_counts=dict(sorted(after.items())),
             source_manifest="manifest.json",
             slepc_was_run=False,
+            overlap_metric=(
+                physical_metric.metric_name
+                if physical_metric is not None
+                else "xi_psi_proxy"
+            ),
+            parallel_displacement_in_overlap=bool(
+                physical_metric.parallel_component_included
+                if physical_metric is not None
+                else False
+            ),
         )
         artifacts = dict(evidence_manifest.get("artifacts", {}))
         artifacts.update(
-            modes="modes_evidence_v2.nc",
-            classification="classification_evidence_v2.nc",
-            mode_tracks="mode_tracks_evidence_v2.nc",
-            summary="summary_evidence_v2.csv",
-            reclassification_report="reclassification_report.json",
+            modes=modes_name,
+            classification=classification_name,
+            mode_tracks=mode_tracks_name,
+            summary=summary_name,
+            reclassification_report=report_name,
         )
+        if physical_active:
+            artifacts["physical_overlap_metric"] = "physical_overlap_metric_full.nc"
         evidence_manifest["artifacts"] = artifacts
-        (output_dir / "manifest_evidence_v2.json").write_text(
+        manifest_name = (
+            "manifest_physical_full_evidence_v2.json"
+            if physical_active
+            else "manifest_evidence_v2.json"
+        )
+        (output_dir / manifest_name).write_text(
             json.dumps(evidence_manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-    (output_dir / "reclassification_report.json").write_text(
+    (output_dir / report_name).write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
@@ -2170,9 +2419,15 @@ def _run_demo(args: argparse.Namespace) -> None:
 
 
 def _load_manifest(artifact_dir: Path) -> dict[str, object]:
+    physical_full_path = artifact_dir / "manifest_physical_full_evidence_v2.json"
+    physical_path = artifact_dir / "manifest_physical_evidence_v2.json"
     reacquired_path = artifact_dir / "manifest_reacquired_evidence_v2.json"
     evidence_path = artifact_dir / "manifest_evidence_v2.json"
-    if reacquired_path.is_file():
+    if physical_full_path.is_file():
+        path = physical_full_path
+    elif physical_path.is_file():
+        path = physical_path
+    elif reacquired_path.is_file():
         path = reacquired_path
     elif evidence_path.is_file():
         path = evidence_path
@@ -2198,6 +2453,10 @@ def _mode_artifact_path(
             artifact_dir / "manifest_evidence_v2.json"
         ).is_file() or (
             artifact_dir / "manifest_reacquired_evidence_v2.json"
+        ).is_file() or (
+            artifact_dir / "manifest_physical_evidence_v2.json"
+        ).is_file() or (
+            artifact_dir / "manifest_physical_full_evidence_v2.json"
         ).is_file()
         manifest = _load_manifest(artifact_dir) if has_manifest else {}
     configured = dict(manifest.get("artifacts", {})).get("modes")
@@ -2369,10 +2628,12 @@ def _spectrum_figure(modes: xr.Dataset, continuum: xr.Dataset, labels: Iterable[
     )
     figure.update_layout(
         template="plotly_white",
-        margin={"l": 64, "r": 22, "t": 46, "b": 56},
+        margin={"l": 64, "r": 22, "t": 96, "b": 56},
         title={
             "text": f"{continuum_title} continuum and classified mode centers",
             "x": 0.02,
+            "y": 0.98,
+            "yanchor": "top",
         },
         xaxis={"title": "Normalized poloidal flux psi_N", "range": [0, 1]},
         yaxis={"title": "Cyclic frequency [kHz]", "range": [max(0, band[0] - 5), band[1] + 5]},
@@ -2511,8 +2772,13 @@ def _resolution_diagnostic_figure(
     kind = str(continuum.attrs.get("continuum_kind", "continuum")).replace("_", " ")
     figure.update_layout(
         template="plotly_white",
-        margin={"l": 64, "r": 22, "t": 46, "b": 56},
-        title={"text": f"All resolutions over {kind}", "x": 0.02},
+        margin={"l": 64, "r": 22, "t": 96, "b": 56},
+        title={
+            "text": f"All resolutions over {kind}",
+            "x": 0.02,
+            "y": 0.98,
+            "yanchor": "top",
+        },
         xaxis={"title": "Mode power-peak psi_N", "range": [0.0, 1.0]},
         yaxis={"title": "Cyclic frequency [kHz]"},
         legend={"orientation": "h", "y": 1.02, "x": 1.0, "xanchor": "right", "yanchor": "bottom"},
@@ -2913,7 +3179,7 @@ h1 { font-size:25px; line-height:1.15; margin:5px 0 4px; font-weight:720; }
                             html.Section(
                                 className="main",
                                 children=[
-                                    html.Div(dcc.Loading(dcc.Graph(id="spectrum", figure=_spectrum_figure(modes, continuum, LABEL_ORDER), style={"height": "520px"})), className="card"),
+                                    html.Div(dcc.Loading(dcc.Graph(id="spectrum", figure=_spectrum_figure(modes, continuum, LABEL_ORDER), style={"height": "570px"})), className="card"),
                                     html.Div(
                                         dcc.Loading(
                                             dcc.Graph(
@@ -2924,7 +3190,7 @@ h1 { font-size:25px; line-height:1.15; margin:5px 0 4px; font-weight:720; }
                                                     LABEL_ORDER,
                                                     "classification",
                                                 ),
-                                                style={"height": "560px"},
+                                                style={"height": "610px"},
                                             )
                                         ),
                                         className="card",
