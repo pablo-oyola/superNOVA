@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -20,6 +21,163 @@ SPEC.loader.exec_module(MODULE)
 
 
 class WindowSolverMultigridScriptTests(unittest.TestCase):
+    def test_reclassify_rebuilds_tracks_from_raw_levels_without_slepc(self):
+        from supernova.core.solver5_multigrid import _nested_bspline_levels
+        from supernova.core.solver5_multigrid_evidence import (
+            bspline_prolongation_matrix,
+        )
+
+        base_spans = 2
+        order = 3
+        quadrature_order = 4
+        radial_levels = _nested_bspline_levels(
+            MODULE._base_spline(base_spans, order, quadrature_order),
+            levels=3,
+        )
+        points, _ = radial_levels[-1].get_quadrature_points()
+        coefficients = [np.linspace(0.2, 1.0, radial_levels[0].dofs)[:, None]]
+        for coarse, fine in zip(radial_levels[:-1], radial_levels[1:]):
+            coefficients.append(
+                np.asarray(bspline_prolongation_matrix(coarse, fine) @ coefficients[-1])
+            )
+
+        frequencies = (2.0004, 2.0001, 2.0)
+        raw_levels = []
+        for level, (radial, coefficient, omega) in enumerate(
+            zip(radial_levels, coefficients, frequencies)
+        ):
+            field = radial.eval_basis(points).T @ coefficient
+            low_dofs = radial.dofs - 1
+            raw_levels.append(
+                xr.Dataset(
+                    {
+                        "s": ("eigenpair", np.asarray([omega**2], dtype=complex)),
+                        "omega": ("eigenpair", np.asarray([omega], dtype=complex)),
+                        "slepc_backward_error": ("eigenpair", [1.0e-12]),
+                        "residual_norm": ("eigenpair", [1.0e-12]),
+                        "window_id": ("eigenpair", [level]),
+                        "window_depth": ("eigenpair", [0]),
+                        "core_owned": ("eigenpair", [True]),
+                        "xi_psi": (
+                            ("eigenpair", "psi", "m_pol"),
+                            field[None, :, :],
+                        ),
+                        "xi_psi_coefficient": (
+                            ("eigenpair", "radial_dof_high", "m_pol"),
+                            coefficient[None, :, :],
+                        ),
+                        "p1_coefficient": (
+                            ("eigenpair", "radial_dof_high", "m_pol"),
+                            coefficient[None, :, :],
+                        ),
+                        "xi_s_coefficient": (
+                            ("eigenpair", "radial_dof_low", "m_pol"),
+                            np.zeros((1, low_dofs, 1), dtype=complex),
+                        ),
+                        "div_xi_coefficient": (
+                            ("eigenpair", "radial_dof_low", "m_pol"),
+                            np.zeros((1, low_dofs, 1), dtype=complex),
+                        ),
+                    },
+                    coords={
+                        "eigenpair": [0],
+                        "psi": points,
+                        "m_pol": [10],
+                        "radial_dof_high": np.arange(radial.dofs),
+                        "radial_dof_low": np.arange(low_dofs),
+                    },
+                )
+            )
+
+        legacy_modes = xr.Dataset(
+            {
+                "frequency_khz": ("track", [100.0]),
+                "center": ("track", [0.5]),
+                "label": ("track", ["inconclusive"]),
+                "reason": ("track", ["incomplete_search_windows"]),
+                "last_level": ("track", [2]),
+                "mode_index_by_level": (("track", "level"), [[0, 0, 0]]),
+                "present_by_level": (("track", "level"), [[True, True, True]]),
+            },
+            coords={"track": [0], "level": [0, 1, 2]},
+            attrs={"schema_version": 1},
+        )
+        continuum = xr.Dataset(
+            {
+                "omega": (
+                    ("psi", "branch"),
+                    np.asarray([[0.5], [0.5]], dtype=complex),
+                ),
+                "frequency_khz": (("psi", "branch"), [[25.0], [25.0]]),
+                "branch_assignment_ambiguous": (
+                    ("psi", "branch"),
+                    np.zeros((2, 1), dtype=bool),
+                ),
+            },
+            coords={"psi": [0.0, 1.0], "branch": [0]},
+        )
+        diagnostics = xr.Dataset(
+            {
+                "valid": (("level", "window"), np.ones((3, 1), dtype=bool)),
+                "catalog_status": (
+                    ("level", "window"),
+                    np.full((3, 1), "capacity_limited", dtype="U24"),
+                ),
+            },
+            coords={"level": [0, 1, 2], "window": [0]},
+        )
+        manifest = {
+            "schema_version": 1,
+            "frequency_khz": [50.0, 150.0],
+            "artifacts": {"modes": "modes.nc"},
+            "configuration": {
+                "base_spans": base_spans,
+                "levels": 3,
+                "order": order,
+                "quadrature_order": quadrature_order,
+                "reconstruction_points": 32,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            MODULE._write_dataset(legacy_modes, output / "modes.nc")
+            MODULE._write_dataset(continuum, output / "continuum.nc")
+            MODULE._write_dataset(diagnostics, output / "window_diagnostics.nc")
+            for level, dataset in enumerate(raw_levels):
+                MODULE._write_dataset(dataset, output / f"level_{level}.nc")
+            (output / "manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+
+            MODULE._run_reclassify(
+                SimpleNamespace(
+                    artifact_dir=output,
+                    output_dir=None,
+                    source="auto",
+                )
+            )
+
+            report = json.loads((output / "reclassification_report.json").read_text())
+            self.assertEqual(report["tracking_source"], "raw_level_retracking")
+            self.assertIs(report["slepc_was_run"], False)
+            self.assertEqual(report["after_label_counts"], {"physical_gap": 1})
+            self.assertEqual(report["previously_inconclusive_after"], {"physical_gap": 1})
+            self.assertEqual(report["legacy_track_histories_identical"], 1)
+            self.assertEqual(report["legacy_track_histories_changed"], 0)
+            with xr.open_dataset(
+                output / "modes_evidence_v2.nc",
+                engine="netcdf4",
+            ) as saved:
+                self.assertEqual(saved["label"].item(), "physical_gap")
+                self.assertEqual(saved["legacy_track"].item(), 0)
+                self.assertEqual(saved.attrs["tracking_source"], "raw_level_retracking")
+            self.assertEqual(
+                MODULE._mode_artifact_path(output),
+                output / "modes_evidence_v2.nc",
+            )
+
     def test_demo_modes_are_normalized_and_cover_every_label(self):
         modes, continuum, diagnostics, band = MODULE._demo_datasets()
 

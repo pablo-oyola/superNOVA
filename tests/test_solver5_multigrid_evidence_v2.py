@@ -244,6 +244,21 @@ def test_global_converged_crossing_is_continuum_coupled_candidate():
     assert result["label"].item() == "continuum_coupled_candidate"
 
 
+def test_coarse_retention_alone_does_not_assert_a_strong_global_limit():
+    tracks = _track(
+        present=(False, False, True),
+        overlap=(np.nan, np.nan, np.nan),
+        frequency_change=(np.nan, np.nan, np.nan),
+    )
+    tracks["coarse_space_retention"] = (
+        ("track", "level"),
+        np.asarray([[np.nan, np.nan, 1.0]]),
+    )
+    result = _classify(tracks, _continuum([[0.8], [1.2]]))
+    assert result["strong_global_limit"].item() != "true"
+    assert result["label"].item() == "unresolved"
+
+
 def test_capacity_limited_reacquisition_does_not_make_artifact():
     tracks = _track(present=(True, True, False))
     tracks["reacquisition_status"] = (

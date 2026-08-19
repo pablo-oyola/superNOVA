@@ -437,15 +437,6 @@ def cluster_aware_mode_assignment(
             "reference_dimension_ambiguous": np.zeros(nreference, dtype=bool),
             "candidate_dimension_ambiguous": np.zeros(ncandidate, dtype=bool),
         }
-    overlaps = np.zeros((nreference, ncandidate), dtype=float)
-    for row in range(nreference):
-        for column in range(ncandidate):
-            cosines = weighted_principal_angle_cosines(
-                reference_vectors[row : row + 1],
-                candidate_vectors[column : column + 1],
-                weights,
-            )
-            overlaps[row, column] = cosines[0] if cosines.size else 0.0
     scale = np.maximum(
         np.maximum(np.abs(reference_frequency[:, None]), np.abs(candidate_frequency[None, :])),
         np.finfo(float).tiny,
@@ -454,6 +445,32 @@ def cluster_aware_mode_assignment(
         reference_frequency[:, None] - candidate_frequency[None, :]
     ) / scale
     allowed = np.isfinite(frequency_change) & (frequency_change <= frequency_gate)
+    overlaps = np.zeros((nreference, ncandidate), dtype=float)
+    flattened_reference = reference_vectors.reshape(nreference, -1)
+    flattened_candidate = candidate_vectors.reshape(ncandidate, -1)
+    repeated_weights = np.repeat(np.asarray(weights, dtype=float), reference_vectors.shape[2])
+    reference_norm = np.sqrt(
+        np.sum(repeated_weights[None, :] * np.abs(flattened_reference) ** 2, axis=1)
+    )
+    candidate_norm = np.sqrt(
+        np.sum(repeated_weights[None, :] * np.abs(flattened_candidate) ** 2, axis=1)
+    )
+    for row in range(nreference):
+        columns = np.flatnonzero(allowed[row])
+        if columns.size == 0 or reference_norm[row] <= np.finfo(float).tiny:
+            continue
+        numerator = np.abs(
+            (flattened_reference[row].conjugate() * repeated_weights)
+            @ flattened_candidate[columns].T
+        )
+        denominator = reference_norm[row] * candidate_norm[columns]
+        overlaps[row, columns] = np.divide(
+            numerator,
+            denominator,
+            out=np.zeros(columns.size, dtype=float),
+            where=denominator > np.finfo(float).tiny,
+        )
+    overlaps = np.clip(overlaps, 0.0, 1.0)
     size = nreference + ncandidate
     unmatched = float(size + 2)
     forbidden = unmatched * float(size + 2)
@@ -1483,11 +1500,16 @@ def classify_tracks_evidence_v2(
             if len(smooth_scaling_checks) >= 2
             else UNKNOWN
         )
-        strong_global = tri_or(
-            tri_and(chain_valid, smooth_scaling),
+        retention_support = (
             tri_state(retention[final] >= config.coarse_retention_min)
             if np.isfinite(retention[final])
-            else UNKNOWN,
+            else UNKNOWN
+        )
+        strong_global = tri_and(
+            roots_valid_two,
+            frequency_converged,
+            smooth_scaling,
+            retention_support,
         )
 
         mode_uncertainty = np.nan

@@ -199,6 +199,15 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="defaults to the artifact directory; original files are never overwritten",
     )
+    reclassify.add_argument(
+        "--source",
+        choices=("auto", "raw", "legacy"),
+        default="auto",
+        help=(
+            "prefer raw level_*.nc catalogs and rebuild tracks; 'legacy' preserves "
+            "the old modes.nc assignments"
+        ),
+    )
 
     demo = subparsers.add_parser("demo", help="write deterministic GUI demo artifacts")
     demo.add_argument(
@@ -331,9 +340,15 @@ def _evaluate_basis(pair, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return high, low
 
 
-def _reconstruct_final_modes(result, multigrid, equilibrium, npoints: int) -> xr.Dataset:
-    tracks = result.mode_tracks
-    evidence = result.classification
+def _reconstruct_modes_from_levels(
+    level_solutions: tuple[xr.Dataset, ...],
+    tracks: xr.Dataset,
+    evidence: xr.Dataset,
+    mixed_levels: tuple,
+    omega_to_khz,
+    npoints: int,
+) -> xr.Dataset:
+    """Reconstruct final fields for either a live solve or offline retracking."""
     ntracks = tracks.sizes.get("track", 0)
     m_pol = np.asarray(tracks.coords["m_pol"].values, dtype=np.int64)
     points = np.linspace(0.0, 1.0, int(npoints))
@@ -359,10 +374,10 @@ def _reconstruct_final_modes(result, multigrid, equilibrium, npoints: int) -> xr
         index = int(mode_index[track, level])
         if index < 0:
             continue
-        solution = result.level_solutions[level]
+        solution = level_solutions[level]
         if level not in basis_values:
             basis_values[level] = _evaluate_basis(
-                multigrid.mixed_levels[level].pair,
+                mixed_levels[level].pair,
                 points,
             )
         phi_high, phi_low = basis_values[level]
@@ -417,7 +432,7 @@ def _reconstruct_final_modes(result, multigrid, equilibrium, npoints: int) -> xr
             window_depth[track] = int(solution["window_depth"].values[index])
 
     omega_by_level = np.asarray(tracks["omega"].values, dtype=np.complex128)
-    frequency_by_level = _omega_to_khz(equilibrium, omega_by_level)
+    frequency_by_level = omega_to_khz(omega_by_level)
     final_omega = np.full(ntracks, np.nan + 1.0j * np.nan, dtype=np.complex128)
     for track, level in enumerate(final_level):
         if level >= 0:
@@ -430,7 +445,7 @@ def _reconstruct_final_modes(result, multigrid, equilibrium, npoints: int) -> xr
                 for name, values in fields.items()
             },
             "omega": ("track", final_omega),
-            "frequency_khz": ("track", _omega_to_khz(equilibrium, final_omega)),
+            "frequency_khz": ("track", omega_to_khz(final_omega)),
             "center": ("track", center),
             "radial_width": ("track", radial_width),
             "dominant_m": ("track", dominant_m),
@@ -460,6 +475,7 @@ def _reconstruct_final_modes(result, multigrid, equilibrium, npoints: int) -> xr
 
     track_fields = (
         "mode_index",
+        "source_mode_index",
         "present",
         "residual_norm",
         "backward_error",
@@ -497,6 +513,17 @@ def _reconstruct_final_modes(result, multigrid, equilibrium, npoints: int) -> xr
     )
     dataset.m_pol.attrs.update(long_name="poloidal mode number")
     return dataset
+
+
+def _reconstruct_final_modes(result, multigrid, equilibrium, npoints: int) -> xr.Dataset:
+    return _reconstruct_modes_from_levels(
+        result.level_solutions,
+        result.mode_tracks,
+        result.classification,
+        multigrid.mixed_levels,
+        lambda omega: _omega_to_khz(equilibrium, omega),
+        npoints,
+    )
 
 
 def _storage_dataset(dataset: xr.Dataset) -> xr.Dataset:
@@ -584,6 +611,210 @@ def _write_dataset(dataset: xr.Dataset, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _load_portable_dataset(path: Path, names: Iterable[str]) -> xr.Dataset:
+    """Load selected variables and restore explicitly split complex arrays."""
+    with xr.open_dataset(path, engine="netcdf4") as source:
+        variables: dict[str, xr.DataArray] = {}
+        for name in names:
+            if name in source:
+                variables[name] = source[name].load()
+                continue
+            real_name = f"{name}_real"
+            imaginary_name = f"{name}_imag"
+            if real_name not in source or imaginary_name not in source:
+                continue
+            restored = source[real_name].load().astype(np.float64) + 1.0j * source[
+                imaginary_name
+            ].load().astype(np.float64)
+            restored.attrs.update(source[real_name].attrs)
+            restored.attrs.pop("complex_component", None)
+            variables[name] = restored
+        dataset = xr.Dataset(variables)
+        dataset.attrs.update(source.attrs)
+    return dataset
+
+
+def _raw_level_paths(artifact_dir: Path, expected_levels: int) -> tuple[Path, ...]:
+    paths = tuple(artifact_dir / f"level_{level}.nc" for level in range(expected_levels))
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Raw-level retracking requires a contiguous level_*.nc catalog; missing "
+            + ", ".join(str(path) for path in missing)
+        )
+    return paths
+
+
+def _load_raw_level(path: Path) -> xr.Dataset:
+    fields = (
+        "s",
+        "omega",
+        "residual_norm",
+        "backward_error",
+        "slepc_backward_error",
+        "absolute_residual_norm",
+        "slepc_error_estimate",
+        "window_id",
+        "window_depth",
+        "core_owned",
+        "reacquisition_status",
+        "xi_psi",
+        "xi_psi_coefficient",
+        "p1_coefficient",
+        "xi_s_coefficient",
+        "div_xi_coefficient",
+    )
+    dataset = _load_portable_dataset(path, fields)
+    required = {"s", "omega", "xi_psi", "xi_psi_coefficient", "window_id"}
+    missing = sorted(required.difference(dataset.data_vars))
+    if missing:
+        raise ValueError(f"{path} is missing raw retracking variables: {missing}")
+    count = dataset.sizes.get("eigenpair", 0)
+    dataset["source_eigenpair"] = (
+        "eigenpair",
+        np.asarray(dataset.coords["eigenpair"].values, dtype=np.int64),
+    )
+    dataset = dataset.assign_coords(eigenpair=np.arange(count, dtype=np.int64))
+    return dataset
+
+
+def _retrack_raw_levels(
+    artifact_dir: Path,
+    manifest: Mapping[str, object],
+):
+    """Rebuild nested spaces, deduplicate saved roots, and rematch all levels."""
+    from supernova.core.solver4 import _build_mixed_radial_data
+    from supernova.core.solver5_multigrid import (
+        ModeClassificationThresholds,
+        MultigridSearchOptions,
+        _deduplicate_window_dataset,
+        _nested_bspline_levels,
+        _track_level_solutions,
+    )
+
+    configuration = dict(manifest.get("configuration", {}))
+    levels = int(configuration.get("levels", 0))
+    if levels < 1:
+        raise ValueError("manifest configuration does not define a positive level count")
+    radial_levels = _nested_bspline_levels(
+        _base_spline(
+            int(configuration["base_spans"]),
+            int(configuration["order"]),
+            int(configuration["quadrature_order"]),
+        ),
+        levels=levels,
+    )
+    points, weights = radial_levels[-1].get_quadrature_points()
+    points = np.asarray(points, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    mixed_levels = tuple(
+        _build_mixed_radial_data(radial, points, weights) for radial in radial_levels
+    )
+    search = MultigridSearchOptions()
+    thresholds = ModeClassificationThresholds()
+    raw_levels = tuple(
+        _load_raw_level(path)
+        for path in _raw_level_paths(artifact_dir, expected_levels=levels)
+    )
+    for level, dataset in enumerate(raw_levels):
+        if not np.array_equal(np.asarray(dataset.coords["psi"].values), points):
+            raise ValueError(
+                f"level_{level}.nc psi grid does not match reconstructed finest quadrature"
+            )
+    deduplicated = tuple(
+        _deduplicate_window_dataset(
+            dataset,
+            weights,
+            relative_s=search.dedup_relative_s,
+            minimum_overlap=search.dedup_overlap,
+        )
+        for dataset in raw_levels
+    )
+    tracks = _track_level_solutions(
+        deduplicated,
+        weights,
+        thresholds,
+        radial_levels=radial_levels,
+    )
+    source_mode_index = np.full(
+        (tracks.sizes.get("track", 0), levels),
+        -1,
+        dtype=np.int64,
+    )
+    mode_index = np.asarray(tracks["mode_index"].values, dtype=np.int64)
+    for track in range(source_mode_index.shape[0]):
+        for level in range(levels):
+            index = int(mode_index[track, level])
+            if index >= 0:
+                source_mode_index[track, level] = int(
+                    deduplicated[level]["source_eigenpair"].values[index]
+                )
+    tracks["source_mode_index"] = (
+        ("track", "level"),
+        source_mode_index,
+    )
+    tracks.attrs.update(
+        tracking_source="raw level_*.nc catalogs",
+        raw_root_counts=tuple(
+            dataset.sizes.get("eigenpair", 0) for dataset in raw_levels
+        ),
+        deduplicated_root_counts=tuple(
+            dataset.sizes.get("eigenpair", 0) for dataset in deduplicated
+        ),
+        slepc_was_run=False,
+    )
+    return deduplicated, tracks, radial_levels, mixed_levels, points, weights
+
+
+def _omega_to_khz_from_saved_continuum(continuum: xr.Dataset):
+    omega = np.asarray(continuum["omega"].values, dtype=np.complex128).real
+    frequency = np.asarray(continuum["frequency_khz"].values, dtype=float)
+    use = np.isfinite(omega) & (np.abs(omega) > np.finfo(float).tiny) & np.isfinite(
+        frequency
+    )
+    if not np.any(use):
+        raise ValueError("Saved continuum does not define an omega-to-kHz conversion")
+    scale = float(np.median(frequency[use] / omega[use]))
+    relative_error = np.abs(frequency[use] - scale * omega[use]) / np.maximum(
+        np.abs(frequency[use]),
+        np.finfo(float).tiny,
+    )
+    if not np.isfinite(scale) or np.nanmax(relative_error) > 1.0e-10:
+        raise ValueError("Saved continuum has an inconsistent omega-to-kHz conversion")
+    return lambda values: np.asarray(values, dtype=np.complex128).real * scale
+
+
+def _legacy_track_association(
+    legacy_modes: xr.Dataset,
+    tracks: xr.Dataset,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Associate retracked sequences with legacy rows through saved root indices."""
+    legacy_lookup: dict[tuple[int, int], int] = {}
+    legacy_indices = np.asarray(legacy_modes["mode_index_by_level"].values, dtype=int)
+    legacy_present = np.asarray(legacy_modes["present_by_level"].values, dtype=bool)
+    for legacy_track in range(legacy_indices.shape[0]):
+        levels = np.flatnonzero(legacy_present[legacy_track])
+        if levels.size:
+            level = int(levels[-1])
+            legacy_lookup[(level, int(legacy_indices[legacy_track, level]))] = legacy_track
+
+    source_indices = np.asarray(tracks["source_mode_index"].values, dtype=int)
+    present = np.asarray(tracks["present"].values, dtype=bool)
+    association = np.full(source_indices.shape[0], -1, dtype=np.int64)
+    labels = np.full(source_indices.shape[0], "unmatched", dtype="U32")
+    legacy_labels = np.asarray(legacy_modes["label"].values).astype(str)
+    for track in range(source_indices.shape[0]):
+        levels = np.flatnonzero(present[track])
+        if levels.size == 0:
+            continue
+        level = int(levels[-1])
+        legacy_track = legacy_lookup.get((level, int(source_indices[track, level])), -1)
+        if legacy_track >= 0:
+            association[track] = legacy_track
+            labels[track] = legacy_labels[legacy_track]
+    return association, labels
+
+
 def _legacy_modes_to_tracks(modes: xr.Dataset) -> tuple[xr.Dataset, np.ndarray]:
     """Migrate the portable schema-v1 mode table into classifier inputs."""
     from supernova.core.solver5_multigrid_evidence import (
@@ -641,9 +872,14 @@ def _reclassification_table(
     ipr_history = np.asarray(tracks["ipr"].values, dtype=float)
     kr_history = np.asarray(tracks["kr"].values, dtype=float)
     for track in range(ntracks):
+        legacy_label = (
+            str(modes["legacy_label"].values[track])
+            if "legacy_label" in modes
+            else str(modes["label"].values[track])
+        )
         row: dict[str, object] = {
             "track": track,
-            "legacy_label": str(modes["label"].values[track]),
+            "legacy_label": legacy_label,
             "width_over_h": json.dumps((width_history[track] / h_history[track]).tolist()),
             "h_times_ipr": json.dumps((h_history[track] * ipr_history[track]).tolist()),
             "h_times_kr": json.dumps((h_history[track] * kr_history[track]).tolist()),
@@ -664,7 +900,7 @@ def _reclassification_table(
 
 
 def _run_reclassify(args: argparse.Namespace) -> None:
-    """Reclassify portable artifacts without constructing matrices or calling SLEPc."""
+    """Reclassify saved roots without constructing eigenoperators or calling SLEPc."""
     from supernova.core.solver5_multigrid_evidence import (
         EvidenceV2Config,
         catalog_status_from_diagnostics,
@@ -674,6 +910,7 @@ def _run_reclassify(args: argparse.Namespace) -> None:
     artifact_dir = Path(args.artifact_dir)
     output_dir = artifact_dir if args.output_dir is None else Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _load_manifest(artifact_dir)
     with xr.open_dataset(artifact_dir / "modes.nc", engine="netcdf4") as source:
         required = [
             name
@@ -692,42 +929,117 @@ def _run_reclassify(args: argparse.Namespace) -> None:
         ]
         modes = source[required].load()
         modes.attrs.update(source.attrs)
-    with xr.open_dataset(artifact_dir / "continuum.nc", engine="netcdf4") as source:
-        names = [
-            name
-            for name in ("frequency_khz", "branch_assignment_ambiguous")
-            if name in source
-        ]
-        continuum = source[names].load()
-    continuum = continuum.rename({"frequency_khz": "omega"})
+    continuum = _load_portable_dataset(
+        artifact_dir / "continuum.nc",
+        ("omega", "frequency_khz", "branch_assignment_ambiguous"),
+    )
     with xr.open_dataset(
         artifact_dir / "window_diagnostics.nc",
         engine="netcdf4",
     ) as source:
         diagnostics = source.load()
-    tracks, weights = _legacy_modes_to_tracks(modes)
     level_status, run_status = catalog_status_from_diagnostics(diagnostics)
+    expected_levels = int(dict(manifest.get("configuration", {})).get("levels", 0))
+    raw_available = expected_levels > 0 and all(
+        (artifact_dir / f"level_{level}.nc").is_file()
+        for level in range(expected_levels)
+    )
+    source_choice = getattr(args, "source", "auto")
+    use_raw = source_choice == "raw" or (
+        source_choice == "auto" and raw_available
+    )
+    if source_choice == "raw" and not raw_available:
+        raise FileNotFoundError("--source raw requested, but the complete level_*.nc set is absent")
+
+    modes_for_table = modes
+    identical_legacy_histories = None
+    if use_raw:
+        (
+            level_solutions,
+            tracks,
+            _radial_levels,
+            mixed_levels,
+            _points,
+            weights,
+        ) = _retrack_raw_levels(artifact_dir, manifest)
+        classification_continuum = continuum[["omega", "branch_assignment_ambiguous"]]
+    else:
+        tracks, weights = _legacy_modes_to_tracks(modes)
+        classification_continuum = continuum[
+            ["frequency_khz", "branch_assignment_ambiguous"]
+        ].rename({"frequency_khz": "omega"})
+
     evidence = classify_tracks_evidence_v2(
         tracks,
-        continuum,
+        classification_continuum,
         weights,
         level_status,
         EvidenceV2Config(),
     )
     evidence.attrs.update(
         source_artifact_directory=str(artifact_dir.resolve()),
-        source_modes="modes.nc",
+        source_modes="level_*.nc" if use_raw else "modes.nc",
         source_continuum="continuum.nc",
         source_window_diagnostics="window_diagnostics.nc",
         run_catalog_status=run_status,
+        tracking_source="raw_level_retracking" if use_raw else "legacy_modes_tracks",
+        slepc_was_run=False,
     )
+
+    if use_raw:
+        converter = _omega_to_khz_from_saved_continuum(continuum)
+        reconstruction_points = int(
+            dict(manifest.get("configuration", {})).get(
+                "reconstruction_points",
+                modes.sizes.get("x", 512),
+            )
+        )
+        modes_for_table = _reconstruct_modes_from_levels(
+            level_solutions,
+            tracks,
+            evidence,
+            mixed_levels,
+            converter,
+            reconstruction_points,
+        )
+        legacy_track, legacy_label = _legacy_track_association(modes, tracks)
+        modes_for_table["legacy_track"] = ("track", legacy_track)
+        modes_for_table["legacy_label"] = ("track", legacy_label)
+        mapped = legacy_track >= 0
+        legacy_indices = np.asarray(modes["mode_index_by_level"].values, dtype=int)
+        legacy_present = np.asarray(modes["present_by_level"].values, dtype=bool)
+        source_indices = np.asarray(tracks["source_mode_index"].values, dtype=int)
+        current_present = np.asarray(tracks["present"].values, dtype=bool)
+        identical_legacy_histories = np.zeros(legacy_track.size, dtype=bool)
+        identical_legacy_histories[mapped] = np.all(
+            source_indices[mapped] == legacy_indices[legacy_track[mapped]],
+            axis=1,
+        ) & np.all(
+            current_present[mapped] == legacy_present[legacy_track[mapped]],
+            axis=1,
+        )
+        modes_for_table.attrs.update(
+            source_artifact_directory=str(artifact_dir.resolve()),
+            source_modes="level_*.nc",
+            tracking_source="raw_level_retracking",
+            classification_version="evidence_v2",
+            slepc_was_run=False,
+        )
+        compact_tracks = tracks.drop_vars("xi_psi", errors="ignore")
+        _write_dataset(compact_tracks, output_dir / "mode_tracks_evidence_v2.nc")
+        _write_dataset(modes_for_table, output_dir / "modes_evidence_v2.nc")
+
     _write_dataset(evidence, output_dir / "classification_evidence_v2.nc")
-    rows = _reclassification_table(modes, tracks, evidence)
+    rows = _reclassification_table(modes_for_table, tracks, evidence)
     _write_summary_csv(rows, output_dir / "summary_evidence_v2.csv")
 
     before = Counter(np.asarray(modes["label"].values).astype(str).tolist())
     after = Counter(np.asarray(evidence["label"].values).astype(str).tolist())
-    legacy_inconclusive = np.asarray(modes["label"].values).astype(str) == "inconclusive"
+    legacy_inconclusive = (
+        np.asarray(modes_for_table["legacy_label"].values).astype(str) == "inconclusive"
+        if "legacy_label" in modes_for_table
+        else np.asarray(modes["label"].values).astype(str) == "inconclusive"
+    )
     former_inconclusive = Counter(
         np.asarray(evidence["label"].values).astype(str)[legacy_inconclusive].tolist()
     )
@@ -749,13 +1061,53 @@ def _run_reclassify(args: argparse.Namespace) -> None:
         "level_catalog_status": level_status.tolist(),
         "before_label_counts": dict(sorted(before.items())),
         "after_label_counts": dict(sorted(after.items())),
-        "previously_inconclusive_count": int(np.count_nonzero(legacy_inconclusive)),
+        "previously_inconclusive_count": int(before.get("inconclusive", 0)),
         "previously_inconclusive_after": dict(sorted(former_inconclusive.items())),
+        "previously_inconclusive_mapped_count": int(np.count_nonzero(legacy_inconclusive)),
         "most_common_reason_codes": reason_counter.most_common(20),
         "solver_rejected_count": int(after.get("solver_rejected", 0)),
         "catalog_status_is_per_mode_veto": False,
         "slepc_was_run": False,
+        "tracking_source": "raw_level_retracking" if use_raw else "legacy_modes_tracks",
+        "legacy_track_count": int(modes.sizes.get("track", 0)),
+        "retracked_track_count": int(evidence.sizes.get("track", 0)),
     }
+    if use_raw:
+        report["raw_root_counts"] = list(tracks.attrs["raw_root_counts"])
+        report["deduplicated_root_counts"] = list(
+            tracks.attrs["deduplicated_root_counts"]
+        )
+        report["legacy_track_histories_identical"] = int(
+            np.count_nonzero(identical_legacy_histories)
+        )
+        report["legacy_track_histories_changed"] = int(
+            identical_legacy_histories.size
+            - np.count_nonzero(identical_legacy_histories)
+        )
+        evidence_manifest = dict(manifest)
+        evidence_manifest.update(
+            schema_version=SCHEMA_VERSION,
+            created_utc=datetime.now(timezone.utc).isoformat(),
+            git_commit=_git_commit(),
+            classification_version="evidence_v2",
+            mode_count=int(evidence.sizes.get("track", 0)),
+            classification_counts=dict(sorted(after.items())),
+            source_manifest="manifest.json",
+            slepc_was_run=False,
+        )
+        artifacts = dict(evidence_manifest.get("artifacts", {}))
+        artifacts.update(
+            modes="modes_evidence_v2.nc",
+            classification="classification_evidence_v2.nc",
+            mode_tracks="mode_tracks_evidence_v2.nc",
+            summary="summary_evidence_v2.csv",
+            reclassification_report="reclassification_report.json",
+        )
+        evidence_manifest["artifacts"] = artifacts
+        (output_dir / "manifest_evidence_v2.json").write_text(
+            json.dumps(evidence_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     (output_dir / "reclassification_report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1456,7 +1808,8 @@ def _run_demo(args: argparse.Namespace) -> None:
 
 
 def _load_manifest(artifact_dir: Path) -> dict[str, object]:
-    path = artifact_dir / "manifest.json"
+    evidence_path = artifact_dir / "manifest_evidence_v2.json"
+    path = evidence_path if evidence_path.is_file() else artifact_dir / "manifest.json"
     if not path.is_file():
         raise FileNotFoundError(f"Missing artifact manifest: {path}")
     manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -1466,6 +1819,24 @@ def _load_manifest(artifact_dir: Path) -> dict[str, object]:
             f"expected one of {SUPPORTED_SCHEMA_VERSIONS}."
         )
     return manifest
+
+
+def _mode_artifact_path(
+    artifact_dir: Path,
+    manifest: Mapping[str, object] | None = None,
+) -> Path:
+    if manifest is None:
+        has_manifest = (artifact_dir / "manifest.json").is_file() or (
+            artifact_dir / "manifest_evidence_v2.json"
+        ).is_file()
+        manifest = _load_manifest(artifact_dir) if has_manifest else {}
+    configured = dict(manifest.get("artifacts", {})).get("modes")
+    if configured:
+        path = artifact_dir / str(configured)
+        if path.is_file():
+            return path
+    evidence_path = artifact_dir / "modes_evidence_v2.nc"
+    return evidence_path if evidence_path.is_file() else artifact_dir / "modes.nc"
 
 
 def _resolve_serve_artifact_dir(artifact_dir: Path) -> Path:
@@ -1485,7 +1856,8 @@ def _resolve_serve_artifact_dir(artifact_dir: Path) -> Path:
 
 def _load_explorer_metadata(artifact_dir: Path):
     manifest = _load_manifest(artifact_dir)
-    with xr.open_dataset(artifact_dir / "modes.nc", engine="netcdf4") as dataset:
+    mode_path = _mode_artifact_path(artifact_dir, manifest)
+    with xr.open_dataset(mode_path, engine="netcdf4") as dataset:
         names = [
             "frequency_khz",
             "center",
@@ -1537,7 +1909,7 @@ def _load_explorer_metadata(artifact_dir: Path):
 def _load_mode_field(artifact_dir: Path, track: int, field: str):
     if field not in FIELD_TITLES:
         raise ValueError(f"Unknown field {field!r}.")
-    with xr.open_dataset(artifact_dir / "modes.nc", engine="netcdf4") as dataset:
+    with xr.open_dataset(_mode_artifact_path(artifact_dir), engine="netcdf4") as dataset:
         real = np.asarray(dataset[f"{field}_real"].isel(track=track).values)
         imag = np.asarray(dataset[f"{field}_imag"].isel(track=track).values)
         x = np.asarray(dataset.coords["x"].values)
