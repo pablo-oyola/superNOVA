@@ -1,4 +1,5 @@
 no_sync/
+no_sync_ref
 __pycache__/
 *.pyc
 *.pyo
@@ -9,15 +10,7 @@ __pycache__/
 .codex
 .agents
 .pytest_cache/
-tests/*
-!tests/test_desc_helper.py
-!tests/test_continuum.py
-!tests/test_equilibrium_cocos.py
-!tests/test_itpa_shear.py
-!tests/test_radial_profile.py
-!tests/test_solver5.py
-!tests/test_solver_fourier_convention.py
-!tests/test_symmetry_verification.py
+tests/__pycache__/
 *.egg-info/
 *.code-workspace
 *.h5
