@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from supernova.core.equilibrium import (
+from supernova.equilibrium import (
     _normalize_active_magnetic_radial_coordinate,
     _validate_internal_equilibrium_convention,
     superEquilibrium,

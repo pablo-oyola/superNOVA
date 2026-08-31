@@ -1,21 +1,22 @@
 __version__ = "0.1.0"
 
 import pycocos
-from .core.equilibrium import superEquilibrium
-from .core.continuum import superContinuum
-from .core._classify_mode import ContinuumClassifier
-from .core.solver2 import superSolver2
-from .core.solver3 import superSolver3
-from .core.solver4 import superSolver4
-from .core.solver5 import superSolver5
-from .core.solver5_multigrid import (
+
+from supernova.equilibrium import superEquilibrium
+from supernova.continuum import superContinuum
+from supernova.classify import ContinuumClassifier
+from supernova.core.solver2 import superSolver2
+from supernova.core.solver3 import superSolver3
+from supernova.core.solver4 import superSolver4
+from supernova.core.solver5 import superSolver5
+from supernova.solve.multigrid import (
     EvidenceV2Config,
     ModeClassificationThresholds,
     MultigridPEPResult,
     MultigridSearchOptions,
     superSolver5Multigrid,
 )
-from .core.solver5_multigrid_evidence import (
+from supernova.solve.evidence import (
     AdaptiveDiscoveryOptions,
     ContinuumQuery,
     MeshPerturbationOptions,
@@ -25,6 +26,6 @@ from .core.solver5_multigrid_evidence import (
     migrate_legacy_mode_dataset,
     mesh_perturbation_evidence,
 )
-from .radial.profile import Profile
-from .radial.base import RadialFE
-from .radial.bspline import BSplineFE
+from supernova.radial.profile import Profile
+from supernova.radial.base import RadialFE
+from supernova.radial.bspline import BSplineFE

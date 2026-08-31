@@ -32,20 +32,20 @@ import supernova
 # Optional third-party backends.  A missing DESC install must not silently
 # hide a kernel, so failures here are reported rather than ignored.
 OPTIONAL_MODULE_PREFIXES = (
-    "supernova.core.desc_helper",
-    "supernova.core.desc_loader",
+    "supernova.interop.desc",
+    "supernova.interop._desc_loader",
 )
 
 # qualname -> sha256 of inspect.getsource(fn.py_func)
 # Captured from superNOVA_2 at f8b246e. The two E-inverse kernels went
 # with the retired superSolver v1 path; 20 remain, 847 lines.
 FROZEN_KERNELS: dict[str, str] = {
-    # supernova/core/_solver_kernel2.py (moved verbatim from _solver_kernel.py)
+    # supernova/operators/blocks.py (moved verbatim from the retired v1 kernel)
     "_build_static_blocks": "5b4ddfdd6abe84810a973ca0567563f7c70402af850938ae803394f00e943c47",
     "scale_rows": "eb1c5e10615ce12acce394dd1e99a9317c1ca53d4d1d35707a840748d0bb1dc3",
     "scale_cols": "38c7ce14be7974d29dd1f8171806ad23c2736e01a6b0325b9e0d8dba6373ca7a",
     "apply_dm_cutoff": "6299e18603420c0f7bc1b50c0311e9ceec21ff860efb322af74f4cbbc228bae3",
-    # supernova/core/_continuum_kernel.py
+    # supernova/operators/continuum_kernel.py
     "_fill_block_kernel": "c8a9d2f49d1891632dce9336987b7b506a3bb4fd2ff69b7cda35f864d7bec4a8",
     "_fill_convolution_block_kernel": "5f64ebd3159da3e779f982f1decee403d67bf0f927de533fed7f22680f83f622",
     "_apply_ghg_scaling": "516525ccacebb0f35741c65d7997542987390b0300f8853807f0c08ae2ebd9bd",
@@ -53,9 +53,9 @@ FROZEN_KERNELS: dict[str, str] = {
     "assembly_slow_sound": "be8dd3a796eece31a3331d86269e6c8983e6f8684238220e637f09e820c37b90",
     "get_active_bounds": "896b54c7c7959ba5fea71bdd75dfc0af1878559c10c7b92aaecdb885a2176dbb",
     "get_harmonic_value": "85cbbfaa3ca5bc71fd4a8dbbe2a4f8b34297e3af64d071d42e63d0c11c6e10d4",
-    # supernova/core/_solver_kernel2.py
+    # supernova/operators/blocks.py
     "assemble_continuum": "2f22578864457e90d6f7a337264e323b2a0a177ee6b90957516fdcc812fb7da1",
-    # supernova/core/_classify_mode.py
+    # supernova/classify.py
     "_quadratic_forms_real": "5d249dc4e6461638941f23ee50dfb041c794a489706b4318673865cc4c70ca2f",
     # supernova/radial/_harmonics_kernels.py
     "_decompose2d_impl": "878a16900acbcca952514e6ade7c54d84049d091e3813474565e8aede5c90580",
@@ -113,7 +113,7 @@ def discovered():
 
 def test_numba_is_active():
     """The freeze is meaningless if ``njit`` degraded to the no-op fallback."""
-    from supernova.core._continuum_kernel import get_active_bounds
+    from supernova.operators.continuum_kernel import get_active_bounds
 
     assert hasattr(get_active_bounds, "py_func"), (
         "numba is not installed, so no kernel exposes .py_func and the freeze "

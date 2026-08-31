@@ -20,7 +20,7 @@ import numpy as np
 import xarray as xr
 from scipy.sparse import csr_matrix
 
-from ._petsc_helpers import (
+from supernova.eigen.petsc import (
     NEPResult,
     _require_petsc,
     _require_slepc,
@@ -29,13 +29,13 @@ from ._petsc_helpers import (
     apply_petsc_options,
     scipy_csr_to_petsc,
 )
-from .solver3 import (
+from supernova.core.solver3 import (
     _as_scalar_complex,
     _ellipse_region_dict,
     _format_complex,
     _matrix_stats,
 )
-from .solver4 import superSolver4
+from supernova.core.solver4 import superSolver4
 
 
 def _polynomial_residual_norm(

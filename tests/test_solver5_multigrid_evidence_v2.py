@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from supernova.core.solver5_multigrid_evidence import (
+from supernova.solve.evidence import (
     EvidenceV2Config,
     MeshPerturbationOptions,
     PhysicalDisplacementMetric,
@@ -25,7 +25,7 @@ from supernova.core.solver5_multigrid_evidence import (
     weighted_principal_angle_cosines,
     window_catalog_status,
 )
-from supernova.core.solver5_multigrid import (
+from supernova.solve.multigrid import (
     ModeClassificationThresholds,
     _nested_bspline_levels,
     _track_level_solutions,

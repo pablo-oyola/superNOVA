@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
-import supernova.core.continuum as continuum_module
-from supernova.core.continuum import _eigh_signed_definite
+import supernova.continuum as continuum_module
+from supernova.continuum import _eigh_signed_definite
 
 
 def test_eigh_signed_definite_preserves_common_sign_reversal():

@@ -9,7 +9,7 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 from scipy import sparse
 
-from .symmetry import (
+from supernova.verification.symmetry import (
     ALGEBRAIC_TOLERANCE,
     ASSEMBLY_TOLERANCE,
     Tolerance,

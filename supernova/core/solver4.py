@@ -19,14 +19,18 @@ import numpy as np
 import xarray as xr
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..radial import BSplineFE, CompatibleBSplinePair
-from ._boundary4 import BoundaryCondition, idealSeparatrixBC, regularityAxisBC
-from ._solver_kernel2 import (
+from supernova.radial import BSplineFE, CompatibleBSplinePair
+from supernova.operators.boundary import (
+    MixedBoundaryCondition as BoundaryCondition,
+    idealSeparatrixBC,
+    regularityAxisBC,
+)
+from supernova.operators.blocks import (
     _as_coo_tensor,
     _validate_dpsi_hat_dx,
     solver_blocks2,
 )
-from .solver3 import (
+from supernova.core.solver3 import (
     _build_local_M_split,
     _matrix_stats,
     _slice_to_quadrature,

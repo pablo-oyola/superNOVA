@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.constants import mu_0
 
-from supernova.core.itpa_benchmark import ITPAEq
+from supernova.cases.itpa import ITPAEq
 
 
 @pytest.mark.parametrize("Bt_sign", [1, -1])

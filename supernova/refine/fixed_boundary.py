@@ -38,7 +38,7 @@ from matplotlib.path import Path as MplPath
 from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import cKDTree
 
-from .qfit import FixedBoundaryQFitter, QFitConfig
+from supernova.refine.qfit import FixedBoundaryQFitter, QFitConfig
 
 
 DEFAULT_FIT = QFitConfig(

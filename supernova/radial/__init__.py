@@ -1,3 +1,3 @@
-from .base import RadialFE
-from .bspline import BSplineFE, CompatibleBSplinePair
-from .profile import Profile, ProfileFactoryPsiThetaZeta
+from supernova.radial.base import RadialFE
+from supernova.radial.bspline import BSplineFE, CompatibleBSplinePair
+from supernova.radial.profile import Profile, ProfileFactoryPsiThetaZeta

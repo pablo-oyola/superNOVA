@@ -8,8 +8,8 @@ import xarray as xr
 from scipy.sparse import coo_array
 
 import supernova
-import supernova.core.solver5_multigrid as multigrid
-from supernova.core.solver5_multigrid import (
+import supernova.solve.multigrid as multigrid
+from supernova.solve.multigrid import (
     ModeClassificationThresholds,
     MultigridPEPResult,
     MultigridSearchOptions,

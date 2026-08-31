@@ -9,9 +9,9 @@ import matplotlib.pyplot as plt
 import xarray as xr
 
 from typing import List, Optional, Any
-from .base import RadialFE
-from .._logger import get_logger
-from ._harmonics_kernels import (
+from supernova.radial.base import RadialFE
+from supernova._logger import get_logger
+from supernova.radial._harmonics_kernels import (
     decompose2d,
     decompose3d,
     decompose3d_mixed_sign,

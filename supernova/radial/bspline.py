@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from typing import List, Optional, Tuple
-from .base import RadialFE
+from supernova.radial.base import RadialFE
 from scipy.interpolate import BSpline
 from scipy.sparse import coo_matrix, csr_matrix, lil_matrix
 from numpy.polynomial.legendre import leggauss

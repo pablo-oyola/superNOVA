@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from supernova.core._continuum_kernel import (
+from supernova.operators.continuum_kernel import (
     _fill_block_kernel,
     _fill_convolution_block_kernel,
     get_harmonic_value,

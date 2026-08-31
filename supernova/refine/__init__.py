@@ -16,14 +16,14 @@ environment.
     ))
 """
 
-from .fixed_boundary import (
+from supernova.refine.fixed_boundary import (
     DEFAULT_FIT,
     RefinementConfig,
     load_diagnostics,
     refine_equilibrium,
     repair_fixed_boundary_export,
 )
-from .qfit import (
+from supernova.refine.qfit import (
     EquilibriumSamples,
     FixedBoundaryQFitter,
     QFitConfig,

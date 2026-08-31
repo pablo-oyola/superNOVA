@@ -8,7 +8,7 @@ Accelerated kernels to decompose fields into (n, m) harmonics.
 import numpy as np
 
 # Importing the accelerators.
-from .._utils import njit, prange
+from supernova._utils import njit, prange
 
 
 @njit(cache=True, nogil=True)

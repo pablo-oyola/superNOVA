@@ -17,14 +17,14 @@ T = (\partial_\psi, \partial_\psi, 0, 0)(p_1, \xi_\psi, \xi^s, \nabla\cdot\xi) -
 
 import numpy as np
 import unyt
-from .equilibrium import superEquilibrium, _active_poloidal_flux_span
-from .continuum import superContinuum
-from .continuum import continuum_crossings, get_knots_clustered_at
-from ..radial.base import RadialFE
-from ..radial.profile import Profile
+from supernova.equilibrium import superEquilibrium, _active_poloidal_flux_span
+from supernova.continuum import superContinuum
+from supernova.continuum import continuum_crossings, get_knots_clustered_at
+from supernova.radial.base import RadialFE
+from supernova.radial.profile import Profile
 
 # Let's import the kernels
-from ._solver_kernel2 import solver_blocks2, build_solver_blocks2
+from supernova.operators.blocks import solver_blocks2, build_solver_blocks2
 # Let's import the PETSc interface for the Krylov inversion.
 
 

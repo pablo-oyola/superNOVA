@@ -11,8 +11,8 @@ import xarray as xr
 pytest.importorskip("desc")
 from desc.grid import LinearGrid
 
-from supernova.core.continuum import superContinuum
-from supernova.core.desc_helper import (
+from supernova.continuum import superContinuum
+from supernova.interop.desc import (
     DESCSolver,
     _dtheta,
     _local_magnetic_shear_desc,

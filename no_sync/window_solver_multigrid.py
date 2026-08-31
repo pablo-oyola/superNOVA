@@ -668,7 +668,7 @@ def _physical_metric_path(artifact_dir: Path) -> Path:
 
 
 def _load_physical_overlap_metric(path: Path):
-    from supernova.core.solver5_multigrid_evidence import PhysicalDisplacementMetric
+    from supernova.solve.evidence import PhysicalDisplacementMetric
 
     dataset = _load_portable_dataset(
         path,
@@ -693,7 +693,7 @@ def _build_physical_overlap_metric(
 ):
     """Build and cache the resolved kinetic metric without invoking SLEPc."""
     import supernova as sn
-    from supernova.core.solver5_multigrid import (
+    from supernova.solve.multigrid import (
         build_resolved_kinetic_energy_metric,
     )
 
@@ -839,7 +839,7 @@ def _retrack_raw_levels(
 ):
     """Rebuild nested spaces, deduplicate saved roots, and rematch all levels."""
     from supernova.core.solver4 import _build_mixed_radial_data
-    from supernova.core.solver5_multigrid import (
+    from supernova.solve.multigrid import (
         ModeClassificationThresholds,
         MultigridSearchOptions,
         _deduplicate_window_dataset,
@@ -984,7 +984,7 @@ def _legacy_track_association(
 
 def _legacy_modes_to_tracks(modes: xr.Dataset) -> tuple[xr.Dataset, np.ndarray]:
     """Migrate the portable schema-v1 mode table into classifier inputs."""
-    from supernova.core.solver5_multigrid_evidence import (
+    from supernova.solve.evidence import (
         migrate_legacy_mode_dataset,
     )
 
@@ -1014,7 +1014,7 @@ def _load_legacy_modes(artifact_dir: Path) -> xr.Dataset:
 
 
 def _trapezoid_weights(points: np.ndarray) -> np.ndarray:
-    from supernova.core.solver5_multigrid_evidence import trapezoid_weights
+    from supernova.solve.evidence import trapezoid_weights
 
     return trapezoid_weights(points)
 
@@ -1090,7 +1090,7 @@ def _reclassification_table(
 
 def _run_reclassify(args: argparse.Namespace) -> None:
     """Reclassify saved roots without constructing eigenoperators or calling SLEPc."""
-    from supernova.core.solver5_multigrid_evidence import (
+    from supernova.solve.evidence import (
         EvidenceV2Config,
         catalog_status_from_diagnostics,
         classify_tracks_evidence_v2,
@@ -1403,7 +1403,7 @@ def _reacquisition_selection_rows(
     omega_to_khz,
     eligible: np.ndarray | None = None,
 ) -> list[dict[str, object]]:
-    from supernova.core.solver5_multigrid_evidence import (
+    from supernova.solve.evidence import (
         select_reacquisition_candidates,
     )
 
@@ -1441,13 +1441,13 @@ def _run_reacquire(args: argparse.Namespace) -> None:
     """Continue only saved tracks missing on their immediately finer mesh."""
     import supernova as sn
     from supernova.core.solver3 import _build_local_M_split
-    from supernova.core.solver5_multigrid import (
+    from supernova.solve.multigrid import (
         ModeClassificationThresholds,
         MultigridSearchOptions,
         _attach_enriched_residuals,
         _window_diagnostics_dataset,
     )
-    from supernova.core.solver5_multigrid_evidence import (
+    from supernova.solve.evidence import (
         EvidenceV2Config,
         ReacquisitionOptions,
         catalog_status_from_diagnostics,

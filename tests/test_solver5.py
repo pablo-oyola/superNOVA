@@ -20,8 +20,8 @@ from supernova.core.solver5 import (
     superSolver5,
 )
 from supernova.core.solver4 import MixedFieldLayout
-from supernova.core._solver_kernel2 import _build_static_blocks
-from supernova.core.equilibrium import (
+from supernova.operators.blocks import _build_static_blocks
+from supernova.equilibrium import (
     _active_poloidal_flux_span,
     _canonicalize_boozer_flux_profiles,
     _validate_internal_equilibrium_convention,
@@ -1159,7 +1159,7 @@ def test_active_poloidal_flux_span_is_offset_invariant():
 
 
 def test_solver5_normalizes_cocos1_flux_per_radian(monkeypatch):
-    from supernova.core.itpa_benchmark import ITPAEq
+    from supernova.cases.itpa import ITPAEq
 
     equ = ITPAEq(ns=16, ntheta=32, m_max=4)
     continuum = supernova.superContinuum(equ, dense=True)

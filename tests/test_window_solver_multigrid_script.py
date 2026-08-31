@@ -209,7 +209,7 @@ def _synthetic_datasets() -> tuple[xr.Dataset, xr.Dataset, xr.Dataset, tuple[flo
 
 class WindowSolverMultigridScriptTests(unittest.TestCase):
     def test_reacquisition_selection_is_eligible_global_and_ranked(self):
-        from supernova.core.solver5_multigrid_evidence import (
+        from supernova.solve.evidence import (
             ReacquisitionOptions,
             select_reacquisition_candidates,
         )
@@ -245,7 +245,7 @@ class WindowSolverMultigridScriptTests(unittest.TestCase):
             )
 
     def test_reacquisition_eligibility_survives_track_reordering(self):
-        from supernova.core.solver5_multigrid import (
+        from supernova.solve.multigrid import (
             _track_mask_from_root_identities,
             _track_root_identities,
         )
@@ -372,8 +372,8 @@ class WindowSolverMultigridScriptTests(unittest.TestCase):
             )
 
     def test_reclassify_rebuilds_tracks_from_raw_levels_without_slepc(self):
-        from supernova.core.solver5_multigrid import _nested_bspline_levels
-        from supernova.core.solver5_multigrid_evidence import (
+        from supernova.solve.multigrid import _nested_bspline_levels
+        from supernova.solve.evidence import (
             bspline_prolongation_matrix,
         )
 

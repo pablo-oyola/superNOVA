@@ -7,10 +7,10 @@ import pytest
 import xarray as xr
 from scipy.sparse import csr_matrix
 
-import supernova.core.solver5_multigrid as multigrid_module
-from supernova.core._petsc_helpers import NEPResult
+import supernova.solve.multigrid as multigrid_module
+from supernova.eigen.petsc import NEPResult
 from supernova.core.solver4 import _build_mixed_radial_data
-from supernova.core.solver5_multigrid import (
+from supernova.solve.multigrid import (
     MultigridSearchOptions,
     ModeClassificationThresholds,
     _WindowRecord,
@@ -22,7 +22,7 @@ from supernova.core.solver5_multigrid import (
     _window_diagnostics_dataset,
     superSolver5Multigrid,
 )
-from supernova.core.solver5_multigrid_evidence import (
+from supernova.solve.evidence import (
     AdaptiveDiscoveryOptions,
     ReacquisitionOptions,
 )

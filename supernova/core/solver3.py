@@ -18,9 +18,9 @@ import numpy as np
 import xarray as xr
 from scipy.sparse import coo_array, csr_matrix
 
-from .solver2 import superSolver2
-from ._petsc_helpers import NEPResult
-from ._solver_kernel2 import (
+from supernova.core.solver2 import superSolver2
+from supernova.eigen.petsc import NEPResult
+from supernova.operators.blocks import (
     mu_0,
     solver_blocks2,
     _as_coo_tensor,

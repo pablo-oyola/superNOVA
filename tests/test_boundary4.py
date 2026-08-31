@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix, eye
 
-from supernova.core._boundary4 import (
-    BoundaryCondition,
+from supernova.operators.boundary import (
+    MixedBoundaryCondition as BoundaryCondition,
     idealSeparatrixBC,
     regularityAxisBC,
 )

@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 from scipy.sparse import coo_array, csr_matrix
 
-from supernova.core._solver_kernel2 import _build_static_blocks
-from supernova.core._solver_kernel2 import build_M_at, solver_blocks2
+from supernova.operators.blocks import _build_static_blocks
+from supernova.operators.blocks import build_M_at, solver_blocks2
 from supernova.core.solver3 import _build_local_M_split
 from supernova.core.solver4 import _project_local_tensor_mixed
 

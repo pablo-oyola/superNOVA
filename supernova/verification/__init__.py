@@ -1,6 +1,6 @@
 """Reusable verification gates for NOVA and small synthetic fixtures."""
 
-from .matrix_properties import (
+from supernova.verification.matrix_properties import (
     PhaseInferenceResult,
     check_hermitian,
     check_matrix_adjointness,
@@ -10,7 +10,7 @@ from .matrix_properties import (
     infer_field_phase_transform,
     phase_transform_matrix,
 )
-from .symmetry import (
+from supernova.verification.symmetry import (
     ALGEBRAIC_TOLERANCE,
     ASSEMBLY_TOLERANCE,
     DEFAULT_TOLERANCES,

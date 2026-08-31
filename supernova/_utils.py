@@ -1,4 +1,4 @@
-from ._logger import get_logger
+from supernova._logger import get_logger
 
 logger = get_logger(__name__)
 
