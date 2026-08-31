@@ -8,8 +8,8 @@ from scipy.sparse import coo_array, csr_matrix
 
 from supernova.operators.blocks import _build_static_blocks
 from supernova.operators.blocks import build_M_at, solver_blocks2
-from supernova.core.solver3 import _build_local_M_split
-from supernova.core.solver4 import _project_local_tensor_mixed
+from supernova.operators.local import _build_local_M_split
+from supernova.operators.project import _project_local_tensor_mixed
 
 
 def _amplitudes(a0, a1):

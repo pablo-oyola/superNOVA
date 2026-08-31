@@ -7,14 +7,16 @@ import pytest
 from scipy.sparse import coo_array, csr_matrix, isspmatrix_csr
 
 import supernova
-import supernova.core.solver4 as solver4_module
-from supernova.core.solver5 import superSolver5
-from supernova.core.solver4 import (
+# assemble_split_matrices resolves _build_local_M_split in the module that
+# defines StabilitySolver, so that is where the fake belongs.
+import supernova.solve.stability as solver4_module
+from supernova.solve.stability import superSolver5
+from supernova.operators.mixed import (
     MixedFieldLayout,
     _build_mixed_radial_data,
-    _project_local_tensor_mixed,
-    superSolver4,
 )
+from supernova.operators.project import _project_local_tensor_mixed
+from supernova.solve.stability import superSolver4
 from supernova.radial import BSplineFE
 
 
@@ -441,8 +443,8 @@ def test_solver4_rejects_rectangular_inputs_before_petsc(bc_options):
         )
 
 
-def test_supernova_exports_solver4_without_replacing_solver3():
+def test_supernova_exports_solver4_as_the_flattened_solver():
     assert supernova.superSolver4 is superSolver4
-    assert supernova.superSolver3 is not supernova.superSolver4
+    assert supernova.superSolver4 is supernova.StabilitySolver
 
 

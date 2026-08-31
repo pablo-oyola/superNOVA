@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import xarray as xr
 
-import supernova.core.solver2 as solver2_module
-from supernova.core.solver2 import superSolver2
+import supernova.solve.stability as solver2_module
+from supernova.solve.stability import superSolver2
 from supernova.radial.profile import Profile
 
 

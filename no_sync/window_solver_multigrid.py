@@ -838,7 +838,7 @@ def _retrack_raw_levels(
     physical_metric=None,
 ):
     """Rebuild nested spaces, deduplicate saved roots, and rematch all levels."""
-    from supernova.core.solver4 import _build_mixed_radial_data
+    from supernova.operators.mixed import _build_mixed_radial_data
     from supernova.solve.multigrid import (
         ModeClassificationThresholds,
         MultigridSearchOptions,
@@ -1440,7 +1440,7 @@ def _reacquisition_selection_rows(
 def _run_reacquire(args: argparse.Namespace) -> None:
     """Continue only saved tracks missing on their immediately finer mesh."""
     import supernova as sn
-    from supernova.core.solver3 import _build_local_M_split
+    from supernova.operators.local import _build_local_M_split
     from supernova.solve.multigrid import (
         ModeClassificationThresholds,
         MultigridSearchOptions,

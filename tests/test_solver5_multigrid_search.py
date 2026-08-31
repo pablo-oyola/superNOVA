@@ -9,7 +9,7 @@ from scipy.sparse import csr_matrix
 
 import supernova.solve.multigrid as multigrid_module
 from supernova.eigen.petsc import NEPResult
-from supernova.core.solver4 import _build_mixed_radial_data
+from supernova.operators.mixed import _build_mixed_radial_data
 from supernova.solve.multigrid import (
     MultigridSearchOptions,
     ModeClassificationThresholds,

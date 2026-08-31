@@ -21,14 +21,12 @@ from scipy.optimize import linear_sum_assignment
 from supernova.radial import BSplineFE
 from supernova.eigen.petsc import NEPResult
 from supernova.operators.blocks import mu_0
-from supernova.core.solver3 import _build_local_M_split
-from supernova.core.solver4 import MixedRadialData, _build_mixed_radial_data
-from supernova.core.solver5 import (
-    LinearGeneralizedEPSSolver,
-    QuadraticPEPSolver,
-    _build_solver5_eigensolver_from_matrices,
-    superSolver5,
-)
+from supernova.operators.local import _build_local_M_split
+from supernova.operators.mixed import MixedRadialData, _build_mixed_radial_data
+from supernova.eigen.gevp import LinearGeneralizedEPSSolver
+from supernova.eigen.pep import QuadraticPEPSolver
+from supernova.eigen.dispatch import _build_solver5_eigensolver_from_matrices
+from supernova.solve.stability import superSolver5
 from supernova.solve.evidence import (
     CLASSIFICATION_VERSION,
     AdaptiveDiscoveryOptions,

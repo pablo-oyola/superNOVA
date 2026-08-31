@@ -19,10 +19,8 @@ import pytest
 from scipy.sparse import coo_array
 
 from supernova.radial import BSplineFE
-from supernova.core.solver4 import (
-    _build_mixed_radial_data,
-    _project_local_tensor_mixed,
-)
+from supernova.operators.mixed import _build_mixed_radial_data
+from supernova.operators.project import _project_local_tensor_mixed
 
 
 # Ten of the sixteen field blocks are populated, with banded mode coupling --

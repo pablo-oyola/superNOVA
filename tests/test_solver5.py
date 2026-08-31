@@ -9,17 +9,30 @@ import xarray as xr
 from scipy.sparse import csr_matrix
 
 import supernova
-import supernova.core.solver2 as solver2_module
-import supernova.core.solver5 as solver5_module
+import supernova.solve.stability as solver2_module
+# The split put backend selection in eigen.dispatch and the PETSc plumbing in
+# each backend module. solver5_module keeps naming the place a fake *backend*
+# goes; _patch_backends puts a fake helper in both backends, since a given test
+# drives only one of them.
+import supernova.eigen.dispatch as solver5_module
+import supernova.eigen.gevp as _gevp_module
+import supernova.eigen.pep as _pep_module
+
+
+def _patch_backends(monkeypatch, name, value):
+    for module in (_pep_module, _gevp_module):
+        monkeypatch.setattr(module, name, value, raising=False)
 import no_sync.solver5_itpa_fitted_eqdsk.solver5_plots as solver5_plots_module
-from supernova.core.solver5 import (
+from supernova.eigen.gevp import (
     _linear_residuals,
+    _validate_gamma_zero_pencil,
+)
+from supernova.eigen.pep import (
     _polynomial_backward_error,
     _polynomial_residual_norm,
-    _validate_gamma_zero_pencil,
-    superSolver5,
 )
-from supernova.core.solver4 import MixedFieldLayout
+from supernova.solve.stability import superSolver5
+from supernova.operators.mixed import MixedFieldLayout
 from supernova.operators.blocks import _build_static_blocks
 from supernova.equilibrium import (
     _active_poloidal_flux_span,
@@ -347,8 +360,8 @@ def test_quadratic_pep_rejects_nonfinite_coefficients_before_petsc(
     def fail_if_petsc_is_requested():
         pytest.fail("PETSc was requested before coefficient validation")
 
-    monkeypatch.setattr(
-        solver5_module,
+    _patch_backends(
+        monkeypatch,
         "_require_petsc",
         fail_if_petsc_is_requested,
     )
@@ -410,12 +423,12 @@ def test_quadratic_pep_retarget_resets_and_reattaches_existing_operators(
     wrapper.last_slepc_error_estimates = np.array([4.0])
     wrapper.last_slepc_backward_errors = np.array([5.0])
     wrapper._configure_mixed_shift_solver = lambda: events.append(("configure",))
-    monkeypatch.setattr(
-        solver5_module,
+    _patch_backends(
+        monkeypatch,
         "_require_slepc",
         lambda: SimpleNamespace(
             ST=SimpleNamespace(Type=SimpleNamespace(SINVERT="sinvert"))
-        ),
+    ),
     )
 
     wrapper.retarget(
@@ -610,17 +623,17 @@ def test_linear_eps_extracts_known_roots_and_native_residuals(monkeypatch):
     wrapper.compute_residuals = True
     wrapper.target_s = 1.5
     wrapper.verbose = False
-    monkeypatch.setattr(
-        solver5_module,
+    _patch_backends(
+        monkeypatch,
         "_vec_read_array",
         lambda vector: vector.values,
     )
-    monkeypatch.setattr(
-        solver5_module,
+    _patch_backends(
+        monkeypatch,
         "_require_slepc",
         lambda: SimpleNamespace(
             EPS=SimpleNamespace(ErrorType=SimpleNamespace(BACKWARD="backward"))
-        ),
+    ),
     )
 
     result = wrapper.solve()
@@ -666,8 +679,8 @@ def test_quadratic_pep_allow_empty_supports_empty_frequency_windows(monkeypatch)
     wrapper.compute_residuals = True
     wrapper.target_s = 1.0
     wrapper.verbose = False
-    monkeypatch.setattr(solver5_module, "_require_petsc", lambda: SimpleNamespace())
-    monkeypatch.setattr(solver5_module, "_require_slepc", lambda: SimpleNamespace())
+    _patch_backends(monkeypatch, "_require_petsc", lambda: SimpleNamespace())
+    _patch_backends(monkeypatch, "_require_slepc", lambda: SimpleNamespace())
 
     result = wrapper.solve(allow_empty=True)
 
@@ -714,7 +727,7 @@ def test_linear_eps_allow_empty_supports_empty_frequency_windows(monkeypatch):
     wrapper.compute_residuals = True
     wrapper.target_s = 1.0
     wrapper.verbose = False
-    monkeypatch.setattr(solver5_module, "_require_slepc", lambda: SimpleNamespace())
+    _patch_backends(monkeypatch, "_require_slepc", lambda: SimpleNamespace())
 
     result = wrapper.solve(allow_empty=True)
 
@@ -996,9 +1009,12 @@ def test_solver5_rejects_rectangular_pep_inputs_before_petsc(bc_options):
         )
 
 
-def test_supernova_exports_solver5_without_replacing_solver4():
+def test_supernova_exports_every_solver_generation_as_one_class():
+    """The four generations were flattened; the old names are aliases."""
     assert supernova.superSolver5 is superSolver5
-    assert supernova.superSolver4 is not supernova.superSolver5
+    assert supernova.StabilitySolver is superSolver5
+    for name in ("superSolver2", "superSolver3", "superSolver4", "superSolver5"):
+        assert getattr(supernova, name) is supernova.StabilitySolver
 
 
 def test_quadratic_pep_configures_mumps_before_internal_st_options():

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from scipy import sparse
 
-from supernova.core.solver2 import superSolver2
+from supernova.solve.stability import superSolver2
 from supernova.radial.profile import Profile
 from supernova.verification import (
     Parity,

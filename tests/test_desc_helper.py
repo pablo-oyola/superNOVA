@@ -20,7 +20,7 @@ from supernova.interop.desc import (
     _reflect_boozer_surface_arrays,
     _rho_tor_from_q,
 )
-from supernova.core.solver2 import superSolver2
+from supernova.solve.stability import superSolver2
 from supernova.radial.bspline import BSplineFE
 from supernova.radial.profile import Profile
 

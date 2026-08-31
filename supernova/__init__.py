@@ -1,3 +1,5 @@
+"""superNOVA: ideal-MHD stability of tokamak equilibria."""
+
 __version__ = "0.1.0"
 
 import pycocos
@@ -5,10 +7,13 @@ import pycocos
 from supernova.equilibrium import superEquilibrium
 from supernova.continuum import superContinuum
 from supernova.classify import ContinuumClassifier
-from supernova.core.solver2 import superSolver2
-from supernova.core.solver3 import superSolver3
-from supernova.core.solver4 import superSolver4
-from supernova.core.solver5 import superSolver5
+from supernova.solve.stability import (
+    StabilitySolver,
+    superSolver2,
+    superSolver3,
+    superSolver4,
+    superSolver5,
+)
 from supernova.solve.multigrid import (
     EvidenceV2Config,
     ModeClassificationThresholds,

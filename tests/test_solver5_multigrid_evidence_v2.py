@@ -31,7 +31,7 @@ from supernova.solve.multigrid import (
     _track_level_solutions,
 )
 from supernova.radial import BSplineFE
-from supernova.core.solver4 import _build_mixed_radial_data
+from supernova.operators.mixed import _build_mixed_radial_data
 
 
 def _continuum(values, *, ambiguous=None):
