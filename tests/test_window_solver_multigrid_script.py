@@ -1,4 +1,4 @@
-"""Focused artifact and GUI tests for no_sync/window_solver_multigrid.py."""
+"""Focused artifact tests for no_sync/window_solver_multigrid.py."""
 
 from __future__ import annotations
 
@@ -18,6 +18,193 @@ SPEC = importlib.util.spec_from_file_location("window_solver_multigrid", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+
+
+def _synthetic_datasets() -> tuple[xr.Dataset, xr.Dataset, xr.Dataset, tuple[float, float]]:
+    rng = np.random.default_rng(20260818)
+    frequency_band = (50.0, 150.0)
+    ntracks, nlevels, nx = 16, 3, 192
+    m_pol = np.arange(12, 32, dtype=np.int64)
+    x = np.linspace(0.0, 1.0, nx)
+    labels = np.asarray(
+        [
+            "physical_gap",
+            "continuum_discretization",
+            "physical_gap",
+            "unresolved",
+            "continuum_coupled_candidate",
+            "solver_rejected",
+            "physical_gap",
+            "continuum_discretization",
+            "unresolved",
+            "discretization_artifact",
+            "physical_gap",
+            "continuum_coupled_candidate",
+            "physical_gap",
+            "unresolved",
+            "solver_rejected",
+            "continuum_discretization",
+        ],
+        dtype="U32",
+    )
+    frequencies = np.linspace(56.0, 143.0, ntracks) + rng.normal(0.0, 1.2, ntracks)
+    centers = np.linspace(0.12, 0.90, ntracks)
+    widths = np.where(labels == "continuum_discretization", 0.030, 0.090)
+    widths = np.where(labels == "solver_rejected", 0.018, widths)
+    fields = {
+        name: np.zeros((ntracks, nx, m_pol.size), dtype=np.complex128)
+        for name in MODULE.FIELD_TITLES
+    }
+    dominant_m = np.empty(ntracks, dtype=np.int64)
+    for track in range(ntracks):
+        dominant_index = int((3 * track + 4) % m_pol.size)
+        dominant_m[track] = m_pol[dominant_index]
+        envelope = np.exp(-0.5 * ((x - centers[track]) / widths[track]) ** 2)
+        harmonic = np.exp(
+            -0.5 * ((np.arange(m_pol.size) - dominant_index) / 2.2) ** 2
+        )
+        phase = np.exp(1.0j * (0.55 * x[:, None] * (m_pol[None, :] - dominant_m[track])))
+        xi = envelope[:, None] * harmonic[None, :] * phase
+        xi /= np.sqrt(np.trapezoid(np.sum(np.abs(xi) ** 2, axis=1), x))
+        fields["xi_psi"][track] = xi
+        fields["p1"][track] = 0.34j * xi * (1.0 - 0.35 * x[:, None])
+        fields["xi_s"][track] = 0.62 * xi * np.cos(np.pi * x[:, None])
+        fields["div_xi"][track] = -0.28j * xi * np.sin(2.0 * np.pi * x[:, None])
+
+    level = np.arange(nlevels)
+    drift = np.asarray([0.018, 0.0045, 0.0])
+    signed = np.where(np.arange(ntracks) % 2, -1.0, 1.0)
+    frequency_levels = frequencies[:, None] * (1.0 + signed[:, None] * drift)
+    present = np.ones((ntracks, nlevels), dtype=bool)
+    present[np.isin(labels, ["solver_rejected", "discretization_artifact"]), 0] = False
+    frequency_levels[~present] = np.nan
+    overlap = np.tile(np.asarray([np.nan, 0.965, 0.994]), (ntracks, 1))
+    overlap[labels == "continuum_discretization", -1] = 0.972
+    overlap[labels == "solver_rejected", -1] = 0.61
+    error = np.tile(np.asarray([2.0e-7, 4.0e-10, 8.0e-12]), (ntracks, 1))
+    error[labels == "solver_rejected", -1] = 2.0e-5
+    reasons = np.asarray(
+        [
+            {
+                "physical_gap": "converged_three_level_chain;strict_continuum_gap",
+                "continuum_discretization": "same_sequence_local_continuum_alignment;singular_mesh_scaling",
+                "continuum_coupled_candidate": "global_limit_with_continuum_crossing",
+                "solver_rejected": "final_root_failed_algebraic_validity",
+                "discretization_artifact": "credible_targeted_absence;independent_mesh_nonconvergence",
+                "unresolved": "insufficient_or_conflicting_evidence",
+            }[label]
+            for label in labels
+        ],
+        dtype="U160",
+    )
+    modes = xr.Dataset(
+        data_vars={
+            **{
+                name: (("track", "x", "m_pol"), values)
+                for name, values in fields.items()
+            },
+            "omega": ("track", frequencies.astype(np.complex128) / 100.0),
+            "frequency_khz": ("track", frequencies),
+            "center": ("track", centers),
+            "radial_width": ("track", widths),
+            "dominant_m": ("track", dominant_m),
+            "normalization_scale": ("track", np.ones(ntracks)),
+            "window_id": ("track", np.arange(ntracks)),
+            "window_depth": ("track", np.full(ntracks, 4)),
+            "frequency_khz_by_level": (("track", "level"), frequency_levels),
+            "present_by_level": (("track", "level"), present),
+            "backward_error_by_level": (("track", "level"), error),
+            "xi_psi_overlap_by_level": (("track", "level"), overlap),
+            "frequency_change_by_level": (
+                ("track", "level"),
+                np.abs(frequency_levels / frequencies[:, None] - 1.0),
+            ),
+            "rms_width_by_level": (
+                ("track", "level"),
+                widths[:, None] * np.asarray([1.16, 1.05, 1.0]),
+            ),
+            "ipr_by_level": (
+                ("track", "level"),
+                (1.0 / widths[:, None]) * np.asarray([0.86, 0.95, 1.0]),
+            ),
+            "label": ("track", labels),
+            "reason": ("track", reasons),
+            "last_level": ("track", np.full(ntracks, 2, dtype=np.int64)),
+            "numerically_valid": ("track", labels != "solver_rejected"),
+            "chain_numerically_valid": ("track", labels != "solver_rejected"),
+            "converged_chain": (
+                "track",
+                np.isin(labels, ["physical_gap", "continuum_coupled_candidate"]),
+            ),
+            "present_all_levels": ("track", np.all(present, axis=1)),
+            "assignment_ambiguous": ("track", labels == "unresolved"),
+            "strict_continuum_crossing": (
+                "track",
+                np.isin(labels, ["continuum_discretization", "continuum_coupled_candidate"]),
+            ),
+            "strict_gap": ("track", labels == "physical_gap"),
+            "minimum_relative_continuum_clearance": (
+                "track",
+                np.where(labels == "physical_gap", 0.032, 0.0015),
+            ),
+            "continuum_band_power_fraction": (
+                "track",
+                np.where(labels == "continuum_discretization", 0.58, 0.025),
+            ),
+            "fine_frequency_change": (
+                "track",
+                np.abs(frequency_levels[:, -1] / frequency_levels[:, -2] - 1.0),
+            ),
+            "medium_fine_overlap": ("track", overlap[:, -1]),
+            "width_ratio": ("track", np.full(ntracks, 0.95)),
+            "ipr_ratio": ("track", np.full(ntracks, 1.05)),
+            "continuum_complete": ("track", np.ones(ntracks, dtype=bool)),
+        },
+        coords={"track": np.arange(ntracks), "level": level, "x": x, "m_pol": m_pol},
+        attrs={
+            "schema_version": MODULE.SCHEMA_VERSION,
+            "demo": True,
+            "ntor": 4,
+            "mmax": 68,
+            "radial_coordinate": "psi_N",
+            "frequency_min_khz": frequency_band[0],
+            "frequency_max_khz": frequency_band[1],
+            "normalization": "integral sum_m |xi_psi_m|^2 dpsi_N = 1",
+            "phase_alignment": "largest-magnitude xi_psi sample made real-positive",
+        },
+    )
+
+    psi = np.linspace(0.0, 1.0, 256)
+    branch = np.arange(24)
+    base = 42.0 + 4.4 * branch[None, :]
+    slope = (psi[:, None] - 0.5) * (18.0 * np.sin(0.75 * branch)[None, :])
+    ripple = 3.5 * np.sin(2.0 * np.pi * psi[:, None] + 0.35 * branch[None, :])
+    continuum_khz = base + slope + ripple
+    continuum = xr.Dataset(
+        data_vars={
+            "omega": (("psi", "branch"), continuum_khz.astype(np.complex128) / 100.0),
+            "frequency_khz": (("psi", "branch"), continuum_khz),
+            "branch_assignment_ambiguous": (
+                ("psi", "branch"),
+                np.zeros_like(continuum_khz, dtype=bool),
+            ),
+        },
+        coords={"psi": psi, "branch": branch},
+        attrs={"demo": True, "omega_normalization": "omegaA"},
+    )
+    diagnostics = xr.Dataset(
+        data_vars={
+            "level_complete": ("level", np.ones(nlevels, dtype=bool)),
+            "valid": (("level", "window"), np.ones((nlevels, 5), dtype=bool)),
+            "nreturned": (
+                ("level", "window"),
+                rng.integers(2, 8, size=(nlevels, 5)),
+            ),
+        },
+        coords={"level": level, "window": np.arange(5)},
+        attrs={"demo": True, "omega_min": 0.5, "omega_max": 1.5},
+    )
+    return modes, continuum, diagnostics, frequency_band
 
 
 class WindowSolverMultigridScriptTests(unittest.TestCase):
@@ -341,8 +528,8 @@ class WindowSolverMultigridScriptTests(unittest.TestCase):
                 output / "modes_evidence_v2.nc",
             )
 
-    def test_demo_modes_are_normalized_and_cover_every_label(self):
-        modes, continuum, diagnostics, band = MODULE._demo_datasets()
+    def test_synthetic_modes_are_normalized_and_cover_every_label(self):
+        modes, continuum, diagnostics, band = _synthetic_datasets()
 
         np.testing.assert_allclose(band, (50.0, 150.0))
         self.assertEqual(set(modes["label"].values.tolist()), set(MODULE.LABEL_ORDER))
@@ -368,323 +555,13 @@ class WindowSolverMultigridScriptTests(unittest.TestCase):
         self.assertEqual(stored.attrs["complete"], 1)
         self.assertEqual(stored.attrs["optional"], "None")
 
-    def test_demo_artifacts_round_trip_and_build_dash_app(self):
-        modes, continuum, diagnostics, band = MODULE._demo_datasets()
-        display_continuum = continuum.isel(branch=slice(0, None, 2)).assign_attrs(
-            continuum_kind="slow_sound",
-            purpose="display_only",
-        )
-        manifest = MODULE._artifact_manifest(
-            args=None,
-            modes=modes,
-            frequency_band=band,
-            demo=True,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            MODULE._save_artifacts(
-                output,
-                modes,
-                continuum,
-                diagnostics,
-                band,
-                manifest,
-                display_continuum=display_continuum,
-            )
-
-            self.assertIs(
-                json.loads((output / "manifest.json").read_text())["demo"],
-                True,
-            )
-            with xr.open_dataset(output / "modes.nc", engine="netcdf4") as saved:
-                self.assertEqual(
-                    saved["xi_psi_real"].dims,
-                    ("track", "x", "m_pol"),
-                )
-                self.assertEqual(
-                    saved["xi_psi_imag"].dims,
-                    ("track", "x", "m_pol"),
-                )
-                self.assertNotIn("xi_psi", saved)
-                self.assertTrue(saved.attrs["complex_storage"].startswith("paired"))
-
-            _, _, loaded_continuum, loaded_full_continuum = (
-                MODULE._load_explorer_metadata(output)
-            )
-            self.assertEqual(
-                loaded_continuum.sizes["branch"],
-                display_continuum.sizes["branch"],
-            )
-            self.assertEqual(loaded_continuum.attrs["continuum_kind"], "slow_sound")
-            self.assertEqual(
-                loaded_full_continuum.sizes["branch"],
-                continuum.sizes["branch"],
-            )
-            self.assertEqual(
-                loaded_full_continuum.attrs["continuum_kind"],
-                "full_sound_alfven",
-            )
-
-            app = MODULE._build_dash_app(output)
-            self.assertEqual(app.title, "solver5 multigrid mode explorer")
-            self.assertEqual(len(app.callback_map), 3)
-            spectrum_callback = next(
-                key for key in app.callback_map if key.startswith("..spectrum.figure")
-            )
-            self.assertEqual(
-                app.callback_map[spectrum_callback]["inputs"],
-                [
-                    {"id": "label-filter", "property": "value"},
-                    {"id": "continuum-background", "property": "value"},
-                    {"id": "diagnostic-color", "property": "value"},
-                ],
-            )
-            self.assertIsNotNone(app.layout)
-            client = app.server.test_client()
-            self.assertEqual(client.get("/").status_code, 200)
-            layout_response = client.get("/_dash-layout")
-            self.assertEqual(layout_response.status_code, 200)
-            layout_json = json.dumps(layout_response.get_json())
-            self.assertIn("label-filter", layout_json)
-            self.assertIn("Visible classifications", layout_json)
-            self.assertIn("continuum-background", layout_json)
-            self.assertIn("resolution-diagnostic", layout_json)
-
-            spectrum_click = client.post(
-                "/_dash-update-component",
-                json={
-                    "output": "mode-select.value",
-                    "outputs": {"id": "mode-select", "property": "value"},
-                    "changedPropIds": ["spectrum.clickData"],
-                    "inputs": [
-                        {
-                            "id": "spectrum",
-                            "property": "clickData",
-                            "value": {"points": [{"customdata": [7]}]},
-                        },
-                        {
-                            "id": "resolution-diagnostic",
-                            "property": "clickData",
-                            "value": None,
-                        },
-                    ],
-                    "state": [
-                        {"id": "mode-select", "property": "value", "value": 0}
-                    ],
-                },
-            )
-            self.assertEqual(spectrum_click.status_code, 200)
-            self.assertEqual(
-                spectrum_click.get_json()["response"]["mode-select"]["value"],
-                7,
-            )
-            diagnostic_click = client.post(
-                "/_dash-update-component",
-                json={
-                    "output": "mode-select.value",
-                    "outputs": {"id": "mode-select", "property": "value"},
-                    "changedPropIds": ["resolution-diagnostic.clickData"],
-                    "inputs": [
-                        {
-                            "id": "spectrum",
-                            "property": "clickData",
-                            "value": None,
-                        },
-                        {
-                            "id": "resolution-diagnostic",
-                            "property": "clickData",
-                            "value": {
-                                "points": [
-                                    {"id": "track-9", "customdata": [9, 2]}
-                                ]
-                            },
-                        },
-                    ],
-                    "state": [
-                        {"id": "mode-select", "property": "value", "value": 7}
-                    ],
-                },
-            )
-            self.assertEqual(diagnostic_click.status_code, 200)
-            self.assertEqual(
-                diagnostic_click.get_json()["response"]["mode-select"]["value"],
-                9,
-            )
-            detail_callback = next(
-                key for key in app.callback_map if key.startswith("..profile.figure")
-            )
-            detail_outputs = [
-                {
-                    "id": output.component_id,
-                    "property": output.component_property,
-                }
-                for output in app.callback_map[detail_callback]["output"]
-            ]
-            detail_response = client.post(
-                "/_dash-update-component",
-                json={
-                    "output": detail_callback,
-                    "outputs": detail_outputs,
-                    "changedPropIds": ["mode-select.value"],
-                    "inputs": [
-                        {"id": "mode-select", "property": "value", "value": 9},
-                        {
-                            "id": "field-select",
-                            "property": "value",
-                            "value": "xi_psi",
-                        },
-                        {
-                            "id": "component-select",
-                            "property": "value",
-                            "value": "magnitude",
-                        },
-                        {
-                            "id": "harmonic-count",
-                            "property": "value",
-                            "value": 10,
-                        },
-                    ],
-                    "state": [],
-                },
-            )
-            self.assertEqual(detail_response.status_code, 200)
-            detail_payload = detail_response.get_json()["response"]
-            self.assertEqual(detail_payload["mode-heading"]["children"], "Track 9")
-            self.assertGreater(
-                len(detail_payload["profile"]["figure"]["data"]),
-                0,
-            )
-
-    def test_serve_prefers_production_artifacts_then_falls_back_to_demo(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            demo = output / "demo"
-            demo.mkdir()
-            (demo / "manifest.json").write_text("{}", encoding="utf-8")
-
-            self.assertEqual(MODULE._resolve_serve_artifact_dir(output), demo)
-
-            (output / "manifest.json").write_text("{}", encoding="utf-8")
-            self.assertEqual(MODULE._resolve_serve_artifact_dir(output), output)
-
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(
-                FileNotFoundError,
-                "Run the demo or solve command first",
-            ):
-                MODULE._resolve_serve_artifact_dir(Path(directory))
-
-    def test_explorer_figures_expose_track_selection_and_harmonics(self):
-        modes, continuum, diagnostics, band = MODULE._demo_datasets()
-        manifest = MODULE._artifact_manifest(
-            args=None,
-            modes=modes,
-            frequency_band=band,
-            demo=True,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            MODULE._save_artifacts(
-                output,
-                modes,
-                continuum,
-                diagnostics,
-                band,
-                manifest,
-            )
-            _, compact_modes, compact_continuum, full_continuum = (
-                MODULE._load_explorer_metadata(output)
-            )
-
-            spectrum = MODULE._spectrum_figure(
-                compact_modes,
-                compact_continuum,
-                MODULE.LABEL_ORDER,
-            )
-            marker_traces = [
-                trace for trace in spectrum.data if trace.customdata is not None
-            ]
-            self.assertEqual(spectrum.data[0].name, "Slow-sound continuum")
-            self.assertEqual(len(marker_traces), len(MODULE.LABEL_ORDER))
-            self.assertEqual(
-                sum(len(trace.x) for trace in marker_traces),
-                modes.sizes["track"],
-            )
-
-            physical_only = MODULE._spectrum_figure(
-                compact_modes,
-                compact_continuum,
-                ["physical_gap"],
-            )
-            self.assertEqual(physical_only.data[0].name, "Slow-sound continuum")
-            self.assertEqual(
-                [trace.name for trace in physical_only.data[1:]],
-                ["Physical gap (5)"],
-            )
-            continuum_only = MODULE._spectrum_figure(
-                compact_modes,
-                compact_continuum,
-                ["continuum_discretization"],
-            )
-            self.assertEqual(
-                [trace.name for trace in continuum_only.data[1:]],
-                ["Continuum discretization (3)"],
-            )
-            no_modes = MODULE._spectrum_figure(
-                compact_modes,
-                compact_continuum,
-                [],
-            )
-            self.assertEqual(len(no_modes.data), 1)
-            self.assertEqual(no_modes.data[0].name, "Slow-sound continuum")
-
-            full_spectrum = MODULE._spectrum_figure(
-                compact_modes,
-                full_continuum,
-                [],
-            )
-            self.assertEqual(full_spectrum.data[0].name, "Full sound-Alfven continuum")
-            self.assertIn(
-                "Full sound-Alfven",
-                full_spectrum.layout.title.text,
-            )
-
-            diagnostic = MODULE._resolution_diagnostic_figure(
-                compact_modes,
-                full_continuum,
-                MODULE.LABEL_ORDER,
-                "h_times_kr",
-            )
-            self.assertIn("full sound alfven", diagnostic.layout.title.text)
-            colorbars = [
-                trace.marker.colorbar.title.text
-                for trace in diagnostic.data
-                if getattr(trace, "marker", None) is not None
-                and getattr(trace.marker, "colorbar", None) is not None
-                and getattr(trace.marker.colorbar, "title", None) is not None
-                and trace.marker.colorbar.title.text
-            ]
-            self.assertIn("h * k_r", colorbars)
-
-            profile = MODULE._profile_figure(
-                output,
-                0,
-                "xi_psi",
-                "magnitude",
-                7,
-            )
-            self.assertEqual(len(profile.data), 8)
-            convergence = MODULE._convergence_figure(compact_modes, 0)
-            self.assertGreaterEqual(len(convergence.data), 2)
-
     def test_empty_search_still_writes_continuum_artifacts(self):
-        modes, continuum, diagnostics, band = MODULE._demo_datasets()
+        modes, continuum, diagnostics, band = _synthetic_datasets()
         empty = modes.isel(track=slice(0, 0))
         manifest = MODULE._artifact_manifest(
             args=None,
             modes=empty,
             frequency_band=band,
-            demo=True,
         )
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -697,11 +574,18 @@ class WindowSolverMultigridScriptTests(unittest.TestCase):
                 manifest,
             )
 
-            preview = (output / "explorer_preview.html").read_text()
-            self.assertIn("No classified roots were returned", preview)
-            app = MODULE._build_dash_app(output)
-            self.assertEqual(len(app.callback_map), 0)
-            self.assertIsNotNone(app.layout)
+            for name in (
+                "continuum.nc",
+                "display_continuum.nc",
+                "window_diagnostics.nc",
+                "summary.csv",
+                "overview.png",
+                "manifest.json",
+            ):
+                self.assertTrue((output / name).is_file(), name)
+            written = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(written["mode_count"], 0)
+            self.assertEqual(written["classification_counts"], {})
 
 
 if __name__ == "__main__":
