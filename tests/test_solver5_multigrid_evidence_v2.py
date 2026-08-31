@@ -1,6 +1,5 @@
 """PETSc-free regression tests for the evidence-v2 mode pipeline."""
 
-import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -599,17 +598,7 @@ def test_legacy_serialized_mode_schema_can_be_migrated_and_reclassified():
 
 
 def test_explorer_prefers_validated_full_physical_artifacts():
-    script_path = (
-        Path(__file__).resolve().parents[1]
-        / "no_sync"
-        / "window_solver_multigrid.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "window_solver_multigrid_test_module",
-        script_path,
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    from supernova.app import artifacts as module
 
     with tempfile.TemporaryDirectory() as directory:
         artifact_dir = Path(directory)

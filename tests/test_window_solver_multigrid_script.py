@@ -1,8 +1,11 @@
-"""Focused artifact tests for no_sync/window_solver_multigrid.py."""
+"""Artifact, reclassify and reacquire tests for supernova.app.
+
+These used to load no_sync/window_solver_multigrid.py by path, because that is
+where the code lived. It is now a package, so they import it.
+"""
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -12,12 +15,24 @@ import unittest
 import numpy as np
 import xarray as xr
 
+from supernova.app import artifacts as MODULE_ARTIFACTS
+from supernova.app import schema as MODULE_SCHEMA
+from supernova.app import workflow as MODULE_WORKFLOW
 
-SCRIPT = Path(__file__).resolve().parents[1] / "no_sync/window_solver_multigrid.py"
-SPEC = importlib.util.spec_from_file_location("window_solver_multigrid", SCRIPT)
-MODULE = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(MODULE)
+
+class _Facade:
+    """Resolve a name across the modules the driver was split into."""
+
+    _sources = (MODULE_WORKFLOW, MODULE_ARTIFACTS, MODULE_SCHEMA)
+
+    def __getattr__(self, name):
+        for source in self._sources:
+            if hasattr(source, name):
+                return getattr(source, name)
+        raise AttributeError(name)
+
+
+MODULE = _Facade()
 
 
 def _synthetic_datasets() -> tuple[xr.Dataset, xr.Dataset, xr.Dataset, tuple[float, float]]:
