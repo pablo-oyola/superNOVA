@@ -142,6 +142,61 @@ def test_solver_geometry_bypasses_native_grid_round_trip():
     )
 
 
+def test_solver_geometry_uses_finite_spectral_map_differentials():
+    class FakeCoordinateMap:
+        def __init__(self):
+            self.psi = None
+            self.theta = None
+
+        def differentials(self, psi, theta):
+            self.psi = psi.copy()
+            self.theta = theta.copy()
+            shape = psi.shape
+            metric = np.empty(shape + (3, 3), dtype=float)
+            for ii in range(3):
+                for jj in range(3):
+                    metric[..., ii, jj] = 10.0 * ii + jj + 1.0
+            return SimpleNamespace(
+                metric_contravariant=metric,
+                jacobian=np.full(shape, 5.0),
+            )
+
+    coordinate_map = FakeCoordinateMap()
+    psi0 = xr.DataArray(
+        [0.05, 0.5, 0.95],
+        dims=("psi0",),
+        attrs={"psi_axis": 0.0, "psi_boundary": 1.0},
+    )
+    fake = SimpleNamespace(
+        coords=xr.Dataset(
+            {
+                "psi0": psi0,
+                "thetageom": ("thetageom", np.linspace(0.0, 2.0 * np.pi, 8)),
+            }
+        ),
+        _coordinate_map=coordinate_map,
+    )
+    equilibrium = superEquilibrium.__new__(superEquilibrium)
+    equilibrium.boozer = fake
+    equilibrium._poloidal_orientation = -1
+
+    geometry = equilibrium._boozer_geometry_on_solver_grid()
+
+    assert geometry.sizes == {"psi": 3, "theta": 8, "zeta": 1}
+    np.testing.assert_allclose(geometry.psi, [0.0, 0.5, 1.0])
+    np.testing.assert_allclose(
+        geometry.psi_physical_norm,
+        [0.05, 0.5, 0.95],
+    )
+    np.testing.assert_allclose(geometry.gtheta_zeta, 13.0)
+    np.testing.assert_allclose(geometry.jac, -5.0)
+    np.testing.assert_allclose(coordinate_map.psi[:, 0], [0.05, 0.5, 0.95])
+    assert np.all(np.isfinite(geometry.to_array()))
+    assert geometry.gpsi_theta.attrs["projection"].startswith(
+        "pyCOCOS spectral coordinate map"
+    )
+
+
 @pytest.mark.parametrize("missing_name", tuple(_CANONICAL_METADATA))
 def test_missing_internal_cocos_metadata_is_rejected(missing_name):
     metadata = dict(_CANONICAL_METADATA)

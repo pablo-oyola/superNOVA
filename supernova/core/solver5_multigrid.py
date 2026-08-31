@@ -3,7 +3,8 @@ r"""Nested compatible-B-spline multigrid classification for solver5.
 The orchestrator in this module builds the point-local ideal-MHD operator once
 on a finest composite Gauss rule.  Three (or more) knot-insertion-nested radial
 spaces then differ only in Galerkin projection, boundary reduction, and their
-quadratic PEP solves.
+eigenvalue solves. Exact ``gamma_s == 0`` uses generalized EPS; all other cases
+use the quadratic PEP.
 """
 
 from __future__ import annotations
@@ -22,7 +23,12 @@ from ._petsc_helpers import NEPResult
 from ._solver_kernel2 import mu_0
 from .solver3 import _build_local_M_split
 from .solver4 import MixedRadialData, _build_mixed_radial_data
-from .solver5 import QuadraticPEPSolver, superSolver5
+from .solver5 import (
+    LinearGeneralizedEPSSolver,
+    QuadraticPEPSolver,
+    _build_solver5_eigensolver_from_matrices,
+    superSolver5,
+)
 from .solver5_multigrid_evidence import (
     CLASSIFICATION_VERSION,
     AdaptiveDiscoveryOptions,
@@ -1952,6 +1958,39 @@ class superSolver5Multigrid:
             "vscale": float(search.region_vscale),
         }
 
+    def _build_window_eigensolver(
+        self,
+        *,
+        matrices: tuple,
+        target_s: complex,
+        region: dict,
+        search: MultigridSearchOptions,
+        prefix: str,
+        verbose: bool,
+    ):
+        """Use the same transparent exact-zero dispatch as ``superSolver5``."""
+        T0, T1, Tminus1 = matrices
+        return _build_solver5_eigensolver_from_matrices(
+            gamma_s=getattr(getattr(self, "solver", None), "gamma_s", 1.0),
+            T0=T0,
+            T1=T1,
+            Tminus1=Tminus1,
+            target_s=target_s,
+            region=region,
+            prefix=prefix,
+            pep_type=search.pep_type,
+            st_type=search.st_type,
+            which=search.which,
+            nev=search.nev,
+            tol=search.tol,
+            maxit=search.maxit,
+            options=dict(search.options),
+            verbose=verbose,
+            compute_residuals=True,
+            quadratic_solver_type=QuadraticPEPSolver,
+            linear_solver_type=LinearGeneralizedEPSSolver,
+        )
+
     @staticmethod
     def _root_indices_in_window(
         roots: np.ndarray,
@@ -2009,7 +2048,7 @@ class superSolver5Multigrid:
         layout = self.solver._mixed_layout(sb, mixed=mixed)
         solver_vectors = np.asarray(result.eigenvectors, dtype=np.complex128)
         if solver_vectors.ndim != 2:
-            raise ValueError("PEP eigenvectors must have shape (eigenpair, dof).")
+            raise ValueError("Eigensolver vectors must have shape (eigenpair, dof).")
         solver_vectors = solver_vectors[indices]
         bc = self.solver._build_nep_boundary_condition(
             sb,
@@ -2027,7 +2066,7 @@ class superSolver5Multigrid:
             source_space = "reduced"
         else:
             raise ValueError(
-                "PEP eigenvector width does not match the mixed full or reduced "
+                "Eigensolver vector width does not match the mixed full or reduced "
                 f"space: got {solver_vectors.shape[1]}, full={layout.n_trial}, "
                 f"reduced={reduced_dofs}."
             )
@@ -2148,6 +2187,8 @@ class superSolver5Multigrid:
                 "ntor": int(sb.ntor),
                 "mmax": int(getattr(sb, "mmax", np.max(np.abs(sb.m_range)))),
                 "max_dm": int(sb.max_dm),
+                "eigensolver_backend": getattr(pep, "backend", "PEP"),
+                "gamma_zero_reduction": getattr(pep, "backend", "PEP") == "EPS",
             },
         )
 
@@ -2193,22 +2234,13 @@ class superSolver5Multigrid:
                     )
                     target_s = complex(target_omega**2)
                 if pep is None:
-                    pep = QuadraticPEPSolver(
-                        A0=Tminus1,
-                        A1=T0,
-                        A2=T1,
+                    pep = self._build_window_eigensolver(
+                        matrices=(T0, T1, Tminus1),
                         target_s=target_s,
                         region=region,
                         prefix=f"{search.prefix}_l{level}_",
-                        pep_type=search.pep_type,
-                        st_type=search.st_type,
-                        which=search.which,
-                        nev=search.nev,
-                        tol=search.tol,
-                        maxit=search.maxit,
-                        options=dict(search.options),
+                        search=search,
                         verbose=verbose,
-                        compute_residuals=True,
                     )
                 else:
                     pep.retarget(target_s, region)
@@ -2249,7 +2281,7 @@ class superSolver5Multigrid:
                     solver_converged=reason_converged,
                 )
                 saturated = catalog_status == "capacity_limited"
-                # Targeted TOAR/SINVERT has no all-roots-in-interval guarantee.
+                # Targeted shift-invert has no all-roots-in-interval guarantee.
                 complete = catalog_status == "certified_complete"
                 records.append(
                     _WindowRecord(
@@ -2563,22 +2595,13 @@ class superSolver5Multigrid:
                         local_search,
                     )
                     if pep is None:
-                        pep = QuadraticPEPSolver(
-                            A0=Tminus1,
-                            A1=T0,
-                            A2=T1,
+                        pep = self._build_window_eigensolver(
+                            matrices=(T0, T1, Tminus1),
                             target_s=target_s,
                             region=region,
                             prefix=f"{search.prefix}_reacq_l{level}_",
-                            pep_type=search.pep_type,
-                            st_type=search.st_type,
-                            which=search.which,
-                            nev=local_search.nev,
-                            tol=search.tol,
-                            maxit=search.maxit,
-                            options=dict(search.options),
+                            search=local_search,
                             verbose=verbose,
-                            compute_residuals=True,
                         )
                     else:
                         pep.retarget(target_s, region)

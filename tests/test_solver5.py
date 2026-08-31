@@ -1,4 +1,4 @@
-"""Focused tests for the solver5 quadratic polynomial mapping."""
+"""Focused tests for solver5 polynomial mapping and exact-zero EPS dispatch."""
 
 from types import SimpleNamespace
 
@@ -13,8 +13,10 @@ import supernova.core.solver2 as solver2_module
 import supernova.core.solver5 as solver5_module
 import no_sync.solver5_itpa_fitted_eqdsk.solver5_plots as solver5_plots_module
 from supernova.core.solver5 import (
+    _linear_residuals,
     _polynomial_backward_error,
     _polynomial_residual_norm,
+    _validate_gamma_zero_pencil,
     superSolver5,
 )
 from supernova.core.solver4 import MixedFieldLayout
@@ -154,8 +156,58 @@ def test_polynomial_backward_error_is_operator_scaled():
     assert backward == pytest.approx(expected)
 
 
+def test_gamma_zero_pencil_requires_exact_zero_inverse_coefficient():
+    T0 = csr_matrix(np.diag([-1.0, -2.0]))
+    T1 = csr_matrix(np.eye(2))
+    stored_zero = csr_matrix(
+        (np.array([0.0]), (np.array([0]), np.array([0]))),
+        shape=(2, 2),
+    )
+
+    actual_T0, actual_T1 = _validate_gamma_zero_pencil(
+        stored_zero,
+        T0,
+        T1,
+        gamma_s=0.0,
+    )
+
+    assert actual_T0.nnz == 2
+    assert actual_T1.nnz == 2
+    with pytest.raises(ValueError, match="exact gamma_s"):
+        _validate_gamma_zero_pencil(
+            csr_matrix((2, 2)),
+            T0,
+            T1,
+            gamma_s=1.0e-15,
+        )
+    with pytest.raises(ValueError, match="Tminus1 to be exactly zero"):
+        _validate_gamma_zero_pencil(
+            csr_matrix(np.diag([1.0e-30, 0.0])),
+            T0,
+            T1,
+            gamma_s=0.0,
+        )
+
+
+def test_linear_residual_uses_native_generalized_pencil():
+    T0 = csr_matrix(np.diag([-1.0, -2.0]))
+    T1 = csr_matrix(np.eye(2))
+
+    absolute, relative, backward = _linear_residuals(
+        T0,
+        T1,
+        2.0,
+        np.array([0.0, 1.0]),
+    )
+
+    assert absolute == 0.0
+    assert relative == 0.0
+    assert backward == 0.0
+
+
 def test_build_pep_maps_split_matrices_to_polynomial_coefficients(monkeypatch):
     solver = object.__new__(superSolver5)
+    solver.gamma_s = 5.0 / 3.0
     split = tuple(csr_matrix(np.eye(2) * scale) for scale in (2.0, 3.0, 5.0))
     solver.assemble_split_matrices = lambda **kwargs: split
     captured = {}
@@ -180,6 +232,7 @@ def test_build_pep_maps_split_matrices_to_polynomial_coefficients(monkeypatch):
 
 def test_build_pep_forwards_explicit_signed_harmonics(monkeypatch):
     solver = object.__new__(superSolver5)
+    solver.gamma_s = 5.0 / 3.0
     split = tuple(csr_matrix(np.eye(2) * scale) for scale in (2.0, 3.0, 5.0))
     assembled = {}
     solver.assemble_split_matrices = lambda **kwargs: (
@@ -209,6 +262,68 @@ def test_build_pep_forwards_explicit_signed_harmonics(monkeypatch):
             mmax=2,
             m_values=m_values,
         )
+
+
+def test_build_pep_transparently_selects_eps_at_exact_gamma_zero(monkeypatch):
+    solver = object.__new__(superSolver5)
+    solver.gamma_s = 0.0
+    T0 = csr_matrix(np.diag([-1.0, -2.0]))
+    T1 = csr_matrix(np.eye(2))
+    Tminus1 = csr_matrix((2, 2), dtype=np.complex128)
+    solver.assemble_split_matrices = lambda **kwargs: (T0, T1, Tminus1)
+    captured = {}
+
+    def fake_eps(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(backend="EPS")
+
+    monkeypatch.setattr(solver5_module, "LinearGeneralizedEPSSolver", fake_eps)
+    monkeypatch.setattr(
+        solver5_module,
+        "QuadraticPEPSolver",
+        lambda **kwargs: pytest.fail("gamma_s=0 unexpectedly selected PEP"),
+    )
+
+    built = solver.build_pep_solver(
+        ntor=4,
+        target_omega=2.0,
+        region={"center": 4.0, "radius": 0.5, "vscale": 0.25},
+    )
+
+    assert built.backend == "EPS"
+    np.testing.assert_allclose(captured["T0"].toarray(), T0.toarray())
+    np.testing.assert_allclose(captured["T1"].toarray(), T1.toarray())
+    assert "pep_type" not in captured
+    assert captured["target_s"] == 4.0
+    assert captured["st_type"] == "SINVERT"
+
+
+def test_build_pep_keeps_small_nonzero_gamma_on_quadratic_path(monkeypatch):
+    solver = object.__new__(superSolver5)
+    solver.gamma_s = 1.0e-15
+    split = tuple(csr_matrix(np.eye(2) * scale) for scale in (2.0, 3.0, 5.0))
+    solver.assemble_split_matrices = lambda **kwargs: split
+    captured = {}
+
+    monkeypatch.setattr(
+        solver5_module,
+        "QuadraticPEPSolver",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(backend="PEP"),
+    )
+    monkeypatch.setattr(
+        solver5_module,
+        "LinearGeneralizedEPSSolver",
+        lambda **kwargs: pytest.fail("nonzero gamma_s unexpectedly selected EPS"),
+    )
+
+    built = solver.build_pep_solver(
+        ntor=4,
+        target_omega=2.0,
+        region={"center": 4.0, "radius": 0.5, "vscale": 0.25},
+    )
+
+    assert built.backend == "PEP"
+    np.testing.assert_allclose(captured["A0"].toarray(), split[2].toarray())
 
 
 @pytest.mark.parametrize(
@@ -404,6 +519,120 @@ def test_solve_pep_destroys_pep_after_success(monkeypatch):
     assert pep.destroy_calls == 1
 
 
+def test_solve_pep_packs_exact_zero_eps_metadata_without_api_change(monkeypatch):
+    expected = xr.Dataset({"eigenvalue": ("eigenpair", [1.0 + 0.0j])})
+
+    class SuccessfulEPS:
+        backend = "EPS"
+        eps_type = "KRYLOVSCHUR"
+        destroy_calls = 0
+
+        def solve(self, max_eigenpairs=None):
+            return SimpleNamespace()
+
+        def destroy(self):
+            self.destroy_calls += 1
+
+    solver = object.__new__(superSolver5)
+    eps = SuccessfulEPS()
+    solver.build_pep_solver = lambda **kwargs: eps
+    packed = {}
+    monkeypatch.setattr(
+        solver,
+        "_split_result_dataset",
+        lambda **kwargs: packed.update(kwargs) or expected,
+    )
+
+    actual = solver.solve_pep(
+        ntor=4,
+        target_omega=1.0,
+        region={"center": 1.0, "radius": 0.1},
+    )
+
+    assert actual is expected
+    assert eps.destroy_calls == 1
+    assert packed["nep_type"] == "EPS"
+    assert packed["extra_attrs"]["problem_type"] == "GENERALIZED_LINEAR"
+    assert packed["extra_attrs"]["gamma_zero_reduction"] is True
+    assert packed["extra_attrs"]["linear_coefficients"] == "[-T0, T1]"
+
+
+def test_linear_eps_extracts_known_roots_and_native_residuals(monkeypatch):
+    class FakeVector:
+        def __init__(self):
+            self.values = np.zeros(2, dtype=np.complex128)
+
+        def destroy(self):
+            pass
+
+    class FakeMatrix:
+        @staticmethod
+        def createVecRight():
+            return FakeVector()
+
+    class FakeEPS:
+        roots = (1.0, 2.0)
+
+        def solve(self):
+            pass
+
+        def getConverged(self):
+            return 2
+
+        def getConvergedReason(self):
+            return "converged"
+
+        def getIterationNumber(self):
+            return 3
+
+        def getEigenpair(self, index, vector, imaginary):
+            vector.values[:] = 0.0
+            vector.values[index] = 1.0
+            return self.roots[index]
+
+        def getErrorEstimate(self, index):
+            return 1.0e-13
+
+        def computeError(self, index, error_type):
+            return 2.0e-13
+
+        @staticmethod
+        def getST():
+            return SimpleNamespace(getType=lambda: "sinvert")
+
+    wrapper = object.__new__(solver5_module.LinearGeneralizedEPSSolver)
+    wrapper.T0 = csr_matrix(np.diag([-1.0, -2.0]))
+    wrapper.T1 = csr_matrix(np.eye(2))
+    wrapper.eps = FakeEPS()
+    wrapper.mats = [FakeMatrix(), FakeMatrix()]
+    wrapper.size = 2
+    wrapper.scalar_type = np.dtype(np.complex128)
+    wrapper.compute_residuals = True
+    wrapper.target_s = 1.5
+    wrapper.verbose = False
+    monkeypatch.setattr(
+        solver5_module,
+        "_vec_read_array",
+        lambda vector: vector.values,
+    )
+    monkeypatch.setattr(
+        solver5_module,
+        "_require_slepc",
+        lambda: SimpleNamespace(
+            EPS=SimpleNamespace(ErrorType=SimpleNamespace(BACKWARD="backward"))
+        ),
+    )
+
+    result = wrapper.solve()
+
+    np.testing.assert_allclose(result.eigenvalues, [1.0, 2.0])
+    np.testing.assert_allclose(wrapper.last_absolute_residual_norms, 0.0)
+    np.testing.assert_allclose(wrapper.last_residual_norms, 0.0)
+    np.testing.assert_allclose(wrapper.last_backward_errors, 0.0)
+    np.testing.assert_allclose(wrapper.last_slepc_error_estimates, 1.0e-13)
+    np.testing.assert_allclose(wrapper.last_slepc_backward_errors, 2.0e-13)
+
+
 def test_quadratic_pep_allow_empty_supports_empty_frequency_windows(monkeypatch):
     class FakeVector:
         def destroy(self):
@@ -443,6 +672,55 @@ def test_quadratic_pep_allow_empty_supports_empty_frequency_windows(monkeypatch)
     result = wrapper.solve(allow_empty=True)
 
     assert result.nconv == 0
+    assert result.eigenvalues.shape == (0,)
+    assert result.eigenvectors.shape == (0, 3)
+    assert wrapper.last_backward_errors.shape == (0,)
+    assert wrapper.last_slepc_backward_errors.shape == (0,)
+
+    with pytest.raises(RuntimeError, match="converged no eigenpairs"):
+        wrapper.solve()
+
+
+def test_linear_eps_allow_empty_supports_empty_frequency_windows(monkeypatch):
+    class FakeVector:
+        def destroy(self):
+            pass
+
+    class FakeMatrix:
+        def createVecRight(self):
+            return FakeVector()
+
+    class FakeEPS:
+        def solve(self):
+            pass
+
+        def getConverged(self):
+            return 0
+
+        def getConvergedReason(self):
+            return -1
+
+        def getIterationNumber(self):
+            return 40
+
+        def getST(self):
+            return SimpleNamespace(getType=lambda: "sinvert")
+
+    wrapper = object.__new__(solver5_module.LinearGeneralizedEPSSolver)
+    wrapper.eps = FakeEPS()
+    wrapper.mats = [FakeMatrix(), FakeMatrix()]
+    wrapper.size = 3
+    wrapper.scalar_type = np.dtype(np.complex128)
+    wrapper.compute_residuals = True
+    wrapper.target_s = 1.0
+    wrapper.verbose = False
+    monkeypatch.setattr(solver5_module, "_require_slepc", lambda: SimpleNamespace())
+
+    result = wrapper.solve(allow_empty=True)
+
+    assert result.nconv == 0
+    assert result.reason == -1
+    assert result.iterations == 40
     assert result.eigenvalues.shape == (0,)
     assert result.eigenvectors.shape == (0, 3)
     assert wrapper.last_backward_errors.shape == (0,)

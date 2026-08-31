@@ -544,33 +544,142 @@ class superEquilibrium:
         return _normalize_active_magnetic_radial_coordinate(magnetic)
 
     def _boozer_geometry_on_solver_grid(self):
-        """Project metric and Jacobian before the native-grid downsampling.
+        """Evaluate the Boozer metric and Jacobian on the solver grid.
 
-        pyCOCOS constructs coordinate-indexed derivatives on its coordinate R-Z
-        grid and intentionally masks them outside the fitted annulus.  Sending
-        those fields through the coarser native EQDSK grid can remove every
-        finite interpolation vertex near the first requested flux surface.
-        Batch-project those fields directly onto the magnetic grid while
-        keeping ``self.realspace`` on the native grid for real-space operators.
+        Current pyCOCOS coordinate objects retain the fitted spectral map that
+        owns these differentials.  Evaluating that map on its public core grid
+        avoids an R-Z interpolation round trip whose LCFS mask can leave an
+        otherwise valid outer surface without a finite interpolation stencil.
+        Older coordinate objects without the map retain the batched R-Z
+        projection as a compatibility fallback.
         """
-        geometry_rz = xr.Dataset()
+        coordinate_map = getattr(self.boozer, "coordinate_map", None)
+        if coordinate_map is None:
+            coordinate_map = getattr(self.boozer, "_coordinate_map", None)
+
         units_i = {"psi": "Wb", "theta": "rad", "zeta": "rad"}
-        for ii in ("psi", "theta", "zeta"):
-            for jj in ("psi", "theta", "zeta"):
-                name = f"g{ii}_{jj}"
-                geometry_rz[name] = self.boozer.metric(
-                    ii,
-                    jj,
-                    tensor="contravariant",
+        coordinate_names = ("psi", "theta", "zeta")
+
+        if coordinate_map is not None:
+            psi0 = self.boozer.coords.psi0
+            psi_values = np.asarray(psi0, dtype=np.float64)
+            attrs = psi0.attrs
+            if "psi_axis" not in attrs or "psi_boundary" not in attrs:
+                raise ValueError(
+                    "Boozer psi0 must define psi_axis and psi_boundary "
+                    "metadata for exact metric evaluation."
+                )
+            psi_axis = float(attrs["psi_axis"])
+            psi_boundary = float(attrs["psi_boundary"])
+            psi_span = psi_boundary - psi_axis
+            if (
+                not np.all(np.isfinite(psi_values))
+                or not np.isfinite(psi_span)
+                or np.isclose(psi_span, 0.0)
+            ):
+                raise ValueError(
+                    "Boozer physical poloidal-flux coordinates must be finite "
+                    "and have distinct axis and boundary values."
                 )
 
-        geometry_rz["jac"] = (
-            self._poloidal_orientation * self.boozer.jacobian()
-        )
-        geometry = self._cyl2mag_on_solver_grid(geometry_rz)
+            psi_physical_norm = (psi_values - psi_axis) / psi_span
+            outward_order = np.argsort(psi_physical_norm)
+            psi_eval = psi_values[outward_order]
+            psi_physical_norm = psi_physical_norm[outward_order]
+            if np.any(np.diff(psi_physical_norm) <= 0.0):
+                raise ValueError(
+                    "Boozer core surfaces must define distinct outward fluxes."
+                )
 
-        for ii in ("psi", "theta", "zeta"):
-            for jj in ("psi", "theta", "zeta"):
+            theta = np.linspace(
+                0.0,
+                2.0 * np.pi,
+                self.boozer.coords.thetageom.size,
+            )
+            psi_mesh, theta_mesh = np.meshgrid(
+                psi_eval,
+                theta,
+                indexing="ij",
+            )
+            differentials = coordinate_map.differentials(psi_mesh, theta_mesh)
+            metric = np.asarray(
+                differentials.metric_contravariant,
+                dtype=np.float64,
+            )
+            jacobian = np.asarray(differentials.jacobian, dtype=np.float64)
+            expected_metric_shape = psi_mesh.shape + (3, 3)
+            if metric.shape != expected_metric_shape:
+                raise ValueError(
+                    "Spectral Boozer metric has shape "
+                    f"{metric.shape}; expected {expected_metric_shape}."
+                )
+            if jacobian.shape != psi_mesh.shape:
+                raise ValueError(
+                    "Spectral Boozer Jacobian has shape "
+                    f"{jacobian.shape}; expected {psi_mesh.shape}."
+                )
+            if not np.all(np.isfinite(metric)) or not np.all(
+                np.isfinite(jacobian)
+            ):
+                raise ValueError(
+                    "Spectral Boozer coordinate differentials contain "
+                    "non-finite values."
+                )
+
+            geometry = xr.Dataset(
+                coords={
+                    "psi": xr.DataArray(
+                        psi_physical_norm,
+                        dims=("psi",),
+                        attrs={
+                            "name": "psi_norm",
+                            "units": "",
+                            "desc": "Physical normalized poloidal flux",
+                            "short_name": "$\\Psi_N$",
+                        },
+                    ),
+                    "theta": theta,
+                    "zeta": [0.0],
+                }
+            )
+            for ii_index, ii in enumerate(coordinate_names):
+                for jj_index, jj in enumerate(coordinate_names):
+                    name = f"g{ii}_{jj}"
+                    geometry[name] = xr.DataArray(
+                        metric[..., ii_index, jj_index, None],
+                        dims=("psi", "theta", "zeta"),
+                    )
+            geometry["jac"] = xr.DataArray(
+                self._poloidal_orientation * jacobian[..., None],
+                dims=("psi", "theta", "zeta"),
+            )
+            geometry = _normalize_active_magnetic_radial_coordinate(geometry)
+            projection_description = (
+                "pyCOCOS spectral coordinate map evaluated exactly on the "
+                "magnetic grid"
+            )
+        else:
+            geometry_rz = xr.Dataset()
+            for ii in coordinate_names:
+                for jj in coordinate_names:
+                    name = f"g{ii}_{jj}"
+                    geometry_rz[name] = self.boozer.metric(
+                        ii,
+                        jj,
+                        tensor="contravariant",
+                    )
+
+            geometry_rz["jac"] = (
+                self._poloidal_orientation * self.boozer.jacobian()
+            )
+            geometry = self._cyl2mag_on_solver_grid(geometry_rz)
+            projection_description = (
+                "pyCOCOS coordinate R-Z geometry projected directly to the "
+                "magnetic grid"
+            )
+
+        for ii in coordinate_names:
+            for jj in coordinate_names:
                 name = f"g{ii}_{jj}"
                 unit_str = str(
                     unyt.Unit(
@@ -580,20 +689,14 @@ class superEquilibrium:
                 geometry[name].attrs.update(
                     {
                         "units": unit_str,
-                        "projection": (
-                            "pyCOCOS coordinate R-Z geometry projected "
-                            "directly to the magnetic grid"
-                        ),
+                        "projection": projection_description,
                     }
                 )
         geometry["jac"].attrs.update(
             {
                 "description": "Coordinate transformation Jacobian.",
                 "units": "m**3/Wb",
-                "projection": (
-                    "pyCOCOS coordinate R-Z geometry projected "
-                    "directly to the magnetic grid"
-                ),
+                "projection": projection_description,
             }
         )
         return geometry
@@ -744,8 +847,8 @@ class superEquilibrium:
                                                     attrs={'description': r'div(\nabla\Psi/||\nabla\Psi||^2).',
                                                            'units': '1/Wb'})
 
-        # Project metric/Jacobian data before their masked coordinate-grid support
-        # is downsampled into the native real-space cache.
+        # Evaluate metric/Jacobian data from the fitted coordinate map before
+        # transforming the native real-space cache.
         magnetic_geometry = self._boozer_geometry_on_solver_grid()
 
         # We can now transform all the (R, z) quantities to the (Psi, Theta) coordinates.

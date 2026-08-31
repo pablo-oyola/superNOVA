@@ -208,7 +208,18 @@ class superContinuum:
 
         psi_vals = np.asarray(psi_vals, dtype=np.float64).reshape(-1)
         m_range = np.arange(mmin_q, mmax_q + 1)
-        m_range2sel = np.arange(mmax_q+1)
+        # Multiplication matrices are indexed by the mode *difference*
+        # m_row - m_col, not by the largest retained state label.  A shifted
+        # state range such as [-2, 17] therefore needs equilibrium harmonics
+        # through 19.  Truncating at 17 silently drops the corner couplings
+        # and can destroy definiteness even when the pointwise metric is
+        # strictly one-signed.
+        maximum_mode_difference = int(np.max(m_range) - np.min(m_range))
+        maximum_profile_harmonic = min(
+            maximum_mode_difference,
+            int(H_mmax),
+        )
+        m_range2sel = np.arange(maximum_profile_harmonic + 1)
         nstate = m_range.size if slow_sound else 2 * m_range.size
 
         eigenvalues = np.zeros((psi_vals.size, nstate), dtype=np.complex128)
@@ -365,7 +376,12 @@ class superContinuum:
 
         psi_vals = np.asarray(psi_vals, dtype=np.float64).reshape(-1)
         m_range = np.arange(-mmax, mmax + 1)
-        m_range2sel = np.arange(mmax+1)
+        maximum_mode_difference = int(np.max(m_range) - np.min(m_range))
+        maximum_profile_harmonic = min(
+            maximum_mode_difference,
+            int(H_mmax),
+        )
+        m_range2sel = np.arange(maximum_profile_harmonic + 1)
         nstate = 2 * m_range.size
 
         A = np.zeros((psi_vals.size, nstate, nstate), dtype=np.complex128)

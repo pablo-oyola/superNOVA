@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import xarray as xr
+from scipy.sparse import csr_matrix
 
 import supernova.core.solver5_multigrid as multigrid_module
 from supernova.core._petsc_helpers import NEPResult
@@ -401,6 +402,41 @@ def test_fixed_search_retargets_once_per_window_and_reports_saturation(
         diagnostics["effective_nev"].values[0, diagnostics["valid"].values[0]],
         np.full(3, 2),
     )
+
+
+def test_multigrid_window_builder_selects_eps_at_exact_gamma_zero(monkeypatch):
+    captured = {}
+
+    def fake_eps(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(backend="EPS")
+
+    monkeypatch.setattr(multigrid_module, "LinearGeneralizedEPSSolver", fake_eps)
+    monkeypatch.setattr(
+        multigrid_module,
+        "QuadraticPEPSolver",
+        lambda **kwargs: pytest.fail("gamma_s=0 unexpectedly selected PEP"),
+    )
+    orchestrator = object.__new__(superSolver5Multigrid)
+    orchestrator.solver = SimpleNamespace(gamma_s=0.0)
+    search = MultigridSearchOptions(nev=5)
+    T0 = csr_matrix(np.diag([-1.0, -2.0]))
+    T1 = csr_matrix(np.eye(2))
+    Tminus1 = csr_matrix((2, 2), dtype=np.complex128)
+
+    built = orchestrator._build_window_eigensolver(
+        matrices=(T0, T1, Tminus1),
+        target_s=2.0,
+        region={"center": 2.0, "radius": 0.5, "vscale": 0.2},
+        search=search,
+        prefix="test_gamma_zero_",
+        verbose=False,
+    )
+
+    assert built.backend == "EPS"
+    assert captured["nev"] == 5
+    np.testing.assert_allclose(captured["T0"].toarray(), T0.toarray())
+    np.testing.assert_allclose(captured["T1"].toarray(), T1.toarray())
 
 
 @pytest.mark.parametrize(
