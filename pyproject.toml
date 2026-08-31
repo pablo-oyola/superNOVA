@@ -20,6 +20,10 @@ dynamic = ["version"]
 [project.optional-dependencies]
 plot = ["matplotlib"]
 desc = ["desc-opt"]
+# Equilibrium refinement. OpenFUSIONToolkit is not on PyPI and must be
+# installed separately; supernova.refine raises a pointed ImportError if it
+# is missing. The solver itself never imports it.
+tokamaker = ["freeqdsk", "matplotlib"]
 
 [tool.setuptools.packages.find]
 where = ["."]
