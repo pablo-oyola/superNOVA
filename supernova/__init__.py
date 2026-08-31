@@ -31,6 +31,16 @@ from supernova.solve.evidence import (
     migrate_legacy_mode_dataset,
     mesh_perturbation_evidence,
 )
+from supernova.api import (
+    Band,
+    Case,
+    ModeSet,
+    PetscOptions,
+    RadialGrid,
+    Scan,
+    profile_from_columns,
+    profile_from_eqdsk,
+)
 from supernova.radial.profile import Profile
 from supernova.radial.base import RadialFE
 from supernova.radial.bspline import BSplineFE
