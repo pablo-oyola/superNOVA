@@ -124,12 +124,18 @@ def _build_mixed_radial_data(
     high: BSplineFE,
     points_q: np.ndarray | None = None,
     weights_q: np.ndarray | None = None,
+    validate: bool = True,
 ) -> MixedRadialData:
     """Build compatible basis data on native or externally supplied quadrature.
 
     Supplying ``points_q`` and ``weights_q`` avoids generating a native
     quadrature for the compatible low space.  This is the multigrid path: all
     nested levels are evaluated on the identical finest-grid rule.
+
+    ``validate`` runs two dense identity checks on the compatible derivative.
+    They are worth their cost once per basis but not once per multigrid level,
+    so the nested-level construction turns them off after the first level has
+    proved the construction sound.
     """
     external_quadrature = points_q is not None or weights_q is not None
     if external_quadrature:
@@ -167,26 +173,28 @@ def _build_mixed_radial_data(
 
     phi_high_q = pair.high.eval_basis(points_q).T
     phi_low_q = pair.low.eval_basis(points_q).T
-    dphi_high_q = pair.high.eval_basis_derivative(points_q).T
-    compatible_derivative = phi_low_q @ pair.derivative.toarray()
-    if not np.allclose(
-        dphi_high_q,
-        compatible_derivative,
-        rtol=1.0e-12,
-        atol=1.0e-12,
-    ):
-        raise RuntimeError("The compatible high/low derivative identity failed.")
-
     mass_low = csr_matrix(phi_low_q.T @ (weights_q[:, None] * phi_low_q))
     G_low_high = (mass_low @ pair.derivative).tocsr()
-    direct_G = phi_low_q.T @ (weights_q[:, None] * dphi_high_q)
-    if not np.allclose(
-        G_low_high.toarray(),
-        direct_G,
-        rtol=1.0e-12,
-        atol=1.0e-12,
-    ):
-        raise RuntimeError("The mixed strong-derivative matrix identity failed.")
+
+    if validate:
+        dphi_high_q = pair.high.eval_basis_derivative(points_q).T
+        compatible_derivative = phi_low_q @ pair.derivative.toarray()
+        if not np.allclose(
+            dphi_high_q,
+            compatible_derivative,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            raise RuntimeError("The compatible high/low derivative identity failed.")
+
+        direct_G = phi_low_q.T @ (weights_q[:, None] * dphi_high_q)
+        if not np.allclose(
+            G_low_high.toarray(),
+            direct_G,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            raise RuntimeError("The mixed strong-derivative matrix identity failed.")
 
     return MixedRadialData(
         pair=pair,
@@ -257,60 +265,129 @@ def _project_local_tensor_mixed(
     if include_derivative:
         derivative = coo_matrix(G_low_high)
         if derivative.nnz:
-            for local_state in range(2 * n_modes):
-                field, mode = divmod(local_state, n_modes)
-                row_parts.append(
-                    field * n_low * n_modes
-                    + derivative.row.astype(np.int64, copy=False) * n_modes
-                    + mode
-                )
-                col_parts.append(
-                    layout.trial_offsets[field]
-                    + derivative.col.astype(np.int64, copy=False) * n_modes
-                    + mode
-                )
-                data_parts.append(derivative.data.astype(np.complex128, copy=False))
+            fields, modes = np.divmod(
+                np.arange(2 * n_modes, dtype=np.int64), n_modes
+            )
+            offsets = np.asarray(layout.trial_offsets, dtype=np.int64)
+            row_parts.append(
+                (
+                    fields[:, None] * n_low * n_modes
+                    + derivative.row.astype(np.int64, copy=False)[None, :] * n_modes
+                    + modes[:, None]
+                ).ravel()
+            )
+            col_parts.append(
+                (
+                    offsets[fields][:, None]
+                    + derivative.col.astype(np.int64, copy=False)[None, :] * n_modes
+                    + modes[:, None]
+                ).ravel()
+            )
+            data_parts.append(
+                np.broadcast_to(
+                    derivative.data.astype(np.complex128, copy=False),
+                    (fields.size, derivative.nnz),
+                ).ravel()
+            )
 
     q_coords, local_rows, local_cols = M.coords
     local_data = M.data.astype(np.complex128, copy=True)
     local_data[local_rows < 2 * n_modes] *= dpsi_hat_dx
     nonzero = local_data != 0.0
-    q_coords = q_coords[nonzero]
-    local_rows = local_rows[nonzero]
-    local_cols = local_cols[nonzero]
+    q_coords = q_coords[nonzero].astype(np.int64, copy=False)
+    local_rows = local_rows[nonzero].astype(np.int64, copy=False)
+    local_cols = local_cols[nonzero].astype(np.int64, copy=False)
     local_data = local_data[nonzero]
 
-    for q in np.unique(q_coords):
-        test_support = np.flatnonzero(phi_low_q[q] != 0.0)
-        if test_support.size == 0:
-            continue
-        q_entries = np.flatnonzero(q_coords == q)
-        for entry in q_entries:
-            local_row = int(local_rows[entry])
-            local_col = int(local_cols[entry])
-            row_field, row_mode = divmod(local_row, n_modes)
-            col_field, col_mode = divmod(local_col, n_modes)
-            trial_basis = phi_high_q if col_field < 2 else phi_low_q
-            trial_support = np.flatnonzero(trial_basis[q] != 0.0)
-            if trial_support.size == 0:
-                continue
+    if local_data.size:
+        row_field, row_mode = np.divmod(local_rows, n_modes)
+        col_field, col_mode = np.divmod(local_cols, n_modes)
+        trial_offsets = np.asarray(layout.trial_offsets, dtype=np.int64)
 
-            radial_rows = np.repeat(test_support, trial_support.size)
-            radial_cols = np.tile(trial_support, test_support.size)
-            radial_factor = (
-                weights_q[q]
-                * phi_low_q[q, radial_rows]
-                * trial_basis[q, radial_cols]
-            )
-            row_parts.append(
-                row_field * n_low * n_modes + radial_rows * n_modes + row_mode
-            )
-            col_parts.append(
-                layout.trial_offsets[col_field]
-                + radial_cols * n_modes
-                + col_mode
-            )
-            data_parts.append(-radial_factor * local_data[entry])
+        # Quadrature points that see the same basis functions form one element.
+        # Grouping by the support signature rather than by position keeps this
+        # correct for any point ordering, and the element blocks below then sum
+        # over quadrature before any global index is materialised.
+        support_signature = np.concatenate(
+            [phi_low_q != 0.0, phi_high_q != 0.0], axis=1
+        )
+        _, element_of_q = np.unique(support_signature, axis=0, return_inverse=True)
+        element_of_q = np.ravel(element_of_q)
+        order = np.argsort(element_of_q[q_coords], kind="stable")
+        entry_bounds = np.searchsorted(
+            element_of_q[q_coords][order], np.arange(element_of_q.max() + 2)
+        )
+
+        for element in range(entry_bounds.size - 1):
+            first, last = entry_bounds[element], entry_bounds[element + 1]
+            if first == last:
+                continue
+            entries = order[first:last]
+            quad = np.flatnonzero(element_of_q == element)
+
+            # One support per element: the union over its quadrature points.
+            # Any spurious index contributes an exact zero and is dropped by
+            # eliminate_zeros below, so a slightly wide support stays correct.
+            test_support = np.flatnonzero(np.any(phi_low_q[quad] != 0.0, axis=0))
+            if test_support.size == 0:
+                continue
+            test_values = phi_low_q[np.ix_(quad, test_support)]
+
+            local_q = np.searchsorted(quad, q_coords[entries])
+            weighted = local_data[entries] * weights_q[q_coords[entries]]
+
+            for low_trial in (False, True):
+                selected = (col_field[entries] >= 2) == low_trial
+                if not selected.any():
+                    continue
+                trial_basis = phi_low_q if low_trial else phi_high_q
+                trial_support = np.flatnonzero(
+                    np.any(trial_basis[quad] != 0.0, axis=0)
+                )
+                if trial_support.size == 0:
+                    continue
+                trial_values = trial_basis[np.ix_(quad, trial_support)]
+
+                chosen = entries[selected]
+                # Distinct (row, col) pairs in this element and trial space.
+                pair_key = local_rows[chosen] * n_state + local_cols[chosen]
+                pairs, pair_of_entry = np.unique(pair_key, return_inverse=True)
+                accumulated = np.zeros(
+                    (pairs.size, quad.size), dtype=np.complex128
+                )
+                np.add.at(
+                    accumulated,
+                    (pair_of_entry, local_q[selected]),
+                    weighted[selected],
+                )
+
+                block = -np.einsum(
+                    "gq,qi,qj->gij",
+                    accumulated,
+                    test_values,
+                    trial_values,
+                    optimize=True,
+                )
+                pair_rows, pair_cols = np.divmod(pairs, n_state)
+                pair_row_field, pair_row_mode = np.divmod(pair_rows, n_modes)
+                pair_col_field, pair_col_mode = np.divmod(pair_cols, n_modes)
+                row_parts.append(
+                    np.broadcast_to(
+                        pair_row_field[:, None, None] * n_low * n_modes
+                        + test_support[None, :, None] * n_modes
+                        + pair_row_mode[:, None, None],
+                        block.shape,
+                    ).ravel()
+                )
+                col_parts.append(
+                    np.broadcast_to(
+                        trial_offsets[pair_col_field][:, None, None]
+                        + trial_support[None, None, :] * n_modes
+                        + pair_col_mode[:, None, None],
+                        block.shape,
+                    ).ravel()
+                )
+                data_parts.append(block.ravel())
 
     if not data_parts:
         return csr_matrix((layout.n_rows, layout.n_trial), dtype=np.complex128)
@@ -521,8 +598,12 @@ class superSolver4(superSolver3):
             bc_kind=kind,
             mixed=mixed,
         )
-        bc_rank = int(np.linalg.matrix_rank(bc.C))
         expected_rank = 2 * layout.n_modes if kind == "full" else layout.n_modes
+        # get_sparse_prolongation already resolves the constraint rank by
+        # pivoted QR on C.T, so its column count is the free-dof count.  Read
+        # it instead of paying for a second, dense SVD of the same matrix.
+        prolongation = bc.get_sparse_prolongation(tol=bc_tol)
+        bc_rank = int(layout.n_trial - prolongation.shape[1])
         if bc_rank != expected_rank:
             raise ValueError(
                 f"solver4 {kind!r} boundary rank must be {expected_rank}, got {bc_rank}."
