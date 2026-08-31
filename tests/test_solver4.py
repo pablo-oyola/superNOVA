@@ -8,6 +8,7 @@ from scipy.sparse import coo_array, csr_matrix, isspmatrix_csr
 
 import supernova
 import supernova.core.solver4 as solver4_module
+from supernova.core.solver5 import superSolver5
 from supernova.core.solver4 import (
     MixedFieldLayout,
     _build_mixed_radial_data,
@@ -419,27 +420,6 @@ def test_solver4_result_expands_reduced_vector_and_names_all_fields(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    "builder, kwargs",
-    [
-        (
-            "build_split_nep_solver",
-            {
-                "ntor": 2,
-                "target_omega": 1.0,
-                "region": {"center": 1.0, "radius": 0.1},
-            },
-        ),
-        (
-            "build_split_ciss_solver",
-            {
-                "ntor": 2,
-                "target_omega": 1.0,
-                "region": {"center": 1.0, "radius": 0.1},
-            },
-        ),
-    ],
-)
-@pytest.mark.parametrize(
     "bc_options",
     [
         {"apply_bcs": False, "bc_kind": "full"},
@@ -448,15 +428,17 @@ def test_solver4_result_expands_reduced_vector_and_names_all_fields(monkeypatch)
         {"apply_bcs": True, "bc_kind": "none"},
     ],
 )
-def test_solver4_rejects_rectangular_nep_inputs_before_petsc(
-    builder,
-    kwargs,
-    bc_options,
-):
-    solver = object.__new__(superSolver4)
+def test_solver4_rejects_rectangular_inputs_before_petsc(bc_options):
+    """_require_full_bc_nep now guards the surviving PEP entry point."""
+    solver = object.__new__(superSolver5)
 
     with pytest.raises(ValueError, match="require apply_bcs=True"):
-        getattr(solver, builder)(**kwargs, **bc_options)
+        solver.build_pep_solver(
+            ntor=2,
+            target_omega=1.0,
+            region={"center": 1.0, "radius": 0.1},
+            **bc_options,
+        )
 
 
 def test_supernova_exports_solver4_without_replacing_solver3():
@@ -464,43 +446,3 @@ def test_supernova_exports_solver4_without_replacing_solver3():
     assert supernova.superSolver3 is not supernova.superSolver4
 
 
-def test_solver4_configures_qr_before_internal_nleigs_options():
-    events = []
-
-    class FakePC:
-        kind = "lu"
-
-        def setType(self, kind):
-            events.append(("pc.setType", kind))
-            self.kind = kind
-
-        def getType(self):
-            return self.kind
-
-    class FakeKSP:
-        pc = FakePC()
-
-        def getPC(self):
-            return self.pc
-
-        def setFromOptions(self):
-            events.append(("ksp.setFromOptions", None))
-            self.pc.kind = "mumps"
-
-        def getOptionsPrefix(self):
-            return "solver4_nep_nleigs_"
-
-        def getType(self):
-            return "preonly"
-
-    ksp = FakeKSP()
-    wrapper = SimpleNamespace(
-        nep=SimpleNamespace(getNLEIGSKSPs=lambda: [ksp]),
-        _vprint=lambda message: events.append(("verbose", message)),
-    )
-
-    superSolver4._configure_nleigs_shift_solvers(wrapper)
-
-    assert events[0] == ("pc.setType", "qr")
-    assert events[1] == ("ksp.setFromOptions", None)
-    assert ksp.pc.getType() == "mumps"

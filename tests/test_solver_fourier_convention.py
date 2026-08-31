@@ -6,9 +6,10 @@ import numpy as np
 import pytest
 from scipy.sparse import coo_array, csr_matrix
 
-from supernova.core._solver_kernel import _build_static_blocks
-from supernova.core._solver_kernel2 import build_M_at, get_T_sparse, solver_blocks2
-from supernova.core.solver3 import _build_local_M_split, _project_local_tensor
+from supernova.core._solver_kernel2 import _build_static_blocks
+from supernova.core._solver_kernel2 import build_M_at, solver_blocks2
+from supernova.core.solver3 import _build_local_M_split
+from supernova.core.solver4 import _project_local_tensor_mixed
 
 
 def _amplitudes(a0, a1):
@@ -198,31 +199,32 @@ def test_solver5_local_split_subtracts_direct_phase_and_recomposes_M_at():
     )
     np.testing.assert_allclose(direct, split, atol=1.0e-14)
 
-    fixed_global = get_T_sparse(
-        sb,
-        coo_array(direct),
-        omega=np.sqrt(s),
-        regularizer=0.0,
-    )
-    split_global = (
-        _project_local_tensor(sb, M0, include_derivative=True)
-        + s * _project_local_tensor(sb, M1, include_derivative=False)
-        + (1.0 / s)
-        * _project_local_tensor(sb, Mminus1, include_derivative=False)
-    )
-    np.testing.assert_allclose(
-        fixed_global.toarray(), split_global.toarray(), atol=1.0e-14
-    )
-
 
 def _radial_projection_blocks(dpsi_hat_dx):
     return SimpleNamespace(
         m_range=np.array([2], dtype=np.int32),
         dpsi_hat_dx=dpsi_hat_dx,
-        phi_q=np.ones((1, 1), dtype=np.float64),
-        weights_q=np.ones(1, dtype=np.float64),
-        WD=csr_matrix([[7.0]]),
     )
+
+
+def _unit_mixed_bases():
+    """One quadrature point, one active basis function in each space.
+
+    The mixed layout needs at least two high-order degrees of freedom, so the
+    second one is present but everywhere zero.  Trial columns then land at
+    ``_TRIAL_COLUMN`` per field: p1 and xi^psi in the high space, xi^s and
+    div_xi in the low space.
+    """
+    return (
+        np.array([[1.0, 0.0]], dtype=np.float64),   # phi_high_q, n_high = 2
+        np.ones((1, 1), dtype=np.float64),          # phi_low_q,  n_low  = 1
+        np.ones(1, dtype=np.float64),               # weights_q
+        csr_matrix([[7.0, 0.0]]),                   # G_low_high
+    )
+
+
+# field -> trial column, for n_high = 2, n_low = 1, one poloidal mode
+_TRIAL_COLUMN = (0, 2, 4, 5)
 
 
 def test_radial_chain_factor_scales_only_differential_equation_rows():
@@ -231,16 +233,20 @@ def test_radial_chain_factor_scales_only_differential_equation_rows():
     tensor = coo_array(local)
     blocks = _radial_projection_blocks(beta)
 
-    expected = -local[0].copy()
-    expected[:2, :] *= beta
-    expected[0, 0] += 7.0
-    expected[1, 1] += 7.0
+    scaled = -local[0].copy()
+    scaled[:2, :] *= beta          # only the two differential-equation rows
 
-    fixed = get_T_sparse(blocks, tensor, omega=1.0, regularizer=0.0)
-    split = _project_local_tensor(blocks, tensor, include_derivative=True)
+    expected = np.zeros((4, 6), dtype=np.complex128)
+    for column, trial in enumerate(_TRIAL_COLUMN):
+        expected[:, trial] = scaled[:, column]
+    expected[0, _TRIAL_COLUMN[0]] += 7.0    # weak d/dx on p1
+    expected[1, _TRIAL_COLUMN[1]] += 7.0    # weak d/dx on xi^psi
 
-    np.testing.assert_allclose(fixed.toarray(), expected)
-    np.testing.assert_allclose(split.toarray(), expected)
+    projected = _project_local_tensor_mixed(
+        blocks, tensor, *_unit_mixed_bases(), include_derivative=True
+    )
+
+    np.testing.assert_allclose(projected.toarray(), expected)
 
 
 @pytest.mark.parametrize(
@@ -252,9 +258,9 @@ def test_radial_chain_factor_rejects_invalid_values(bad_factor):
     tensor = coo_array(np.eye(4, dtype=np.complex128)[None, :, :])
 
     with pytest.raises(ValueError, match="dpsi_hat_dx"):
-        get_T_sparse(blocks, tensor, omega=1.0, regularizer=0.0)
-    with pytest.raises(ValueError, match="dpsi_hat_dx"):
-        _project_local_tensor(blocks, tensor, include_derivative=True)
+        _project_local_tensor_mixed(
+            blocks, tensor, *_unit_mixed_bases(), include_derivative=True
+        )
 
 
 def test_solver_blocks_roundtrip_preserves_radial_chain_factor():

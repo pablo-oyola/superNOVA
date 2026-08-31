@@ -14,17 +14,291 @@ from .._utils import njit, prange
 mu_0 = 1.0 # Normalized units.
 from dataclasses import dataclass
 import xarray as xr
-from scipy.sparse import csr_matrix, coo_matrix, coo_array
+from scipy.sparse import csr_matrix, coo_array
 
 # Some of the kernels are already implemented.
 from ._continuum_kernel import (_fill_block_kernel, 
                                 _apply_ghg_scaling,
                                 _fill_convolution_block_kernel,
                                 )
-from ._solver_kernel import _build_static_blocks
+# Moved verbatim from the retired _solver_kernel.py.  These four kernels
+# carry the static block construction and are frozen by
+# tests/test_physics_freeze.py: relocate them, never rewrite them.
+@njit(cache=True, nogil=True, inline="always")
+def scale_rows(matrix: np.ndarray, diag: np.ndarray, conj: bool=False):
+    """
+    Multiply each matrix row by the corresponding diagonal factor in place.
 
-from ..radial.base import RadialFE
-from ._boundary import BoundaryCondition
+    This is a small Numba helper for left multiplication by a diagonal matrix.
+    After the call, ``matrix[i, j]`` has been multiplied by ``diag[i]`` for all
+    columns ``j``. The operation mutates ``matrix`` and returns nothing.
+
+    It will be used to apply the following operation:
+    G @ H, where G = diag(g) and H is the original matrix.
+
+    The `conj` flag can be set to evaluate:
+
+    G^H @ H, where G^H = diag(g^*) is the Hermitian conjugate of G. 
+    In this case, each row will be multiplied by the complex 
+    conjugate of the corresponding diagonal factor.
+
+    Parameters
+    ----------
+    matrix : ndarray
+        Two-dimensional complex matrix to mutate.
+    diag : ndarray
+        One-dimensional row-scaling factors with length ``matrix.shape[0]``.
+    conj : bool, optional
+        If True, use the complex conjugate of the diagonal factors. 
+        Default is False.
+    """
+    for i in range(matrix.shape[0]):
+        factor = diag[i]
+        if conj:
+            factor = np.conj(factor)
+        for j in range(matrix.shape[1]):
+            matrix[i, j] *= factor
+
+@njit(cache=True, nogil=True, inline="always")
+def scale_cols(matrix: np.ndarray, diag: np.ndarray, conj: bool=False):
+    """
+    Multiply each matrix column by the corresponding diagonal factor in place.
+
+    This is a small Numba helper for right multiplication by a diagonal matrix.
+    After the call, ``matrix[i, j]`` has been multiplied by ``diag[j]`` for all
+    rows ``i``. The operation mutates ``matrix`` and returns nothing.
+
+    It will be used to apply the following operation:
+    H @ G, where G = diag(g) and H is the original matrix.
+
+    The `conj` flag can be set to evaluate:
+
+    H @ G^H, where G^H = diag(g^*) is the Hermitian conjugate of G. 
+    In this case, each row will be multiplied by the complex 
+    conjugate of the corresponding diagonal factor.
+
+    Parameters
+    ----------
+    matrix : ndarray
+        Two-dimensional complex matrix to mutate.
+    diag : ndarray
+        One-dimensional column-scaling factors with length ``matrix.shape[1]``.
+    conj : bool, optional
+        If True, use the complex conjugate of the diagonal factors. 
+        Default is False.
+    """
+    for j in range(matrix.shape[1]):
+        factor = diag[j]
+        if conj:
+            factor = np.conj(factor)
+        for i in range(matrix.shape[0]):
+            matrix[i, j] *= factor
+
+@njit(cache=True, nogil=True, inline="always")
+def apply_dm_cutoff(matrix: np.ndarray, m_range: np.ndarray, dm_max: int):
+    """
+    Zero entries outside the requested physical poloidal-mode coupling width.
+    """
+    for i in range(matrix.shape[0]):
+        mi = m_range[i]
+        for j in range(matrix.shape[1]):
+            if abs(mi - m_range[j]) > dm_max:
+                matrix[i, j] = 0.0
+
+@njit(parallel=True, cache=True, nogil=True)
+def _build_static_blocks(
+    C11: np.ndarray, O: np.ndarray, C12_2: np.ndarray, C12_3: np.ndarray, C22: np.ndarray,
+    D11: np.ndarray, D12: np.ndarray, kappa_s: np.ndarray,
+    K: np.ndarray, M: np.ndarray, 
+    F11_2: np.ndarray, F12_1: np.ndarray, F12_2: np.ndarray, F21: np.ndarray, F22: np.ndarray,
+    hprof: np.ndarray, Iprof: np.ndarray, gprof: np.ndarray, qprof: np.ndarray,
+    pressure: np.ndarray, pressure_deriv: np.ndarray, density: np.ndarray, gamma_s: float,
+    one_gpp: np.ndarray, gtp_over_gpp: np.ndarray, gpz_over_gpp: np.ndarray,
+    ntor: int, m_range: int,
+    dm_max: int=100, dn_max: int=100):
+    r"""
+    Build the static blocks of the C, D and F matrices.
+
+    Parameters
+    ----------
+    C11 : ndarray [npsi, mpol, ntor]
+        The C11 profile of the C matrix, which is static and does not depend on the
+        eigenvalue. 2K_\Psi/g^{\psi\psi}.
+    """
+    # Dimensions of the problem. We will need these to allocate the relevant matrices and blocks.
+    assert C11.ndim == 3, "C11 must have shape (npsi, mpol, ntor)"
+    # nstate = (C11.shape[1] - 1) * 2 + 1 # m=0 is only one state, m>0 are two states.
+    # mpol_max = C11.shape[1] - 1
+    npsi = C11.shape[0]
+    # m_range = np.arange(-mpol_max, mpol_max + 1)
+    n_range = np.zeros_like(m_range) + ntor
+    mpol_max = np.max(np.abs(m_range))
+    nstate = m_range.size
+
+    # We will check the shape of all inputs.
+    assert O.shape == C11.shape, "O must have shape (npsi, mpol, ntor)"
+    assert C12_2.shape == C11.shape, "C12_2 must have shape (npsi, mpol, ntor)"
+    assert C12_3.shape == C11.shape, "C12_3 must have shape (npsi, mpol, ntor)"
+    assert C22.shape == C11.shape, "C22 must have shape (npsi, mpol, ntor)"
+    assert D11.shape == C11.shape, "D11 must have shape (npsi, mpol, ntor)"
+    assert D12.shape == C11.shape, "D12 must have shape (npsi, mpol, ntor)"
+    assert kappa_s.shape == C11.shape, "kappa_s must have shape (npsi, mpol, ntor)"
+    assert K.shape == C11.shape, "K must have shape (npsi, mpol, ntor)"
+    assert M.shape == C11.shape, "M must have shape (npsi, mpol, ntor)"
+    assert F11_2.shape == C11.shape, "F11_2 must have shape (npsi, mpol, ntor)"
+    assert F12_1.shape == C11.shape, "F12_1 must have shape (npsi, mpol, ntor)"
+    assert F12_2.shape == C11.shape, "F12_2 must have shape (npsi, mpol, ntor)"
+    assert F21.shape == C11.shape, "F21 must have shape (npsi, mpol, ntor)"
+    assert F22.shape == C11.shape, "F22 must have shape (npsi, mpol, ntor)"
+    assert hprof.shape == (npsi,), "hprof must have shape (npsi,)"
+    assert Iprof.shape == (npsi,), "Iprof must have shape (npsi,)"
+    assert gprof.shape == (npsi,), "gprof must have shape (npsi,)"
+    assert pressure.shape == (npsi,), "pressure must have shape (npsi,)"
+    assert pressure_deriv.shape == (npsi,), "pressure_deriv must have shape (npsi,)"
+    assert density.shape == (npsi,), "density must have shape (npsi,)"
+    assert one_gpp.shape == C11.shape, "one_gpp must have shape (npsi, mpol, ntor)"
+    assert gtp_over_gpp.shape == C11.shape, r"g^{\theta\psi} must have shape (npsi, mpol, ntor)"
+    assert gpz_over_gpp.shape == C11.shape, r"g_{\zeta\psi} must have shape (npsi, mpol, ntor)"
+    assert gamma_s >= 0, "gamma_s must be positive."
+
+    # Allocating the space. 
+    C0 = np.zeros((npsi, 2*nstate, 2*nstate), dtype=np.complex128)
+    D0 = np.zeros((npsi, 2*nstate, 2*nstate), dtype=np.complex128)
+    F  = np.zeros((npsi, 2*nstate, 2*nstate), dtype=np.complex128)
+    C1 = np.zeros((npsi, nstate, nstate), dtype=np.complex128)
+    D1 = np.zeros((npsi, nstate, nstate), dtype=np.complex128)
+    gtp_over_gpp_mat = np.zeros((npsi, nstate, nstate), dtype=np.complex128)
+    gpz_over_gpp_mat = np.zeros((npsi, nstate, nstate), dtype=np.complex128)
+
+    # Some preparatory elements.
+    diagonal_ones = np.eye(nstate, dtype=np.complex128)
+
+    for ipsi in prange(npsi):
+        # We place first into the C0, D0 and F matrices the blocks that do
+        # not require convolution or extra operations.
+        # C11 and C22 elements go directly into the matrix without further ado.
+        fill_block_kernel(2.0*C11[ipsi], m_range, n_range, 
+                          C0[ipsi, :nstate, :nstate], 
+                          max_dm=dm_max, max_dn=dn_max)
+        fill_block_kernel(C22[ipsi], m_range, n_range, 
+                          C0[ipsi, nstate:, nstate:], 
+                          max_dm=dm_max, max_dn=dn_max)
+
+        # On the element C12, we only place the C12_3 part and then we add up the 
+        # scaled C11 by mu_0 p_0'.
+        fill_block_kernel(C12_3[ipsi], m_range, n_range, 
+                          C0[ipsi, :nstate, nstate:], 
+                          max_dm=dm_max, max_dn=dn_max)
+        C0[ipsi, :nstate, nstate:] += mu_0 * pressure_deriv[ipsi] * C0[ipsi, :nstate, :nstate]
+
+        # We fill D11 with the D11 profile, and we will add later the contribution of the convolution with the G operator.
+        fill_block_kernel(D11[ipsi], m_range, n_range, 
+                          D0[ipsi, :nstate, :nstate], 
+                          max_dm=dm_max, max_dn=dn_max)
+
+        # D12 element only needs to be multiplied later by 2\mu_0\gamma_s p_0 
+        # which is a local value: D12 is an alias for C11.
+        fill_block_kernel(C11[ipsi], m_range, n_range, 
+                          D0[ipsi, :nstate, nstate:], 
+                          max_dm=dm_max, max_dn=dn_max)
+        D0[ipsi, :nstate, nstate:] *= 2 * mu_0 * gamma_s * pressure[ipsi]
+
+        # D21 has two pieces: one that is directly the kappa_s and the other one is 
+        # the operator \hat\sigma/h(\Psi) applied to the eigenvector.
+        fill_block_kernel(2.0*kappa_s[ipsi], m_range, n_range, 
+                          D0[ipsi, nstate:, :nstate], 
+                          max_dm=dm_max, max_dn=dn_max)
+
+        # D22 has a 1 - \beta contribution. The beta term depends on the
+        # eigenvalue, so place the 1 part here and the signed term in D1 below.
+        D0[ipsi, nstate:, nstate:] = diagonal_ones
+
+        # F11 element is composed by -K + \hat\sigma/B^2. We just place now the
+        # K part, and we will add the rest later.
+        kmat = np.zeros((nstate, nstate), dtype=np.complex128)
+        fill_block_kernel(K[ipsi], m_range, n_range, kmat, max_dm=dm_max, max_dn=dn_max)
+        F[ipsi, :nstate, :nstate] = - kmat
+        one_over_B2 = np.zeros((nstate, nstate), dtype=np.complex128) 
+        fill_block_kernel(F11_2[ipsi], m_range, n_range, one_over_B2, max_dm=dm_max, max_dn=dn_max)
+
+        # F21 and F22 are directly the F21 and F22 profiles, so we can place them directly.
+        fill_block_kernel(F21[ipsi], m_range, n_range, F[ipsi, nstate:, :nstate], max_dm=dm_max, max_dn=dn_max)
+        fill_block_kernel(F22[ipsi], m_range, n_range, F[ipsi, nstate:, nstate:], max_dm=dm_max, max_dn=dn_max)
+
+        # We create the diagonal representations of the G and sigma operators.
+        g_diag = np.zeros(nstate, dtype=np.complex128)
+        sigma_diag = np.zeros(nstate, dtype=np.complex128)
+        for i in range(nstate):
+            g_diag[i] = 1j*(qprof[ipsi] * n_range[i] - m_range[i])
+            sigma_diag[i] = - 1j * (Iprof[ipsi] * n_range[i] + gprof[ipsi] * m_range[i])
+
+        # Now we create and fill other matrices.
+        c12_2mat = np.zeros((nstate, nstate), dtype=np.complex128)
+        fill_block_kernel(C12_2[ipsi], m_range, n_range, c12_2mat, max_dm=dm_max, max_dn=dn_max)
+        omat = np.zeros((nstate, nstate), dtype=np.complex128)
+        fill_block_kernel(O[ipsi], m_range, n_range, omat, max_dm=dm_max, max_dn=dn_max)
+        apply_ghg_scaling(omat, qprof[ipsi], n_range, m_range) # G^H @ O @ G.
+
+        # Now, we can get C12 contribution by convoluting the G^H @ O @ G with
+        # the C12_2 factor on the left. The product of two dm-limited factors
+        # can otherwise broaden the final C12 band, so cap this contribution
+        # before adding it to C0.
+        c12_conv = c12_2mat @ omat
+        apply_dm_cutoff(c12_conv, m_range, dm_max)
+        C0[ipsi, :nstate, nstate:] -= c12_conv # C12 is done!.
+
+        # D11 is the D11 input convoluted with the G operator on the right.
+        # D11 = D11 @ G. Since G is a diagonal operator, we can just scale
+        # the columns of D11
+        scale_cols(D0[ipsi, :nstate, :nstate], g_diag)
+
+        # We now scale the sigma for the D21 contribution.
+        D21_2mat = np.zeros((nstate, nstate), dtype=np.complex128)
+        one_over_h = np.zeros((C11.shape[1], C11.shape[2]), dtype=np.complex128)
+        one_over_h[0, 0] = -1.0 / hprof[ipsi]
+        fill_block_kernel(one_over_h, m_range, n_range, D21_2mat, max_dm=dm_max, max_dn=dn_max) 
+        # We fill D21_2 with a scalar zero-mode, since we will just scale it by the sigma_diag.
+        scale_cols(D21_2mat, sigma_diag) # D21_2 = D
+        D0[ipsi, nstate:, :nstate] += D21_2mat # We add the D21_2 contribution to D21.
+
+        # sigma/B²
+        scale_cols(one_over_B2, sigma_diag)
+        F[ipsi, :nstate, :nstate] += one_over_B2 # We add the 1/B^2 part to F11, which is the part that does
+
+        # We build now F12 contributions.
+        f12_1mat = np.zeros((nstate, nstate), dtype=np.complex128)
+        f12_2mat = np.zeros((nstate, nstate), dtype=np.complex128)
+        fill_block_kernel(F12_1[ipsi], m_range, n_range, f12_1mat, max_dm=dm_max, max_dn=dn_max)
+        fill_block_kernel(F12_2[ipsi], m_range, n_range, f12_2mat, max_dm=dm_max, max_dn=dn_max)
+        scale_rows(f12_1mat, g_diag) # G @ F12_1
+        scale_cols(f12_2mat, g_diag) # F12_2 @ G
+
+        # We add the F12 contributions and the pressure-curvature term
+        # -mu_0 * p_0' * K. The continuum profile K already contains 2*K_s.
+        F[ipsi, :nstate, nstate:] += f12_1mat + f12_2mat \
+            - kmat * mu_0 * pressure_deriv[ipsi] 
+
+        # Filling the C1 and D1 matrices, that will have a dependence on the eigenvalue.
+        fill_block_kernel(one_gpp[ipsi], m_range, n_range, C1[ipsi], max_dm=dm_max, max_dn=dn_max)
+        fill_block_kernel(M[ipsi], m_range, n_range, D1[ipsi], max_dm=dm_max, max_dn=dn_max)
+        apply_ghg_scaling(D1[ipsi], qprof[ipsi], n_range, m_range) # Compressibility core: G^H @ M @ G.
+        D1[ipsi] *= -mu_0 * gamma_s * pressure[ipsi]
+        # Stored inverse-lambda coefficient: D1 = -M[B0**2/h] @ A22.
+        D1[ipsi] = c12_2mat @ D1[ipsi]
+        apply_dm_cutoff(D1[ipsi], m_range, dm_max)
+
+        # And finally we fill the gpt_over_gpp and gpz_over_gpp matrices, that will be used to apply the convolution with the G operator in the solver.+
+        fill_block_kernel(gtp_over_gpp[ipsi], m_range, n_range, gtp_over_gpp_mat[ipsi], max_dm=dm_max, max_dn=dn_max)
+        fill_block_kernel(gpz_over_gpp[ipsi], m_range, n_range, gpz_over_gpp_mat[ipsi], max_dm=dm_max, max_dn=dn_max)
+
+        # We need now to scale the gtp,gzp_over_gpp by the appropriate factors, 
+        # im and in to get the correct scaling.
+        scale_cols(gtp_over_gpp_mat[ipsi], -1j*m_range) # g^{\theta\psi}/g^{\psi\psi} has an im factor.
+        scale_cols(gpz_over_gpp_mat[ipsi],  1j*n_range) # g^{\zeta\psi}/g^{\psi\psi} has an in factor.
+
+    return C0, C1, D0, D1, F, gtp_over_gpp_mat, gpz_over_gpp_mat
+
+
 
 
 def _build_sparse(C: np.ndarray, dm: int=None) -> coo_array:
@@ -696,128 +970,3 @@ def build_M_at(sb: solver_blocks2, omega: float, regularizer: float=1e-3) -> coo
         _offset_coo_tensor(E, nstates_xip1, nstates_xip1, full_shape, "E", scale=-1.0),
     )
 
-def get_T_sparse(sb: solver_blocks2, M: coo_array, 
-                 omega: float=None, regularizer: float=1e-3) -> csr_matrix:
-    r"""
-    Builds the full ideal MHD operator T in the space of 
-    (p1, xi^\psi, xi^s, \nabla\cdot\xi) for a given
-    frequency omega.
-
-    The local differential rows are defined per
-    ``psi_hat = Psi/(Baxis*aminor**2)`` while ``WD`` differentiates in the
-    solver coordinate ``x``. Therefore the Galerkin term uses
-    ``dpsi_hat_dx*M`` only for the first two equation groups:
-
-    T = ((\partial_x,\partial_x,0,0)\otimes I_M
-         - diag(beta,beta,1,1) M),
-
-    with ``beta = dpsi_hat_dx``.
-    """
-    M = _as_coo_tensor(M, "M")
-    if M.shape[1] != M.shape[2]:
-        raise ValueError("M must be square in its state dimensions.")
-
-    nq, n_state, _ = M.shape
-    nmode = sb.m_range.size
-    dpsi_hat_dx = _validate_dpsi_hat_dx(
-        getattr(sb, "dpsi_hat_dx", 1.0)
-    )
-    expected_state = 4 * nmode
-    if n_state != expected_state:
-        raise ValueError(f"M state size must be {expected_state}, got {n_state}.")
-
-    if sb.phi_q is None:
-        raise ValueError("sb.phi_q must be set before assembling T.")
-    if sb.weights_q is None:
-        raise ValueError("sb.weights_q must be set before assembling T.")
-    if sb.WD is None:
-        raise ValueError("sb.WD must be set before assembling T.")
-
-    phi_q = np.asarray(sb.phi_q)
-    weights_q = np.asarray(sb.weights_q)
-    if phi_q.ndim != 2:
-        raise ValueError("phi_q must have shape (n_quad, n_radial).")
-    if phi_q.shape[0] != nq:
-        raise ValueError("M and phi_q must use the same quadrature points.")
-    if weights_q.shape != (nq,):
-        raise ValueError(f"weights_q must have shape {(nq,)}, got {weights_q.shape}.")
-
-    n_radial = phi_q.shape[1]
-    if sb.WD.shape != (n_radial, n_radial):
-        raise ValueError(f"WD must have shape {(n_radial, n_radial)}, got {sb.WD.shape}.")
-
-    rows = []
-    cols = []
-    data = []
-
-    # Radial derivative part. Only p1 and xi^psi carry a radial derivative in
-    # ((partial_psi, partial_psi, 0, 0) - M).
-    wd = coo_matrix(sb.WD)
-    if wd.nnz:
-        derivative_states = np.arange(2 * nmode, dtype=np.int64)
-        rows.append(
-            np.repeat(wd.row, derivative_states.size) * n_state
-            + np.tile(derivative_states, wd.nnz)
-        )
-        cols.append(
-            np.repeat(wd.col, derivative_states.size) * n_state
-            + np.tile(derivative_states, wd.nnz)
-        )
-        data.append(np.repeat(wd.data.astype(np.complex128), derivative_states.size))
-
-    q_coords, local_rows, local_cols = M.coords
-    local_data = M.data.astype(np.complex128, copy=True)
-    local_data[local_rows < 2 * nmode] *= dpsi_hat_dx
-    local_keep = local_data != 0.0
-    if np.any(local_keep):
-        q_coords = q_coords[local_keep]
-        local_rows = local_rows[local_keep]
-        local_cols = local_cols[local_keep]
-        local_data = local_data[local_keep]
-
-        for q in np.unique(q_coords):
-            radial_support = np.flatnonzero(phi_q[q] != 0.0)
-            if radial_support.size == 0:
-                continue
-
-            q_mask = q_coords == q
-            local_q_rows = local_rows[q_mask]
-            local_q_cols = local_cols[q_mask]
-            local_q_data = local_data[q_mask]
-            if local_q_data.size == 0:
-                continue
-
-            radial_rows = np.repeat(radial_support, radial_support.size)
-            radial_cols = np.tile(radial_support, radial_support.size)
-            radial_data = (
-                weights_q[q]
-                * phi_q[q, radial_rows]
-                * phi_q[q, radial_cols]
-            ).astype(np.complex128, copy=False)
-
-            rows.append(
-                (
-                    radial_rows[:, None] * n_state
-                    + local_q_rows[None, :]
-                ).ravel()
-            )
-            cols.append(
-                (
-                    radial_cols[:, None] * n_state
-                    + local_q_cols[None, :]
-                ).ravel()
-            )
-            data.append(-(radial_data[:, None] * local_q_data[None, :]).ravel())
-
-    size = n_radial * n_state
-    if not data:
-        return csr_matrix((size, size), dtype=np.complex128)
-
-    return coo_matrix(
-        (
-            np.concatenate(data),
-            (np.concatenate(rows), np.concatenate(cols)),
-        ),
-        shape=(size, size),
-        dtype=np.complex128,
-    ).tocsr()

@@ -20,7 +20,7 @@ from supernova.core.desc_helper import (
     _reflect_boozer_surface_arrays,
     _rho_tor_from_q,
 )
-from supernova.core.solver import superSolver
+from supernova.core.solver2 import superSolver2
 from supernova.radial.bspline import BSplineFE
 from supernova.radial.profile import Profile
 
@@ -375,7 +375,7 @@ def test_desc_solver_constructs_continuum_and_full_solver_profiles(desc_equilibr
         domain=(0.0, 1.0),
         quad_order=3,
     )
-    solver = superSolver(desc_equilibrium, continuum, radial)
+    solver = superSolver2(desc_equilibrium, continuum, radial)
     for profile in [solver.C11, solver.C22, solver.D11, solver.D21_1, solver.F22]:
         assert np.all(np.isfinite(profile.data.values))
 

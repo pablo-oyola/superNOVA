@@ -27,8 +27,6 @@ from ._solver_kernel2 import (
     solver_blocks2,
 )
 from .solver3 import (
-    SplitRationalCISSNEPSolver,
-    SplitRationalNEPSolver,
     _build_local_M_split,
     _matrix_stats,
     _slice_to_quadrature,
@@ -645,122 +643,6 @@ class superSolver4(superSolver3):
                 "so the compatible mixed operator is square. Partial/no-BC "
                 "assemblies are available only through assemble_split_matrices()."
             )
-
-    def build_split_nep_solver(
-        self,
-        ntor: int,
-        target_omega: complex,
-        region: dict | None,
-        mmax: int | None = None,
-        max_dm: int = 10,
-        regularizer: float = 0.0,
-        apply_bcs: bool = True,
-        bc_kind: str | None = "full",
-        bc_tol: float | None = None,
-        prefix: str = "nova_split_nep",
-        which: str = "TARGET_MAGNITUDE",
-        nev: int = 6,
-        tol: float = 1e-8,
-        maxit: int = 100,
-        options: dict | None = None,
-        spectral_shift: complex | None = None,
-        verbose: bool = False,
-        compute_residuals: bool = True,
-    ) -> SplitRationalNEPSolver:
-        """Build NLEIGS only for the square full-BC mixed operator."""
-        self._require_full_bc_nep(apply_bcs, bc_kind)
-        nep = super().build_split_nep_solver(
-            ntor=ntor,
-            target_omega=target_omega,
-            region=region,
-            mmax=mmax,
-            max_dm=max_dm,
-            regularizer=regularizer,
-            apply_bcs=apply_bcs,
-            bc_kind=bc_kind,
-            bc_tol=bc_tol,
-            prefix=prefix,
-            which=which,
-            nev=nev,
-            tol=tol,
-            maxit=maxit,
-            options=options,
-            spectral_shift=spectral_shift,
-            verbose=verbose,
-            compute_residuals=compute_residuals,
-        )
-        self._configure_nleigs_shift_solvers(nep)
-        return nep
-
-    @staticmethod
-    def _configure_nleigs_shift_solvers(nep: SplitRationalNEPSolver) -> None:
-        """Use QR for NLEIGS shift solves unless PETSc options override it.
-
-        One-sided mixed reduction does not guarantee a nonzero in every
-        natural-order diagonal position even when the square matrix has a
-        valid structural matching.  PETSc's natural-order LU rejects that
-        pattern before numerical factorization, whereas QR supports the mixed
-        ordering directly.  Calling ``setFromOptions`` last preserves an
-        explicit user choice for the internal KSP/PC.
-        """
-        for ksp in nep.nep.getNLEIGSKSPs():
-            ksp.getPC().setType("qr")
-            ksp.setFromOptions()
-            nep._vprint(
-                "[superSolver4] configured NLEIGS mixed shift solve: "
-                f"prefix={ksp.getOptionsPrefix()!r}, ksp={ksp.getType()}, "
-                f"pc={ksp.getPC().getType()}"
-            )
-
-    def build_split_ciss_solver(
-        self,
-        ntor: int,
-        region: dict,
-        target_omega: complex | None = None,
-        mmax: int | None = None,
-        max_dm: int = 10,
-        regularizer: float = 0.0,
-        apply_bcs: bool = True,
-        bc_kind: str | None = "full",
-        bc_tol: float | None = None,
-        prefix: str = "nova_split_ciss",
-        which: str = "ALL",
-        nev: int = 32,
-        tol: float = 1e-8,
-        maxit: int = 100,
-        ciss_sizes: dict | None = None,
-        ciss_extraction: str | None = None,
-        ciss_refinement: dict | None = None,
-        ciss_threshold: dict | None = None,
-        options: dict | None = None,
-        verbose: bool = False,
-        compute_residuals: bool = True,
-    ) -> SplitRationalCISSNEPSolver:
-        """Build CISS only for the square full-BC mixed operator."""
-        self._require_full_bc_nep(apply_bcs, bc_kind)
-        return super().build_split_ciss_solver(
-            ntor=ntor,
-            region=region,
-            target_omega=target_omega,
-            mmax=mmax,
-            max_dm=max_dm,
-            regularizer=regularizer,
-            apply_bcs=apply_bcs,
-            bc_kind=bc_kind,
-            bc_tol=bc_tol,
-            prefix=prefix,
-            which=which,
-            nev=nev,
-            tol=tol,
-            maxit=maxit,
-            ciss_sizes=ciss_sizes,
-            ciss_extraction=ciss_extraction,
-            ciss_refinement=ciss_refinement,
-            ciss_threshold=ciss_threshold,
-            options=options,
-            verbose=verbose,
-            compute_residuals=compute_residuals,
-        )
 
     def _split_result_dataset(
         self,

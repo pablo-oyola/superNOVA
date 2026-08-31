@@ -37,15 +37,14 @@ OPTIONAL_MODULE_PREFIXES = (
 )
 
 # qualname -> sha256 of inspect.getsource(fn.py_func)
-# Captured from superNOVA_2 at f8b246e; 22 kernels, 1019 lines.
+# Captured from superNOVA_2 at f8b246e. The two E-inverse kernels went
+# with the retired superSolver v1 path; 20 remain, 847 lines.
 FROZEN_KERNELS: dict[str, str] = {
-    # supernova/core/_solver_kernel.py
+    # supernova/core/_solver_kernel2.py (moved verbatim from _solver_kernel.py)
     "_build_static_blocks": "5b4ddfdd6abe84810a973ca0567563f7c70402af850938ae803394f00e943c47",
     "scale_rows": "eb1c5e10615ce12acce394dd1e99a9317c1ca53d4d1d35707a840748d0bb1dc3",
     "scale_cols": "38c7ce14be7974d29dd1f8171806ad23c2736e01a6b0325b9e0d8dba6373ca7a",
     "apply_dm_cutoff": "6299e18603420c0f7bc1b50c0311e9ceec21ff860efb322af74f4cbbc228bae3",
-    "_apply_E_inv": "05d2e426e6cdf541e27d4d65214a303ae0306402fd81e87aca9d6a4e2aa0fdec",
-    "_apply_Eprime_inv": "0ffa0d5dae381e5408daee3edde71bd65925be8efa84f6afbb120249a0ad8f47",
     # supernova/core/_continuum_kernel.py
     "_fill_block_kernel": "c8a9d2f49d1891632dce9336987b7b506a3bb4fd2ff69b7cda35f864d7bec4a8",
     "_fill_convolution_block_kernel": "5f64ebd3159da3e779f982f1decee403d67bf0f927de533fed7f22680f83f622",
