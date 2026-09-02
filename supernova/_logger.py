@@ -88,14 +88,6 @@ class ColoredFormatter(logging.Formatter):
         else:
             return log_message
 
-class ErrorOnlyFilter(logging.Filter):
-    """Filter that only allows ERROR and CRITICAL messages (for all-ranks logging)."""
-    
-    def filter(self, record: logging.LogRecord) -> bool:
-        """Return True if level is ERROR or CRITICAL."""
-        return record.levelno >= logging.ERROR
-
-
 # Global flag to track if logging has been configured
 _LOGGING_CONFIGURED = False
 

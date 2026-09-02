@@ -28,6 +28,10 @@ _MHD_RAW_JDIAG_DIMS = u_current_mks * u_magnetic_field**2 / u_length
 _MHD_MU0_JDIAG_DIMS = u_magnetic_field**3
 
 
+# Registered with unyt by subclassing Equivalence: the class body's
+# ``type_name = "mhd_mu0"`` is what ``to_equivalent(..., "mhd_mu0")`` below
+# resolves. Nothing names this class directly, so a reference-based dead-code
+# sweep will call it unused -- it is not.
 class MHDMu0Equivalence(Equivalence):
     """
     MHD SI equivalence that absorbs or restores a factor of mu_0.

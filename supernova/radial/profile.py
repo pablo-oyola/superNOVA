@@ -301,45 +301,6 @@ def ProfileFactoryPsiThetaZeta(
         )
     return profiles
 
-def ProfileFactoryRzPhi(
-    magnetic_coordinates: MagneticCoordinates,
-    *args,
-    ntormax: Optional[int] = None,
-    mpolmax: Optional[int] = None
-) -> List["Profile"]:
-    """
-    Factory function to generate many Profiles at once, assuming the
-    input field is defined on the cylindrical grid (R, z, phi).
-
-    Input arguments (*args) are expected to be different datarrays or datasets,
-    defined on the same (R, z, phi) grid, and the factory will return a list of Profile
-    instances, one for each input field. 
-    The factory will batch the process for all the input profiles: transforming them all
-    to the (Psi, Theta, Zeta) coordinates and then calling the ProfileFactorPsiThetaZeta
-    that will decompose them into (n, m) harmonics and build the Profile instances.
-    """
-    for iargs in args:
-        if not isinstance(iargs, (xr.DataArray, xr.Dataset)):
-            raise ValueError("All input arguments must be xarray DataArrays or Datasets.")
-        
-    # We combine all the arguments into a single dataset.
-    data = xr.Dataset()
-    for i, arg in enumerate(args):
-        if isinstance(arg, xr.DataArray):
-            data[f'field_{i}'] = arg
-        else:
-            for var in arg.data_vars:
-                data[f'{var}_{i}'] = arg[var]
-
-    # We now generate the Psi, Theta, Zeta coordinates using the magnetic_coordinates.
-    data_mag = magnetic_coordinates.cyl2mag_scalar(field=data, return_psi_norm=True)
-
-    return ProfileFactoryPsiThetaZeta(
-        data_mag,
-        ntormax=ntormax,
-        mpolmax=mpolmax,
-    )
-
 class Profile:
     """
     This will contain the information of a collection of radial profiles, indexing them
