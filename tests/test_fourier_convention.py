@@ -7,7 +7,7 @@ import pytest
 from scipy.sparse import coo_array, csr_matrix
 
 from supernova.operators.blocks import _build_static_blocks
-from supernova.operators.blocks import build_M_at, solver_blocks2
+from supernova.operators.blocks import build_M_at, SolverBlocks
 from supernova.operators.local import _build_local_M_split
 from supernova.operators.project import _project_local_tensor_mixed
 
@@ -266,7 +266,7 @@ def test_radial_chain_factor_rejects_invalid_values(bad_factor):
 def test_solver_blocks_roundtrip_preserves_radial_chain_factor():
     harmonic = _zero_tensor((1, 1, 1))
     xip1 = _zero_tensor((1, 2, 2))
-    blocks = solver_blocks2(
+    blocks = SolverBlocks(
         m_range=np.array([2], dtype=np.int32),
         max_dm=0,
         ntor=1,
@@ -295,9 +295,9 @@ def test_solver_blocks_roundtrip_preserves_radial_chain_factor():
 
     with pytest.warns(UserWarning, match="Duplicate dimension names"):
         dataset = blocks.to_xarray()
-    restored = solver_blocks2.from_xarray(dataset)
+    restored = SolverBlocks.from_xarray(dataset)
     assert restored.dpsi_hat_dx == pytest.approx(0.25)
 
     dataset.attrs.pop("dpsi_hat_dx")
-    legacy_restored = solver_blocks2.from_xarray(dataset)
+    legacy_restored = SolverBlocks.from_xarray(dataset)
     assert legacy_restored.dpsi_hat_dx == pytest.approx(1.0)

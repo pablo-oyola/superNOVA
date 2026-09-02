@@ -9,12 +9,12 @@ import pytest
 import xarray as xr
 
 from supernova.solve.evidence import (
-    EvidenceV2Config,
+    EvidenceConfig,
     MeshPerturbationOptions,
     PhysicalDisplacementMetric,
     aggregate_catalog_status,
     bspline_prolongation_matrix,
-    classify_tracks_evidence_v2,
+    classify_tracks,
     deterministic_shifted_bspline,
     migrate_legacy_mode_dataset,
     physical_displacement_cross_gram,
@@ -90,12 +90,12 @@ def _track(
 
 
 def _classify(tracks, continuum, catalog="capacity_limited"):
-    return classify_tracks_evidence_v2(
+    return classify_tracks(
         tracks,
         continuum,
         np.ones(tracks.sizes["psi"]) / tracks.sizes["psi"],
         catalog,
-        EvidenceV2Config(),
+        EvidenceConfig(),
     )
 
 
@@ -418,7 +418,7 @@ def test_deterministic_shifted_mesh_preserves_topology_and_records_seed():
 
 
 def test_smooth_sequence_is_not_continuum_like():
-    config = EvidenceV2Config()
+    config = EvidenceConfig()
     evidence = refinement_scaling_evidence(
         np.asarray([0.25, 0.125, 0.0625]),
         np.asarray([0.20, 0.20, 0.20]),
@@ -587,7 +587,7 @@ def test_legacy_serialized_mode_schema_can_be_migrated_and_reclassified():
         attrs={"schema_version": 1, "base_spans": 40},
     )
     tracks, weights = migrate_legacy_mode_dataset(modes)
-    result = classify_tracks_evidence_v2(
+    result = classify_tracks(
         tracks,
         _continuum([[50.0], [50.0]]),
         weights,

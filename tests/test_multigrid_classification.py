@@ -442,11 +442,12 @@ def test_public_defaults_and_result_xarray_topology():
     assert supernova.MultigridSearchOptions is MultigridSearchOptions
     assert supernova.ModeClassificationThresholds is ModeClassificationThresholds
     assert supernova.MultigridPEPResult is MultigridPEPResult
-    assert supernova.superSolver5Multigrid is multigrid.superSolver5Multigrid
+    assert supernova.MultigridSolver is multigrid.MultigridSolver
     assert set(multigrid.__all__) == {
-        "EvidenceV2Config",
+        "EvidenceConfig",
         "ModeClassificationThresholds",
         "MultigridPEPResult",
         "MultigridSearchOptions",
-        "superSolver5Multigrid",
+        "MultigridSolver",
+        "build_resolved_kinetic_energy_metric",
     }

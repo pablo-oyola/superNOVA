@@ -19,7 +19,7 @@ from supernova.radial import BSplineFE, CompatibleBSplinePair
 
 @dataclass(frozen=True)
 class MixedFieldLayout:
-    """Dimensions and field-major index maps for the solver4 operator."""
+    """Dimensions and field-major index maps for the mixed operator."""
 
     n_high: int
     n_low: int

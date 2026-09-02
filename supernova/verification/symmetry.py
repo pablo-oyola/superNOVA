@@ -962,7 +962,7 @@ def compare_positive_subblock(
     """Compare a production matrix with the positive block of doubled assembly.
 
     Radial counts may be scalars, per-field sequences, or field-name mappings.
-    Row and trial counts are independent so the function supports solver4/5's
+    Row and trial counts are independent so the function supports the mixed operator's
     rectangular mixed B-spline layout.
     """
     production_modes = np.asarray(production_m_values, dtype=np.int64)

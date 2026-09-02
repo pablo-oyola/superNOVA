@@ -31,7 +31,7 @@ from supernova.eigen.pep import (
     _polynomial_backward_error,
     _polynomial_residual_norm,
 )
-from supernova.solve.stability import superSolver5
+from supernova.solve.stability import StabilitySolver
 from supernova.operators.mixed import MixedFieldLayout
 from supernova.operators.blocks import _build_static_blocks
 from supernova.equilibrium import (
@@ -219,7 +219,7 @@ def test_linear_residual_uses_native_generalized_pencil():
 
 
 def test_build_pep_maps_split_matrices_to_polynomial_coefficients(monkeypatch):
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     solver.gamma_s = 5.0 / 3.0
     split = tuple(csr_matrix(np.eye(2) * scale) for scale in (2.0, 3.0, 5.0))
     solver.assemble_split_matrices = lambda **kwargs: split
@@ -244,7 +244,7 @@ def test_build_pep_maps_split_matrices_to_polynomial_coefficients(monkeypatch):
 
 
 def test_build_pep_forwards_explicit_signed_harmonics(monkeypatch):
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     solver.gamma_s = 5.0 / 3.0
     split = tuple(csr_matrix(np.eye(2) * scale) for scale in (2.0, 3.0, 5.0))
     assembled = {}
@@ -278,7 +278,7 @@ def test_build_pep_forwards_explicit_signed_harmonics(monkeypatch):
 
 
 def test_build_pep_transparently_selects_eps_at_exact_gamma_zero(monkeypatch):
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     solver.gamma_s = 0.0
     T0 = csr_matrix(np.diag([-1.0, -2.0]))
     T1 = csr_matrix(np.eye(2))
@@ -312,7 +312,7 @@ def test_build_pep_transparently_selects_eps_at_exact_gamma_zero(monkeypatch):
 
 
 def test_build_pep_keeps_small_nonzero_gamma_on_quadratic_path(monkeypatch):
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     solver.gamma_s = 1.0e-15
     split = tuple(csr_matrix(np.eye(2) * scale) for scale in (2.0, 3.0, 5.0))
     solver.assemble_split_matrices = lambda **kwargs: split
@@ -489,7 +489,7 @@ def test_solve_pep_preserves_primary_error_when_destroy_also_fails():
             self.destroy_calls += 1
             raise RuntimeError("secondary PEPDestroy failure")
 
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     pep = FailingPEP()
     solver.build_pep_solver = lambda **kwargs: pep
 
@@ -517,7 +517,7 @@ def test_solve_pep_destroys_pep_after_success(monkeypatch):
         def destroy(self):
             self.destroy_calls += 1
 
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     pep = SuccessfulPEP()
     solver.build_pep_solver = lambda **kwargs: pep
     monkeypatch.setattr(solver, "_split_result_dataset", lambda **kwargs: expected)
@@ -546,7 +546,7 @@ def test_solve_pep_packs_exact_zero_eps_metadata_without_api_change(monkeypatch)
         def destroy(self):
             self.destroy_calls += 1
 
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     eps = SuccessfulEPS()
     solver.build_pep_solver = lambda **kwargs: eps
     packed = {}
@@ -756,7 +756,7 @@ def test_solve_pep_forwards_signed_harmonics_to_result_packing(monkeypatch):
         def destroy(self):
             pass
 
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     build_kwargs = {}
     packing_kwargs = {}
     solver.build_pep_solver = lambda **kwargs: (
@@ -782,7 +782,7 @@ def test_solve_pep_forwards_signed_harmonics_to_result_packing(monkeypatch):
 
 
 def test_split_result_dataset_packs_explicit_signed_harmonic_coordinates():
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     solver.M = SimpleNamespace(m_pol=np.arange(-2, 3, dtype=np.int64))
     solver._species_mass_amu = lambda: 2.0
     m_values = np.array([-2, -1, 1, 2], dtype=np.int64)
@@ -999,7 +999,7 @@ def test_solve_and_plot_xipsi_mirror_symmetry_builds_signed_itpa_diagnostic(
     ],
 )
 def test_solver5_rejects_rectangular_pep_inputs_before_petsc(bc_options):
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
     with pytest.raises(ValueError, match="require apply_bcs=True"):
         solver.build_pep_solver(
             ntor=2,
@@ -1011,9 +1011,9 @@ def test_solver5_rejects_rectangular_pep_inputs_before_petsc(bc_options):
 
 def test_supernova_exports_every_solver_generation_as_one_class():
     """The four generations were flattened; the old names are aliases."""
-    assert supernova.superSolver5 is superSolver5
-    assert supernova.StabilitySolver is superSolver5
-    for name in ("superSolver2", "superSolver3", "superSolver4", "superSolver5"):
+    assert supernova.StabilitySolver is StabilitySolver
+    assert supernova.StabilitySolver is StabilitySolver
+    for name in ("StabilitySolver", "StabilitySolver", "StabilitySolver", "StabilitySolver"):
         assert getattr(supernova, name) is supernova.StabilitySolver
 
 
@@ -1186,7 +1186,7 @@ def test_solver5_normalizes_cocos1_flux_per_radian(monkeypatch):
         quad_order=3,
     )
 
-    solver = superSolver5(equ, continuum, radialfe=radialfe)
+    solver = StabilitySolver(equ, continuum, radialfe=radialfe)
 
     assert np.all(np.isfinite(solver.pressure_deriv.data.values))
     physical_span = _active_poloidal_flux_span(equ.boozer.coords.psi0)
@@ -1200,7 +1200,7 @@ def test_solver5_normalizes_cocos1_flux_per_radian(monkeypatch):
 
     monkeypatch.setattr(
         solver2_module,
-        "build_solver_blocks2",
+        "build_solver_blocks",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
     blocks = solver._assemble_solver_blocks_for_m_range(

@@ -55,7 +55,7 @@ def _overview_figure(
         ylim=(max(0.0, frequency_band[0] - 5.0), frequency_band[1] + 5.0),
         xlabel=r"Normalized poloidal flux $\psi_N$",
         ylabel="Cyclic frequency [kHz]",
-        title="solver5 multigrid classifications over the slow-sound continuum",
+        title="multigrid classifications over the slow-sound continuum",
     )
     axis.grid(True, alpha=0.18)
     if labeled_modes:

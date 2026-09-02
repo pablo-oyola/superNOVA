@@ -20,7 +20,7 @@ from supernova.solve.multigrid import (
     _is_converged_reason,
     _nested_bspline_levels,
     _window_diagnostics_dataset,
-    superSolver5Multigrid,
+    MultigridSolver,
 )
 from supernova.solve.evidence import (
     AdaptiveDiscoveryOptions,
@@ -312,7 +312,7 @@ def test_fixed_search_retargets_once_per_window_and_reports_saturation(
             events.append(("destroy",))
 
     monkeypatch.setattr(multigrid_module, "QuadraticPEPSolver", FakePEP)
-    orchestrator = object.__new__(superSolver5Multigrid)
+    orchestrator = object.__new__(MultigridSolver)
     orchestrator.levels = 1
     orchestrator.master_weights = np.array([0.4, 0.6])
 
@@ -417,7 +417,7 @@ def test_multigrid_window_builder_selects_eps_at_exact_gamma_zero(monkeypatch):
         "QuadraticPEPSolver",
         lambda **kwargs: pytest.fail("gamma_s=0 unexpectedly selected PEP"),
     )
-    orchestrator = object.__new__(superSolver5Multigrid)
+    orchestrator = object.__new__(MultigridSolver)
     orchestrator.solver = SimpleNamespace(gamma_s=0.0)
     search = MultigridSearchOptions(nev=5)
     T0 = csr_matrix(np.diag([-1.0, -2.0]))
@@ -500,7 +500,7 @@ def test_solve_pep_constructs_local_blocks_once_for_all_levels(monkeypatch):
             projection_calls.append((mixed, kwargs))
             return (f"T0-{mixed}", f"T1-{mixed}", f"Tm1-{mixed}")
 
-    orchestrator = object.__new__(superSolver5Multigrid)
+    orchestrator = object.__new__(MultigridSolver)
     orchestrator.solver = FakeSolver()
     orchestrator.levels = 3
     orchestrator.mixed_levels = ("coarse", "medium", "fine")
@@ -564,7 +564,7 @@ def test_solve_pep_constructs_local_blocks_once_for_all_levels(monkeypatch):
 
 
 def test_adaptive_discovery_stops_after_stable_global_candidate_pass(monkeypatch):
-    orchestrator = object.__new__(superSolver5Multigrid)
+    orchestrator = object.__new__(MultigridSolver)
     radial = _base_spline(build_matrices=False)
     orchestrator.radial_levels = (radial,)
     orchestrator.master_points = np.asarray([0.25, 0.75])
@@ -682,7 +682,7 @@ def test_missing_root_reacquisition_uses_prolonged_initial_space(monkeypatch):
         lambda coarse, fine, n_modes: np.eye(2),
     )
 
-    orchestrator = object.__new__(superSolver5Multigrid)
+    orchestrator = object.__new__(MultigridSolver)
     orchestrator.levels = 2
     orchestrator.solver = FakeSolver()
     orchestrator.mixed_levels = ("coarse", "fine")

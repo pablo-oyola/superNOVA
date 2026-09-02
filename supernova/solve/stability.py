@@ -1,9 +1,9 @@
 r"""One solver for the ideal-MHD stability problem.
 
-The four ``superSolverN`` generations were a linear inheritance chain in which
-each level bolted on a different eigensolver strategy.  Only the last one is
-used, so they are one class here.  Nothing in the chain called ``super()``, so
-this is the same code with the indirection removed.
+This was once four classes in a linear inheritance chain, each level bolting on
+a different eigensolver strategy.  Only one strategy is used, so there is one
+class.  Nothing in the chain called ``super()``, so this is the same code with
+the indirection removed.
 
 The pipeline, top to bottom:
 
@@ -32,7 +32,7 @@ from supernova.radial.base import RadialFE
 from supernova.radial.profile import Profile
 from supernova.radial import BSplineFE
 
-from supernova.operators.blocks import solver_blocks2, build_solver_blocks2
+from supernova.operators.blocks import SolverBlocks, build_solver_blocks
 from supernova.operators.boundary import (
     MixedBoundaryCondition as BoundaryCondition,
     idealSeparatrixBC,
@@ -58,8 +58,7 @@ from supernova.eigen.region import _as_scalar_complex, _ellipse_region_dict
 class StabilitySolver:
     """Assemble and solve the ideal-MHD pencil on one radial grid."""
 
-    # ---- from superSolver2 ----------------------------------------------
-
+    
     def __init__(self, equ: superEquilibrium, 
                  cont: superContinuum,
                  radialfe: RadialFE):
@@ -132,7 +131,7 @@ class StabilitySolver:
         and \nabla\Psi·\nabla = g^{\psi\psi}\partial_\Psi
         + g^{\psi\Theta}\partial_\Theta + g^{\psi\zeta}\partial_\zeta.
 
-        Since the objective of the superSolver is to separate the radial from the 
+        Since the objective is to separate the radial from the
         radially-local operators to apply Krylov-based solvers, we need to move the
         g^{\Psi\Psi} = ||\nabla\Psi||^2 from the LHS to the RHS. After recalculation:
 
@@ -404,7 +403,7 @@ class StabilitySolver:
         ntor: int,
         m_range: np.ndarray,
         max_dm: int,
-    ) -> solver_blocks2:
+    ) -> SolverBlocks:
         """Assemble solver blocks for an already validated harmonic list."""
         m_range = np.asarray(m_range, dtype=np.int64)
         if int(max_dm) < 0:
@@ -431,7 +430,7 @@ class StabilitySolver:
         mass_amu = float(self.cont.mass.to("amu").v)
         mass_density = S(self.density) * mass_amu
 
-        blocks = build_solver_blocks2(
+        blocks = build_solver_blocks(
             C11=H(self.C11, coefficient_mmax, nmax_eff),
             O=H(self.O, coefficient_mmax, nmax_eff),
             C12_2=H(self.C12_2, coefficient_mmax, nmax_eff),
@@ -487,7 +486,7 @@ class StabilitySolver:
         ntor: int,
         m_values: np.ndarray,
         max_dm: int = 10,
-    ) -> solver_blocks2:
+    ) -> SolverBlocks:
         """Build uncached blocks for an explicit diagnostic harmonic list.
 
         This opt-in path does not alter ``self.solver_blocks`` and therefore
@@ -501,7 +500,7 @@ class StabilitySolver:
             max_dm=max_dm,
         )
 
-    def build_solver_blocks(self, ntor: int, max_dm: int=10, mmax: int=None) -> solver_blocks2:
+    def build_solver_blocks(self, ntor: int, max_dm: int=10, mmax: int=None) -> SolverBlocks:
         """
         We build the solver blocks using the pre-evaluated profiles already
         evaluated at the radial points and fill the class to be used later 
@@ -560,8 +559,7 @@ class StabilitySolver:
 
         return self.solver_blocks
 
-    # ---- from superSolver3 ----------------------------------------------
-
+    
     @staticmethod
     def _normalize_bc_kind(bc_kind: str | None) -> str:
         """
@@ -593,12 +591,11 @@ class StabilitySolver:
         """
         return float(self.cont.mass.to("amu").v)
 
-    # ---- from superSolver4 ----------------------------------------------
-
+    
     def _get_mixed_radial_data(self) -> MixedRadialData:
         """Return compatible basis data cached for the current high space."""
         if not isinstance(self.radialfe, BSplineFE):
-            raise TypeError("superSolver4 requires a BSplineFE high radial space.")
+            raise TypeError("The mixed compatible spaces require a BSplineFE high radial space.")
         cached = getattr(self, "_mixed_radial_data", None)
         if cached is None or cached.pair.high is not self.radialfe:
             cached = _build_mixed_radial_data(self.radialfe)
@@ -607,7 +604,7 @@ class StabilitySolver:
 
     def _mixed_layout(
         self,
-        sb: solver_blocks2,
+        sb: SolverBlocks,
         mixed: MixedRadialData | None = None,
     ) -> MixedFieldLayout:
         mixed = self._get_mixed_radial_data() if mixed is None else mixed
@@ -619,7 +616,7 @@ class StabilitySolver:
 
     def _build_nep_boundary_condition(
         self,
-        sb: solver_blocks2,
+        sb: SolverBlocks,
         bc_kind: str | None = "full",
         mixed: MixedRadialData | None = None,
     ) -> BoundaryCondition:
@@ -689,7 +686,7 @@ class StabilitySolver:
 
     def _assemble_split_matrices_from_local(
         self,
-        sb: solver_blocks2,
+        sb: SolverBlocks,
         mixed: MixedRadialData,
         local_split: tuple,
         *,
@@ -767,7 +764,7 @@ class StabilitySolver:
                 )
 
         if verbose:
-            print("[superSolver4] assembled mixed split matrices before BC reduction")
+            print("[assembly] assembled mixed split matrices before BC reduction")
             print(
                 f"  ntor={sb.ntor}, n_modes={layout.n_modes}, "
                 f"n_high={layout.n_high}, n_low={layout.n_low}"
@@ -793,7 +790,7 @@ class StabilitySolver:
         bc_rank = int(layout.n_trial - prolongation.shape[1])
         if bc_rank != expected_rank:
             raise ValueError(
-                f"solver4 {kind!r} boundary rank must be {expected_rank}, got {bc_rank}."
+                f"{kind!r} boundary rank must be {expected_rank}, got {bc_rank}."
             )
 
         reduced = tuple(
@@ -814,7 +811,7 @@ class StabilitySolver:
             )
 
         if verbose:
-            print("[superSolver4] split matrices after one-sided BC reduction")
+            print("[assembly] split matrices after one-sided BC reduction")
             print(
                 f"  bc_kind={kind}, bc_rank={bc_rank}, "
                 f"full_shape={expected_shape}, reduced_shape={reduced_shape}"
@@ -828,7 +825,7 @@ class StabilitySolver:
         kind = self._normalize_bc_kind(bc_kind)
         if not apply_bcs or kind != "full":
             raise ValueError(
-                "superSolver4 NEP solves require apply_bcs=True and bc_kind='full' "
+                "Mixed-space solves require apply_bcs=True and bc_kind='full' "
                 "so the compatible mixed operator is square. Partial/no-BC "
                 "assemblies are available only through assemble_split_matrices()."
             )
@@ -1037,8 +1034,7 @@ class StabilitySolver:
             attrs=attrs,
         )
 
-    # ---- from superSolver5 ----------------------------------------------
-
+    
     def build_pep_solver(
         self,
         ntor: int,
@@ -1062,7 +1058,7 @@ class StabilitySolver:
         compute_residuals: bool = True,
         m_values: np.ndarray | None = None,
     ) -> QuadraticPEPSolver | LinearGeneralizedEPSSolver:
-        """Assemble and build the appropriate solver5 eigensolver.
+        """Assemble and build the appropriate eigensolver.
 
         The historical method name remains unchanged.  Exact ``gamma_s == 0``
         returns a generalized EPS solver for ``(-T0)x = s*T1*x``; otherwise it
@@ -1131,7 +1127,7 @@ class StabilitySolver:
         compute_residuals: bool = True,
         m_values: np.ndarray | None = None,
     ) -> xr.Dataset:
-        """Solve solver5 with transparent exact-zero EPS dispatch.
+        """Solve with transparent exact-zero EPS dispatch.
 
         Pass an explicit signed ``m_values`` array only for diagnostics that
         require a harmonic space closed under ``m -> -m``.
@@ -1167,7 +1163,7 @@ class StabilitySolver:
         if backend == "EPS":
             description = (
                 "SLEPc generalized EPS solution of the exact gamma_s=0 "
-                "solver5 pencil (-T0) x = s*T1 x."
+                "pencil (-T0) x = s*T1 x."
             )
             extra_attrs = {
                 "problem_type": "GENERALIZED_LINEAR",
@@ -1179,7 +1175,7 @@ class StabilitySolver:
             }
         else:
             description = (
-                "SLEPc quadratic PEP solution of sparse solver5 "
+                "SLEPc quadratic PEP solution of the sparse pencil "
                 "(Tminus1 + s*T0 + s**2*T1) x = 0."
             )
             extra_attrs = {
@@ -1230,10 +1226,3 @@ class StabilitySolver:
             eigensolver.destroy()
             return output
 
-
-# Historical names.  The four generations were never separately useful; they
-# are all this class.
-superSolver2 = StabilitySolver
-superSolver3 = StabilitySolver
-superSolver4 = StabilitySolver
-superSolver5 = StabilitySolver

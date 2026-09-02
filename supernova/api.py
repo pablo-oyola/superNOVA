@@ -22,7 +22,7 @@ and computing mode centroids and widths -- live here once.
     modes.centroid, modes.width
 
 The low-level objects stay reachable: :class:`~supernova.solve.stability.
-StabilitySolver` and :class:`~supernova.solve.multigrid.superSolver5Multigrid`
+StabilitySolver` and :class:`~supernova.solve.multigrid.MultigridSolver`
 take the same arguments they always did, and every result here wraps an
 ``xarray.Dataset`` that is available as ``.dataset``.
 """
@@ -493,7 +493,7 @@ class Scan:
     Owns a :class:`~supernova.solve.stability.StabilitySolver` and reuses it:
     the solver blocks and the mixed bases are built once, and each window is a
     retargeted solve.  For the multigrid classification pipeline use
-    :class:`~supernova.solve.multigrid.superSolver5Multigrid` directly.
+    :class:`~supernova.solve.multigrid.MultigridSolver` directly.
     """
 
     def __init__(self, case: Case, grid: RadialGrid, *, ntor: int,

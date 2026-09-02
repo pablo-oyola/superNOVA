@@ -4,7 +4,7 @@ import numpy as np
 import xarray as xr
 
 import supernova.solve.stability as solver2_module
-from supernova.solve.stability import superSolver2
+from supernova.solve.stability import StabilitySolver
 from supernova.radial.profile import Profile
 
 
@@ -102,7 +102,7 @@ def test_solver_resampling_owns_continuum_profiles_across_radial_grids(monkeypat
     continuum = _continuum(equilibrium)
     continuum_before = _profile_snapshots(continuum)
 
-    first = superSolver2(equilibrium, continuum, _RadialFE([0.2, 0.6]))
+    first = StabilitySolver(equilibrium, continuum, _RadialFE([0.2, 0.6]))
 
     _assert_profiles_unchanged(continuum, continuum_before)
     for name in continuum_before:
@@ -110,7 +110,7 @@ def test_solver_resampling_owns_continuum_profiles_across_radial_grids(monkeypat
     assert first.D21_2 is first.M
     first_before = _profile_snapshots(first)
 
-    second = superSolver2(equilibrium, continuum, _RadialFE([0.15, 0.45, 0.75]))
+    second = StabilitySolver(equilibrium, continuum, _RadialFE([0.15, 0.45, 0.75]))
 
     _assert_profiles_unchanged(continuum, continuum_before)
     _assert_profiles_unchanged(first, first_before)
@@ -133,13 +133,13 @@ def test_solver_block_assembly_uses_solver_owned_continuum_profiles(monkeypatch)
     )
     monkeypatch.setattr(
         solver2_module,
-        "build_solver_blocks2",
+        "build_solver_blocks",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
     equilibrium = _Equilibrium(np.linspace(0.0, 1.0, 9))
     continuum = _continuum(equilibrium)
-    solver = superSolver2(equilibrium, continuum, _RadialFE([0.2, 0.6]))
+    solver = StabilitySolver(equilibrium, continuum, _RadialFE([0.2, 0.6]))
 
     for name in ("H", "J", "K", "L", "M"):
         getattr(continuum, name).data.values[...] = -1000.0

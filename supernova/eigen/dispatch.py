@@ -93,7 +93,3 @@ def build_eigensolver(
         compute_residuals=compute_residuals,
     )
 
-
-# The historical name, kept because solve/multigrid.py and a few no_sync
-# scripts still call it.
-_build_solver5_eigensolver_from_matrices = build_eigensolver

@@ -15,13 +15,13 @@ from scipy.sparse import coo_matrix, csr_matrix
 from supernova.operators.blocks import (
     _as_coo_tensor,
     _validate_dpsi_hat_dx,
-    solver_blocks2,
+    SolverBlocks,
 )
 from supernova.operators.mixed import MixedFieldLayout
 
 
 def _project_local_tensor_mixed(
-    sb: solver_blocks2,
+    sb: SolverBlocks,
     M,
     phi_high_q: np.ndarray,
     phi_low_q: np.ndarray,

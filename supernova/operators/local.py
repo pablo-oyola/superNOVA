@@ -17,7 +17,7 @@ from scipy.sparse import coo_array, csr_matrix
 
 from supernova.operators.blocks import (
     mu_0,
-    solver_blocks2,
+    SolverBlocks,
     _as_coo_tensor,
     _filter_zero_data,
     _combine_coo_tensors,
@@ -34,7 +34,7 @@ def _matrix_stats(name: str, matrix: csr_matrix) -> str:
     return f"{name}: shape={matrix.shape}, nnz={matrix.nnz}, density={density:.3e}"
 
 
-def _validate_split_block_shapes(sb: solver_blocks2):
+def _validate_split_block_shapes(sb: SolverBlocks):
     """
     Check the local block shapes expected by the four-field solver state.
     """
@@ -105,7 +105,7 @@ def _slice_to_quadrature(tensor, nq: int, name: str) -> coo_array:
 
 
 def _build_local_M_split(
-    sb: solver_blocks2,
+    sb: SolverBlocks,
     regularizer: float = 0.0,
 ) -> tuple[coo_array, coo_array, coo_array]:
     r"""

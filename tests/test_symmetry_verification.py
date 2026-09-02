@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from scipy import sparse
 
-from supernova.solve.stability import superSolver2
+from supernova.solve.stability import StabilitySolver
 from supernova.radial.profile import Profile
 from supernova.verification import (
     Parity,
@@ -539,7 +539,7 @@ def test_transformed_real_eigenspace_rejects_non_conjugation_invariant_line():
     ],
 )
 def test_solver2_explicit_m_validator_accepts_sorted_unique_signed_integers(values):
-    validated = superSolver2._validate_explicit_m_values(values, available_mmax=4)
+    validated = StabilitySolver._validate_explicit_m_values(values, available_mmax=4)
     np.testing.assert_array_equal(validated, values.astype(np.int64))
     assert validated.dtype == np.int64
 
@@ -547,7 +547,7 @@ def test_solver2_explicit_m_validator_accepts_sorted_unique_signed_integers(valu
 def test_solver2_explicit_signed_assembly_forwards_modes_without_touching_cache(
     monkeypatch,
 ):
-    solver = object.__new__(superSolver2)
+    solver = object.__new__(StabilitySolver)
     solver.M = Profile(
         np.array([0.5]),
         np.zeros((1, 11, 1), dtype=np.complex128),
@@ -570,7 +570,7 @@ def test_solver2_explicit_signed_assembly_forwards_modes_without_touching_cache(
         return assembled_blocks
 
     monkeypatch.setattr(
-        superSolver2,
+        StabilitySolver,
         "_assemble_solver_blocks_for_m_range",
         fake_assemble,
     )
@@ -605,7 +605,7 @@ def test_solver2_explicit_signed_assembly_forwards_modes_without_touching_cache(
 )
 def test_solver2_explicit_m_validator_rejects_invalid_lists(values, message):
     with pytest.raises(ValueError, match=message):
-        superSolver2._validate_explicit_m_values(values, available_mmax=4)
+        StabilitySolver._validate_explicit_m_values(values, available_mmax=4)
 
 
 @pytest.mark.parametrize(
@@ -627,4 +627,4 @@ def test_solver2_explicit_m_validator_rejects_invalid_lists(values, message):
 )
 def test_solver2_explicit_m_validator_rejects_nonnumeric_and_overflow_inputs(values):
     with pytest.raises(ValueError):
-        superSolver2._validate_explicit_m_values(values, available_mmax=4)
+        StabilitySolver._validate_explicit_m_values(values, available_mmax=4)

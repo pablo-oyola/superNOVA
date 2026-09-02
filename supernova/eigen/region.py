@@ -50,7 +50,7 @@ def _ellipse_region_dict(region: dict | None, target_s: complex) -> dict:
         raise ValueError("region must be a dictionary.")
     region_type = region.get("type", "ellipse")
     if str(region_type).lower() != "ellipse":
-        raise ValueError("solver3 v1 supports only ellipse regions.")
+        raise ValueError("only elliptical search regions are supported.")
 
     center = _as_scalar_complex(region.get("center", target_s), "region['center']")
     radius = float(region.get("radius", 0.25 * abs(target_s)))

@@ -16,7 +16,7 @@ Current conditions:
 - ``p_1``, ``xi^psi``, ``xi^s`` and ``div.xi`` all vanish at the axis.
 
 This module merges the former ``_boundary3`` base and ``_boundary4`` mixed
-subclasses; the monolithic-space subclasses went with superSolver3's boundary
+subclasses; the monolithic-space subclasses went with the retired monolithic-space boundary
 builder.
 """
 
@@ -324,7 +324,7 @@ class BoundaryCondition:
 #
 # Merged from the former _boundary4.py, which was a 209-line subclass module
 # with nothing to separate it from its base.  The four monolithic-space
-# subclasses that used to live above went with superSolver3's boundary
+# subclasses that used to live above went with the retired monolithic-space boundary
 # builder; these are the only ones the solver reaches.
 # ---------------------------------------------------------------------------
 
@@ -340,7 +340,7 @@ class MixedBoundaryCondition(BoundaryCondition):
 
         For a rectangular mixed operator ``T`` and a sparse prolongation ``P``
         satisfying ``C @ P = 0``, return ``T @ P``.  Equation rows are not
-        projected because they already live in the solver4 lower test space.
+        projected because they already live in the lower-order test space.
         """
         P = self.get_sparse_prolongation(tol=tol)
         mat = matrix.tocsr() if issparse(matrix) else csr_matrix(matrix)
@@ -381,7 +381,7 @@ def _validate_mixed_spaces(
     high_radialfe: RadialFE,
     low_radialfe: RadialFE,
 ) -> tuple[int, int]:
-    """Return compatible high/low dimensions for the solver4 layout."""
+    """Return compatible high/low dimensions for the mixed field-major layout."""
     n_high = high_radialfe.get_ndofs()
     n_low = low_radialfe.get_ndofs()
     if n_high < 2:

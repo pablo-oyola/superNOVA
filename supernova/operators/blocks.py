@@ -453,7 +453,7 @@ def _combine_coo_tensors(shape: tuple[int, int, int], *tensors) -> coo_array:
     return _coo_tensor_from_parts(shape, data_parts, coord_parts)
 
 @dataclass
-class solver_blocks2:
+class SolverBlocks:
     """
     Contains the block matrices of the problem, once they are filled and prepared
     at initialization.
@@ -636,29 +636,29 @@ class solver_blocks2:
                     "d(Psi/(Baxis*aminor**2))/dx for the solver radial coordinate"
                 ),
                 "state_order": "full_state is ordered as p1(m_range) followed by xi(m_range).",
-                "description": "Serialized solver_blocks2 data for solver debugging and persistence.",
+                "description": "Serialized SolverBlocks data for solver debugging and persistence.",
             },
         )
     
     @staticmethod
-    def from_xarray(dataset: xr.Dataset) -> "solver_blocks2":
+    def from_xarray(dataset: xr.Dataset) -> "SolverBlocks":
         """
-        Reconstructs a solver_blocks2 instance from an xarray dataset created by to_xarray.
+        Reconstructs a SolverBlocks instance from an xarray dataset created by to_xarray.
 
         Parameters
         ----------
         dataset : xr.Dataset
-            The xarray dataset containing the serialized solver_blocks2 data.
+            The xarray dataset containing the serialized SolverBlocks data.
 
         Returns
         -------
-        solver_blocks2
-            The reconstructed solver_blocks2 instance.
+        SolverBlocks
+            The reconstructed SolverBlocks instance.
         """
         # We get the maximum coupling.
         dm_max = dataset.attrs.get("max_dm", 100)
 
-        # We will extract the variables and coordinates from the dataset and use them to construct the solver_blocks2 instance.
+        # We will extract the variables and coordinates from the dataset and use them to construct the SolverBlocks instance.
         C0 = _build_sparse(dataset["C0"].values, dm_max) if "C0" in dataset else None
         D0 = _build_sparse(dataset["D0"].values, dm_max) if "D0" in dataset else None
         F = _build_sparse(dataset["F"].values, dm_max) if "F" in dataset else None
@@ -687,7 +687,7 @@ class solver_blocks2:
             dataset.attrs.get("dpsi_hat_dx", 1.0)
         )
 
-        return solver_blocks2(
+        return SolverBlocks(
             max_dm=dm_max,
             C0=C0,
             D0=D0,
@@ -794,7 +794,7 @@ def assemble_continuum(H: np.ndarray, K: np.ndarray, J: np.ndarray,
 
     return A_out, B_out
 
-def build_solver_blocks2(
+def build_solver_blocks(
     C11: np.ndarray, O: np.ndarray, C12_2: np.ndarray, C12_3: np.ndarray, C22: np.ndarray,
     D11: np.ndarray, D12: np.ndarray, kappa_s: np.ndarray,
     K: np.ndarray, M: np.ndarray, 
@@ -805,7 +805,7 @@ def build_solver_blocks2(
     H: np.ndarray, J: np.ndarray, L: np.ndarray,
     ntor: int, m_range: np.ndarray, max_dm: int=1000, max_dn: int=1000,
     dpsi_hat_dx: float = 1.0,
-) -> solver_blocks2:
+) -> SolverBlocks:
     r"""
     Intermediary function that will call the kernel to build the blocks,
     and then return the dataclass with the filled frozen blocks.
@@ -840,7 +840,7 @@ def build_solver_blocks2(
 
     # We create the m_range array, that will be used in the solver to 
     # identify the m values of each state.
-    out = solver_blocks2(m_range=m_range, max_dm=max_dm, ntor=ntor,
+    out = SolverBlocks(m_range=m_range, max_dm=max_dm, ntor=ntor,
                         C0=C0, C1=C1, D0=D0, D1=D1, F=F,
                         gtp_over_gpp=gtp_over_gpp_mat, gpz_over_gpp=gpz_over_gpp_mat,
                         hprof=hprof, Iprof=Iprof, gprof=gprof, qprof=qprof, 
@@ -853,7 +853,7 @@ def build_solver_blocks2(
     return out
 
 # -- Building the operator for a given frequency:
-def build_M_at(sb: solver_blocks2, omega: float, regularizer: float=1e-3) -> coo_array:
+def build_M_at(sb: SolverBlocks, omega: float, regularizer: float=1e-3) -> coo_array:
     r"""
     Builds the full operator M in the space of (p1, xi^\psi, xi^s, \nabla\cdot\xi) for a given
     frequency omega.

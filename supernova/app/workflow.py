@@ -206,7 +206,7 @@ def _build_physical_overlap_metric(
         species=str(configuration["species"]),
     )
     equilibrium, continuum_solver = _load_case(case_args)
-    multigrid = sn.superSolver5Multigrid(
+    multigrid = sn.MultigridSolver(
         equilibrium,
         continuum_solver,
         _base_spline(
@@ -546,7 +546,7 @@ def _run_solve(args: argparse.Namespace) -> None:
     frequency_band = tuple(np.sort(np.asarray(args.frequency_khz, dtype=float)))
     window_count = _window_count(frequency_band, args.window_width_khz)
     equilibrium, continuum_solver = _load_case(args)
-    multigrid = sn.superSolver5Multigrid(
+    multigrid = sn.MultigridSolver(
         equilibrium,
         continuum_solver,
         _base_spline(args.base_spans, args.order, args.quadrature_order),
@@ -641,9 +641,9 @@ def _run_solve(args: argparse.Namespace) -> None:
 def _run_reclassify(args: argparse.Namespace) -> None:
     """Reclassify saved roots without constructing eigenoperators or calling SLEPc."""
     from supernova.solve.evidence import (
-        EvidenceV2Config,
+        EvidenceConfig,
         catalog_status_from_diagnostics,
-        classify_tracks_evidence_v2,
+        classify_tracks,
     )
 
     artifact_dir = Path(args.artifact_dir)
@@ -735,12 +735,12 @@ def _run_reclassify(args: argparse.Namespace) -> None:
         else "modes_evidence_v2.nc"
     )
 
-    evidence = classify_tracks_evidence_v2(
+    evidence = classify_tracks(
         tracks,
         classification_continuum,
         weights,
         level_status,
-        EvidenceV2Config(),
+        EvidenceConfig(),
     )
     evidence.attrs.update(
         source_artifact_directory=str(artifact_dir.resolve()),
@@ -958,10 +958,10 @@ def _run_reacquire(args: argparse.Namespace) -> None:
         _window_diagnostics_dataset,
     )
     from supernova.solve.evidence import (
-        EvidenceV2Config,
+        EvidenceConfig,
         ReacquisitionOptions,
         catalog_status_from_diagnostics,
-        classify_tracks_evidence_v2,
+        classify_tracks,
     )
 
     artifact_dir = Path(args.artifact_dir)
@@ -1037,7 +1037,7 @@ def _run_reacquire(args: argparse.Namespace) -> None:
         species=str(configuration["species"]),
     )
     equilibrium, continuum_solver = _load_case(case_args)
-    multigrid = sn.superSolver5Multigrid(
+    multigrid = sn.MultigridSolver(
         equilibrium,
         continuum_solver,
         _base_spline(
@@ -1114,12 +1114,12 @@ def _run_reacquire(args: argparse.Namespace) -> None:
     ) as source:
         diagnostics = source.load()
     level_status, run_status = catalog_status_from_diagnostics(diagnostics)
-    evidence = classify_tracks_evidence_v2(
+    evidence = classify_tracks(
         tracks,
         continuum[["omega", "branch_assignment_ambiguous"]],
         multigrid.master_weights,
         level_status,
-        EvidenceV2Config(),
+        EvidenceConfig(),
     )
     evidence.attrs.update(
         source_artifact_directory=str(artifact_dir.resolve()),

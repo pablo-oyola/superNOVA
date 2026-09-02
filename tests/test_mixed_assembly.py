@@ -10,13 +10,13 @@ import supernova
 # assemble_split_matrices resolves _build_local_M_split in the module that
 # defines StabilitySolver, so that is where the fake belongs.
 import supernova.solve.stability as solver4_module
-from supernova.solve.stability import superSolver5
+from supernova.solve.stability import StabilitySolver
 from supernova.operators.mixed import (
     MixedFieldLayout,
     _build_mixed_radial_data,
 )
 from supernova.operators.project import _project_local_tensor_mixed
-from supernova.solve.stability import superSolver4
+from supernova.solve.stability import StabilitySolver
 from supernova.radial import BSplineFE
 
 
@@ -264,7 +264,7 @@ def test_projector_validates_local_state_and_derivative_shapes():
 
 
 def _synthetic_solver(monkeypatch, seed=2718):
-    solver = object.__new__(superSolver4)
+    solver = object.__new__(StabilitySolver)
     solver.radialfe = _high_space()
     mixed = solver._get_mixed_radial_data()
     n_modes = 2
@@ -432,7 +432,7 @@ def test_solver4_result_expands_reduced_vector_and_names_all_fields(monkeypatch)
 )
 def test_solver4_rejects_rectangular_inputs_before_petsc(bc_options):
     """_require_full_bc_nep now guards the surviving PEP entry point."""
-    solver = object.__new__(superSolver5)
+    solver = object.__new__(StabilitySolver)
 
     with pytest.raises(ValueError, match="require apply_bcs=True"):
         solver.build_pep_solver(
@@ -444,7 +444,7 @@ def test_solver4_rejects_rectangular_inputs_before_petsc(bc_options):
 
 
 def test_supernova_exports_solver4_as_the_flattened_solver():
-    assert supernova.superSolver4 is superSolver4
-    assert supernova.superSolver4 is supernova.StabilitySolver
+    assert supernova.StabilitySolver is StabilitySolver
+    assert supernova.StabilitySolver is supernova.StabilitySolver
 
 

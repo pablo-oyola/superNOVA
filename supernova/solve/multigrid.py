@@ -1,4 +1,4 @@
-r"""Nested compatible-B-spline multigrid classification for solver5.
+r"""Nested compatible-B-spline multigrid classification.
 
 The orchestrator in this module builds the point-local ideal-MHD operator once
 on a finest composite Gauss rule.  Three (or more) knot-insertion-nested radial
@@ -25,18 +25,18 @@ from supernova.operators.local import _build_local_M_split
 from supernova.operators.mixed import MixedRadialData, _build_mixed_radial_data
 from supernova.eigen.gevp import LinearGeneralizedEPSSolver
 from supernova.eigen.pep import QuadraticPEPSolver
-from supernova.eigen.dispatch import _build_solver5_eigensolver_from_matrices
-from supernova.solve.stability import superSolver5
+from supernova.eigen.dispatch import build_eigensolver
+from supernova.solve.stability import StabilitySolver
 from supernova.solve.evidence import (
     CLASSIFICATION_VERSION,
     AdaptiveDiscoveryOptions,
     EVIDENCE_LABELS,
-    EvidenceV2Config,
+    EvidenceConfig,
     MeshPerturbationOptions,
     PhysicalDisplacementMetric,
     ReacquisitionOptions,
     aggregate_catalog_status,
-    classify_tracks_evidence_v2,
+    classify_tracks,
     cluster_aware_mode_assignment,
     deterministic_shifted_bspline,
     enriched_residual,
@@ -1410,7 +1410,7 @@ def _solve_master_continuum(
             "ntor": int(sb.ntor),
             "m_pol": np.array2string(np.asarray(sb.m_range), separator=","),
             "max_dm": int(sb.max_dm),
-            "source": "solver_blocks2.A/B on the finest master operator grid",
+            "source": "SolverBlocks.A/B on the finest master operator grid",
             "branch_tracking": (
                 "adjacent-psi maximum-overlap assignment of generalized right "
                 "eigenvectors; relative-s is tie-break only"
@@ -1766,7 +1766,7 @@ def _classify_tracks(
     thresholds: ModeClassificationThresholds,
     *,
     classification_version: str = "legacy",
-    evidence_config: EvidenceV2Config | None = None,
+    evidence_config: EvidenceConfig | None = None,
     catalog_status: str | np.ndarray | None = None,
 ) -> xr.Dataset:
     """Dispatch the preserved legacy classifier or the evidence-v2 pipeline."""
@@ -1791,7 +1791,7 @@ def _classify_tracks(
             "certified_complete",
             "partial",
         )
-    return classify_tracks_evidence_v2(
+    return classify_tracks(
         tracks,
         continuum,
         weights,
@@ -1893,8 +1893,8 @@ def _is_converged_reason(reason) -> bool:
         return "converg" in text and not any(token in text for token in rejected)
 
 
-class superSolver5Multigrid:
-    """Solve and conservatively classify solver5 roots on nested radial spaces."""
+class MultigridSolver:
+    """Solve and conservatively classify roots on nested radial spaces."""
 
     def __init__(
         self,
@@ -1921,12 +1921,12 @@ class superSolver5Multigrid:
             )
             for radialfe in self.radial_levels
         )
-        self.solver = superSolver5(equ, cont, self.finest_radialfe)
+        self.solver = StabilitySolver(equ, cont, self.finest_radialfe)
 
     def build_shifted_mesh_variant(
         self,
         options: MeshPerturbationOptions | Mapping[str, object] | None = None,
-    ) -> "superSolver5Multigrid":
+    ) -> "MultigridSolver":
         """Return a one-level same-resolution solver for selective mesh checks.
 
         The axis, edge, degree, and number of B-splines match the production
@@ -1966,9 +1966,9 @@ class superSolver5Multigrid:
         prefix: str,
         verbose: bool,
     ):
-        """Use the same transparent exact-zero dispatch as ``superSolver5``."""
+        """Use the same transparent exact-zero dispatch as a single-grid solve."""
         T0, T1, Tminus1 = matrices
-        return _build_solver5_eigensolver_from_matrices(
+        return build_eigensolver(
             gamma_s=getattr(getattr(self, "solver", None), "gamma_s", 1.0),
             T0=T0,
             T1=T1,
@@ -2816,7 +2816,7 @@ class superSolver5Multigrid:
         search: MultigridSearchOptions | Mapping[str, object] | None = None,
         thresholds: ModeClassificationThresholds | Mapping[str, object] | None = None,
         classification_version: str = CLASSIFICATION_VERSION,
-        evidence_config: EvidenceV2Config | Mapping[str, object] | None = None,
+        evidence_config: EvidenceConfig | Mapping[str, object] | None = None,
         adaptive_discovery: AdaptiveDiscoveryOptions | Mapping[str, object] | None = None,
         reacquisition: ReacquisitionOptions | Mapping[str, object] | None = None,
         verbose: bool = False,
@@ -2826,7 +2826,7 @@ class superSolver5Multigrid:
         omega_range = _validate_omega_range(omega_range)
         search = _coerce_options(search, MultigridSearchOptions)
         thresholds = _coerce_options(thresholds, ModeClassificationThresholds)
-        evidence_config = _coerce_options(evidence_config, EvidenceV2Config)
+        evidence_config = _coerce_options(evidence_config, EvidenceConfig)
         discovery = (
             None
             if adaptive_discovery is None
@@ -3007,7 +3007,7 @@ class superSolver5Multigrid:
                 ),
                 "spectrum_slicing_applicable": False,
                 "spectrum_slicing_reason": (
-                    "solver5 currently declares a GENERAL quadratic PEP; "
+                    "the solver currently declares a GENERAL quadratic PEP; "
                     "Hermitian/hyperbolic structure and definiteness have not "
                     "been certified, so all-in-interval slicing is disabled"
                 ),
@@ -3023,10 +3023,10 @@ class superSolver5Multigrid:
 
 
 __all__ = [
-    "EvidenceV2Config",
+    "EvidenceConfig",
     "ModeClassificationThresholds",
     "MultigridPEPResult",
     "MultigridSearchOptions",
     "build_resolved_kinetic_energy_metric",
-    "superSolver5Multigrid",
+    "MultigridSolver",
 ]

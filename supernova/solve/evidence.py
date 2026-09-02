@@ -1,4 +1,4 @@
-"""Evidence-v2 diagnostics and classification for solver5 multiresolution roots.
+"""Evidence-v2 diagnostics and classification for multiresolution roots.
 
 This module is deliberately independent of PETSc/SLEPc.  It consumes returned
 eigenpairs and their diagnostics; catalog completeness is retained as metadata
@@ -65,7 +65,7 @@ class PhysicalDisplacementMetric:
 
     ``sqrt(g) * (|xi^psi|^2/g^{psi psi} + g^{psi psi}|xi^s|^2/B^2)``.
 
-    ``xi^b`` is not part of the solver5 state and is therefore deliberately
+    ``xi^b`` is not part of the four-field state and is therefore deliberately
     excluded.  The public metric name remains ``kinetic_energy`` so matching
     results use the evidence-v2 vocabulary, while ``parallel_component_included``
     and ``definition`` make the resolved-component limitation machine readable.
@@ -215,7 +215,7 @@ def tri_or(*values) -> str:
 
 
 @dataclass(frozen=True)
-class EvidenceV2Config:
+class EvidenceConfig:
     """Configurable gates for evidence calculation and final classification."""
 
     backward_error_max: float = 1.0e-8
@@ -1419,7 +1419,7 @@ def refinement_scaling_evidence(
     width: np.ndarray,
     ipr: np.ndarray,
     kr: np.ndarray,
-    config: EvidenceV2Config,
+    config: EvidenceConfig,
 ) -> dict[str, float | str | int]:
     """Fit localization exponents and require multiple consistent diagnostics."""
     alpha_width, width_fit = _log_slope(h, width)
@@ -1562,10 +1562,10 @@ def mesh_perturbation_evidence(
     local_h: float | None,
     reference_continuum_aligned: bool | None,
     shifted_continuum_aligned: bool | None,
-    config: EvidenceV2Config | None = None,
+    config: EvidenceConfig | None = None,
 ) -> dict[str, float | str]:
     """Summarize one explicitly selected non-nested mesh validation."""
-    config = EvidenceV2Config() if config is None else config
+    config = EvidenceConfig() if config is None else config
     if shifted_frequency is None or not np.isfinite(shifted_frequency):
         return {
             "shifted_mesh_frequency_change": np.nan,
@@ -1905,15 +1905,15 @@ def _reason_code_sets(flags: Mapping[str, str]) -> tuple[str, str, str]:
     return ";".join(satisfied), ";".join(failed), ";".join(unknown)
 
 
-def classify_tracks_evidence_v2(
+def classify_tracks(
     tracks: xr.Dataset,
     continuum: xr.Dataset,
     weights: np.ndarray,
     catalog_status: str | Sequence[str],
-    config: EvidenceV2Config | None = None,
+    config: EvidenceConfig | None = None,
 ) -> xr.Dataset:
     """Calculate independent evidence first, then assign evidence-v2 labels."""
-    config = EvidenceV2Config() if config is None else config
+    config = EvidenceConfig() if config is None else config
     ntracks = tracks.sizes.get("track", 0)
     nlevels = tracks.sizes.get("level", 0)
     if isinstance(catalog_status, str):
@@ -2440,7 +2440,7 @@ __all__ = [
     "ContinuumQuery",
     "AdaptiveDiscoveryOptions",
     "EVIDENCE_LABELS",
-    "EvidenceV2Config",
+    "EvidenceConfig",
     "MeshPerturbationOptions",
     "PhysicalDisplacementMetric",
     "REACQUISITION_STATUSES",
@@ -2449,7 +2449,7 @@ __all__ = [
     "aggregate_catalog_status",
     "bspline_prolongation_matrix",
     "catalog_status_from_diagnostics",
-    "classify_tracks_evidence_v2",
+    "classify_tracks",
     "cluster_aware_mode_assignment",
     "deterministic_shifted_bspline",
     "enriched_residual",

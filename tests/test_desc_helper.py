@@ -1,7 +1,15 @@
 import os
 from types import SimpleNamespace
 
-os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
+# NOTE: do not set NUMBA_DISABLE_JIT here. pytest imports every test module at
+# collection, so an environment variable set at import time applies to the whole
+# session: every @njit function imported afterwards becomes a plain Python
+# function. That silently stopped the suite exercising the compiled kernels, and
+# produced a Dispatcher calling a plain function inside _build_static_blocks
+# ("'function' object has no attribute 'get_call_template'"). It cost four
+# test_radial_profile failures and four errors in test_itpa_acceptance, all of
+# which looked like unrelated pre-existing breakage. If a module genuinely needs
+# the JIT off, run it in a subprocess.
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-supernova")
 
 import numpy as np
@@ -20,7 +28,7 @@ from supernova.interop.desc import (
     _reflect_boozer_surface_arrays,
     _rho_tor_from_q,
 )
-from supernova.solve.stability import superSolver2
+from supernova.solve.stability import StabilitySolver
 from supernova.radial.bspline import BSplineFE
 from supernova.radial.profile import Profile
 
@@ -375,7 +383,7 @@ def test_desc_solver_constructs_continuum_and_full_solver_profiles(desc_equilibr
         domain=(0.0, 1.0),
         quad_order=3,
     )
-    solver = superSolver2(desc_equilibrium, continuum, radial)
+    solver = StabilitySolver(desc_equilibrium, continuum, radial)
     for profile in [solver.C11, solver.C22, solver.D11, solver.D21_1, solver.F22]:
         assert np.all(np.isfinite(profile.data.values))
 
