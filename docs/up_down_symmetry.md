@@ -60,9 +60,9 @@ component parities.  The Boozer gauge shift in
 axisymmetric equilibrium (the \(\nabla\phi\) contribution is orthogonal to
 \(\nabla\psi\)).
 
-## Mixed solver4/solver5 operator
+## The mixed operator
 
-Solver4 and solver5 use a compatible mixed Petrov-Galerkin discretization.
+The solver uses a compatible mixed Petrov-Galerkin discretization.
 The trial ordering is
 
 ```text
@@ -75,7 +75,7 @@ on the trial side as \(T_kP\).  Although this makes the dimensions square, it
 does not identify the row basis with the reduced trial basis.
 
 Consequently the suite does **not** claim ordinary Hermiticity,
-\(T_k=T_k^\dagger\), or apply a one-space similarity transform to solver5.
+\(T_k=T_k^\dagger\), or apply a one-space similarity transform to the assembled pencil.
 Those would be mathematically unjustified for the current discretization.
 Phase and reflection relations must instead be written between the two spaces:
 
