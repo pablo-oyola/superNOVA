@@ -575,10 +575,10 @@ class ContinuumWindow(QtWidgets.QMainWindow):
             self._cut_artists.extend(marks)
             listed = ", ".join(f"{value:.3f}" for value in cuts[:12])
             more = "" if cuts.size <= 12 else f" (+{cuts.size - 12} more)"
+            where = "radius" if cuts.size == 1 else "radii"
             self.cuts_label.setText(
                 f"<b>{frequency:.2f} kHz cuts the continuum at "
-                f"{cuts.size} radius{'' if cuts.size == 1 else 'es'}:</b><br>"
-                f"psi_N = {listed}{more}"
+                f"{cuts.size} {where}:</b><br>psi_N = {listed}{more}"
             )
         else:
             self.cuts_label.setText(
