@@ -337,6 +337,25 @@ class Case:
                    metadata={"cocos_in": cocos_in, "species": species,
                              "gamma_s": gamma_s})
 
+    def with_continuum(self, *, gamma_s: float | None = None,
+                       species: str | None = None,
+                       dense: bool = True) -> "Case":
+        """Return the same equilibrium with a differently parameterised continuum.
+
+        gamma_s and the ion species change the continuum but not the geometry,
+        and the Boozer transform is the expensive step -- seconds for a real
+        eqdsk against about 0.1 s for the continuum. Rebuilding the whole Case
+        to sweep gamma_s would pay for the transform again for nothing.
+        """
+        gamma_s = self.gamma_s if gamma_s is None else float(gamma_s)
+        species = self.metadata.get("species", "D") if species is None else species
+        continuum = superContinuum(self.equilibrium, gamma_s=gamma_s,
+                                   species=species, dense=dense)
+        metadata = dict(self.metadata)
+        metadata.update({"gamma_s": gamma_s, "species": species})
+        return Case(self.equilibrium, continuum, source=self.source,
+                    metadata=metadata)
+
     @classmethod
     def from_refined(cls, directory, *, density: Profile, **kwargs) -> "Case":
         """Load a TokaMaker-refined equilibrium, COCOS read from its sidecar.

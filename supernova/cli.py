@@ -126,6 +126,12 @@ def _parser() -> argparse.ArgumentParser:
     reacquire.add_argument("--minimum-overlap", type=float, default=0.90)
     reacquire.add_argument("--verbose", action="store_true")
 
+    gui = subparsers.add_parser(
+        "gui", help="open the continuum window (needs PySide6)")
+    gui.add_argument(
+        "session", nargs="?", type=Path, default=None,
+        help="a session JSON saved from the window; omit to start empty")
+
     return parser
 
 
@@ -137,6 +143,12 @@ def main() -> None:
         _run_reclassify(args)
     elif args.command == "reacquire":
         _run_reacquire(args)
+    elif args.command == "gui":
+        # imported here so the CLI does not need PySide6 for the other commands
+        from supernova.gui.continuum import main as _gui_main
+
+        raise SystemExit(_gui_main(
+            ["supernova"] + ([str(args.session)] if args.session else [])))
     else:
         raise SystemExit(f"unknown command: {args.command}")
 
