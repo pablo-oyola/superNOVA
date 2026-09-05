@@ -336,3 +336,62 @@ def test_classification_is_rejected_for_the_pure_branches(tmp_path):
     state = _valid(tmp_path, which="slow_sound", classify=True)
     assert any("full sound-Alfven" in p for p in state.validate())
     assert _valid(tmp_path, which="full", classify=True).validate() == []
+
+
+# --------------------------------------------- classification feasibility
+
+def _feasibility_case(q_min=1.71, q_max=1.87, available=48):
+    """A Case-shaped stub carrying only what the feasibility check reads."""
+    import numpy as np
+    return SimpleNamespace(
+        equilibrium=SimpleNamespace(
+            qprof=SimpleNamespace(data=np.linspace(q_min, q_max, 32))),
+        continuum=SimpleNamespace(H=SimpleNamespace(m_pol=np.arange(available + 1))),
+    )
+
+
+@pytest.mark.parametrize("ntor", [1, 2, 3, 4, 6, 10])
+def test_a_band_away_from_m_zero_is_classifiable(ntor):
+    """The operators convolve, so only the band's span matters, not |m|.
+
+    This is the case the classifier used to reject: at ITPA's q the band sits
+    at m = 7..15 for n = 6, far from zero but only eight wide.
+    """
+    from supernova.gui._model import classification_feasibility
+
+    assert classification_feasibility(_feasibility_case(), ntor, 20) == (True, "")
+
+
+def test_an_equilibrium_with_too_few_harmonics_cannot_classify():
+    from supernova.gui._model import classification_feasibility
+
+    ok, why = classification_feasibility(_feasibility_case(available=4), 6, 20)
+    assert ok is False
+    assert "mode difference of 8" in why
+    assert "carries only 4" in why
+    assert "m_max at least 8" in why
+    assert "branches are still correct" in why
+
+
+def test_shear_not_n_is_what_outruns_a_finite_equilibrium():
+    """The span is n*(q_max - q_min) + 6, so wide shear is the real cost.
+
+    ITPA's q barely moves (1.71 to 1.87), so even n = 60 spans only 17
+    harmonics. A MAST-like profile reaching q = 15 spans more than 48 by n = 4.
+    """
+    from supernova.gui._model import classification_feasibility
+
+    narrow = _feasibility_case(1.71, 1.87, available=48)
+    assert classification_feasibility(narrow, 60, 200)[0] is True
+
+    wide = _feasibility_case(1.0, 15.0, available=48)
+    assert classification_feasibility(wide, 2, 200)[0] is True
+    assert classification_feasibility(wide, 4, 200)[0] is False
+
+
+def test_an_empty_band_is_reported_as_such():
+    from supernova.gui._model import classification_feasibility
+
+    ok, why = classification_feasibility(_feasibility_case(), 6, mmax=-20)
+    assert ok is False
+    assert "raise mmax" in why

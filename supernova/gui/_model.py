@@ -85,6 +85,44 @@ class ContinuumResult:
         return np.unique(np.round(np.asarray(crossings, dtype=float), 9))
 
 
+def _harmonic_band(q_min: float, q_max: float, ntor: int, mmax: int):
+    """The poloidal band solve() will use, exactly as it computes it."""
+    lowest = int(np.floor(ntor * q_min)) - 3
+    highest = min(int(mmax), int(np.ceil(ntor * q_max)) + 3)
+    return lowest, highest
+
+
+def classification_feasibility(case, ntor: int, mmax: int) -> tuple[bool, str]:
+    """Can the family classifier run for this harmonic band, and if not, why?
+
+    The operators are convolutions: an entry between state harmonics m and m'
+    reads the equilibrium harmonic at m - m'. So what matters is the span of
+    the band, never how far it sits from m = 0, and the only way to fall short
+    is an equilibrium whose profiles carry fewer harmonics than the span.
+    """
+    q = np.abs(np.asarray(case.equilibrium.qprof.data).squeeze().real)
+    q_min, q_max = float(np.nanmin(q)), float(np.nanmax(q))
+    available = int(np.abs(case.continuum.H.m_pol).max())
+
+    lowest, highest = _harmonic_band(q_min, q_max, abs(int(ntor)), int(mmax))
+    if highest < lowest:
+        return False, "The harmonic band is empty; raise mmax."
+
+    span = highest - lowest
+    if available >= span:
+        return True, ""
+
+    return False, (
+        f"Family labels are unavailable for n = {ntor}. The band spans "
+        f"m = {lowest} to {highest}, so the operators need equilibrium "
+        f"harmonics up to a mode difference of {span}, and this equilibrium "
+        f"carries only {available}.\n\nRebuild it with m_max at least "
+        f"{span}, or narrow the band with a smaller mmax. The branches are "
+        f"still correct -- only the Alfvenic / sound / mixed labels are "
+        f"missing."
+    )
+
+
 class ContinuumModel:
     """Holds the loaded Case and turns a state into a result."""
 
@@ -140,6 +178,21 @@ class ContinuumModel:
         started = time.perf_counter()
 
         if state.classify and state.which == "full":
+            feasible, why = classification_feasibility(
+                self.case, int(state.ntor), int(state.mmax))
+            if not feasible:
+                # Predicted from the harmonic band, so the expensive classified
+                # solve is skipped rather than run and thrown away.
+                classify_note = why
+                if progress:
+                    progress("Family labels unavailable here; solving without them...")
+                eigenvalues = self.case.continuum.solve(
+                    ntor=int(state.ntor), which="full", normalize_eigvals=True,
+                    psi_vals=psi_n, classify=False, mmax=int(state.mmax),
+                )
+                elapsed = time.perf_counter() - started
+                return self._pack(state, psi_n, eigenvalues, elapsed, reloaded,
+                                  rebuilt, None, classify_note)
             if progress:
                 progress("Solving and classifying families (slower)...")
             try:
@@ -152,16 +205,11 @@ class ContinuumModel:
                     classifier.to_xarray()["family_code"], dtype=np.int8
                 )
             except ValueError as error:
-                # The classifier convolves the equilibrium's poloidal harmonics
-                # into a metric matrix, so it needs at least max|m| + 1 of them.
-                # A wide harmonic band -- which is what a large n asks for --
-                # outruns what the profiles carry, and the shape mismatch that
-                # results says nothing useful on its own.
+                # A backstop: the check above should have caught this, so a
+                # failure here means the prediction is wrong about something.
                 classify_note = (
-                    "Family labels unavailable at this n: the equilibrium "
-                    "profiles do not carry enough poloidal harmonics for the "
-                    f"selected band. Lower n or mmax, or rebuild the "
-                    f"equilibrium with a larger m_max. ({error})"
+                    "Family labels failed unexpectedly -- the harmonic band "
+                    f"looked wide enough. Please report this. ({error})"
                 )
                 if progress:
                     progress("Classification unavailable; solving without it...")
@@ -182,6 +230,12 @@ class ContinuumModel:
             )
         elapsed = time.perf_counter() - started
 
+        return self._pack(state, psi_n, eigenvalues, elapsed, reloaded,
+                          rebuilt, family_code, classify_note)
+
+    def _pack(self, state, psi_n, eigenvalues, elapsed, reloaded, rebuilt,
+              family_code, classify_note) -> ContinuumResult:
+        """Turn solver output into the result the plot wants."""
         # eigenvalues are omega**2 normalised to the on-axis Alfven frequency
         khz = np.sqrt(eigenvalues.real).to("kHz").v / (2.0 * np.pi)
         q = np.asarray(self.case.equilibrium.qprof.data).squeeze().real
