@@ -375,8 +375,12 @@ class ContinuumClassifier:
         ntor: int,
     ) -> Optional[np.ndarray]:
         arr = np.asarray(value)
-        mmax = int(np.max(np.abs(m_range)))
-        mharm = mmax + 1
+        # The kernel below indexes the table by the mode difference
+        # m_i - m_j, so it only has to reach max(m) - min(m). Requiring
+        # max|m| + 1 rejected every band that sits away from m = 0 -- which is
+        # any sizeable n, since the band tracks n*q -- even though the
+        # convolution never asks for those harmonics.
+        mharm = int(np.max(m_range) - np.min(m_range)) + 1
 
         if arr.ndim == 1:
             if arr.size < mharm:

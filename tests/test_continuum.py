@@ -99,3 +99,34 @@ def test_solve_loads_harmonics_for_full_shifted_mode_difference(monkeypatch):
 
     np.testing.assert_array_equal(captured["build_mode_range"], np.arange(-3, 4))
     assert captured["build_harmonic_count"] == 7
+
+
+def test_family_classification_works_for_a_band_away_from_m_zero():
+    """Regression: the harmonic guard rejected any sizeable toroidal mode.
+
+    ``solve`` loads equilibrium harmonics 0 .. max(m) - min(m), because
+    ``_fill_block_kernel`` indexes the table by the mode difference m_i - m_j.
+    The classifier's precondition demanded max|m| + 1 instead. The state band
+    tracks n*q, so for anything but the smallest n it sits far from m = 0 and
+    max|m| greatly exceeds the span -- and classification failed with a bare
+    shape mismatch on the J metric blocks, for bands the convolution handles
+    perfectly well.
+
+    ITPA has q from about 1.71 to 1.87, so n = 6 puts the band at m = 7..15:
+    a span of 8 against max|m| of 15.
+    """
+    import numpy as np
+    import supernova as sn
+    from supernova.cases.itpa import ITPAEq
+
+    equilibrium = ITPAEq(ns=64, ntheta=64, m_max=48)
+    continuum = sn.superContinuum(equilibrium, gamma_s=5.0 / 3.0,
+                                  species="H", dense=True)
+    _values, _vectors, classifier = continuum.solve(
+        ntor=6, which="full", psi_vals=np.linspace(0.0, 1.0, 24), mmax=20,
+        normalize_eigvals=True, return_eigvecs=True, classify=True,
+    )
+    families = classifier.to_xarray()["family"]
+    labels = set(np.unique(np.asarray(families)).tolist())
+    assert labels <= {"Alfvenic", "sound", "mixed", "invalid"}
+    assert {"Alfvenic", "sound"} <= labels
