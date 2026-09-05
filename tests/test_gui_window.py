@@ -160,3 +160,51 @@ def test_a_session_survives_a_round_trip_through_the_window(tmp_path):
     assert "NTOR 7" in out
     assert "NPSI 512" in out
     assert "CURSOR 88.5" in out
+
+
+def test_redrawing_with_a_mode_line_up_does_not_crash():
+    """Regression: change the branch while the frequency cursor is shown.
+
+    _draw begins with Axes.clear(), which detaches every artist. The cursor
+    artists were still referenced afterwards, and matplotlib refuses to remove
+    an artist twice, so the redraw raised NotImplementedError inside the solve
+    callback and left the plot broken.
+    """
+    out = run_in_offscreen_qt('''
+        window.result = make_result()
+        window._draw(window.result)
+        window._set_cursor(118.0)
+        print("CUTS_BEFORE", len(window._cut_artists))
+
+        # what the user did: switch to another branch set, which re-solves
+        # and redraws from scratch while the mode line is up
+        window.which_combo.setCurrentIndex(
+            window.which_combo.findData("alfven"))
+        window.result = make_result(which="alfven")
+        window._draw(window.result)
+        print("SURVIVED_REDRAW", window.state.cursor_khz)
+
+        # and again, twice more, to be sure nothing accumulates
+        for _ in range(2):
+            window._draw(window.result)
+        print("CUTS_AFTER", len(window._cut_artists))
+        print("OK")
+    ''')
+    assert "CUTS_BEFORE 2" in out          # the line plus its crossing markers
+    assert "SURVIVED_REDRAW 118.0" in out
+    assert "CUTS_AFTER 2" in out           # redrawn, not accumulated
+    assert "OK" in out
+
+
+def test_the_placeholder_can_follow_a_drawn_cursor():
+    """Clearing back to the empty state must not trip over stale artists."""
+    out = run_in_offscreen_qt('''
+        window.result = make_result()
+        window._draw(window.result)
+        window._set_cursor(118.0)
+        window._draw_placeholder()
+        print("ARTISTS", len(window._cut_artists))
+        print("OK")
+    ''')
+    assert "ARTISTS 0" in out
+    assert "OK" in out

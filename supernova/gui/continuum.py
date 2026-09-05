@@ -84,6 +84,8 @@ class ContinuumWindow(QtWidgets.QMainWindow):
         self._worker: _SolveWorker | None = None
         self._restack = False          # a change arrived while solving
         self._explicit = False         # this solve came from the toolbar
+        self._cursor_line = None
+        self._cut_artists = []
         self._loading_ui = False       # suppress signals while writing widgets
 
         self._build_ui()
@@ -130,8 +132,6 @@ class ContinuumWindow(QtWidgets.QMainWindow):
         self.status = self.statusBar()
         self.status.showMessage("Choose an equilibrium and a density profile.")
 
-        self._cursor_line = None
-        self._cut_artists = []
         self._dragging = False
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -489,6 +489,7 @@ class ContinuumWindow(QtWidgets.QMainWindow):
 
     def _draw_placeholder(self) -> None:
         self.axes.clear()
+        self._forget_cursor_artists()
         self.axes.text(0.5, 0.5, "Choose an equilibrium and a density profile",
                        ha="center", va="center", transform=self.axes.transAxes,
                        color="0.45")
@@ -499,7 +500,7 @@ class ContinuumWindow(QtWidgets.QMainWindow):
 
     def _draw(self, result: ContinuumResult) -> None:
         self.axes.clear()
-        self._cursor_line = None
+        self._forget_cursor_artists()
         khz = result.frequency_khz
 
         if result.family_code is None:
@@ -550,12 +551,26 @@ class ContinuumWindow(QtWidgets.QMainWindow):
                              markerscale=4)
         self.canvas.draw_idle()
 
-    def _draw_cursor(self, result: ContinuumResult) -> None:
-        """The mode line and the places it meets the continuum."""
-        for artist in getattr(self, "_cut_artists", []):
-            artist.remove()
+    def _forget_cursor_artists(self) -> None:
+        """Drop the cursor artists, whether or not the axes still holds them.
+
+        ``Axes.clear()`` detaches every artist without telling anyone who kept
+        a reference, and matplotlib refuses to remove an artist twice. So a
+        redraw that begins with clear() would otherwise leave this list full of
+        artists that raise NotImplementedError on removal -- which is what
+        happened when the branch selector changed while a mode line was up.
+        """
+        for artist in self._cut_artists:
+            try:
+                artist.remove()
+            except (NotImplementedError, ValueError):
+                pass                      # already detached by Axes.clear()
         self._cut_artists = []
         self._cursor_line = None
+
+    def _draw_cursor(self, result: ContinuumResult) -> None:
+        """The mode line and the places it meets the continuum."""
+        self._forget_cursor_artists()
 
         frequency = self.state.cursor_khz
         if frequency <= 0.0:
