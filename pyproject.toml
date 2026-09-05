@@ -6,24 +6,46 @@ build-backend = "setuptools.build_meta"
 name = "pynova"
 description = "SuperNOVA: A Python package for computing the ideal MHD stability of tokamak equilibria."
 readme = "README.md"
-requires-python = ">=3.9"
+# Tested range.  numba, jax (DESC) and petsc4py all support it; 3.14 is
+# untested and numba is usually the last to follow a new interpreter.
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "numpy",
-    "scipy",
-    "unyt",
-    "numba",
-    "xarray",
-    "pycocos",
+    "numpy>=1.26,<2.5",      # upper bound is numba's; DESC 0.17.3 caps at 2.5.1
+    "scipy>=1.11",
+    "unyt>=3.0",
+    "numba>=0.59",
+    "xarray>=2024.1",
+    "matplotlib>=3.7",       # imported at module level by continuum, isotopes, radial
+    "tqdm>=4.60",
+    "findiff>=0.10",
+    # pyCOCOS is not on PyPI: the PyPI project called 'pycocos' is an unrelated
+    # package, so this must stay a direct git reference pinned to a commit.
+    "pycocos @ git+https://github.com/pablo-oyola/pyCOCOS.git@8e9aacb99dfd4382d366b786e4a684d722ea90e4",
 ]
 dynamic = ["version"]
 
 [project.optional-dependencies]
-plot = ["matplotlib"]
-desc = ["desc-opt"]
+# The eigenvalue backend.  These have no PyPI wheels and must be compiled
+# against a PETSc built with complex scalars, MUMPS and OpenMP; use
+# tools/install_stack.py, which pins the same versions and sets the configure
+# options.  Listed here so `pip check` and dependency tools see the contract.
+solver = [
+    "petsc4py>=3.25,<3.26",
+    "slepc4py>=3.25,<3.26",
+]
+mpi = ["mpi4py>=4.0,<5"]
+# DESC equilibria (supernova.interop.desc).  0.17.3 is the first release
+# whose caps (scipy<=1.18.0, numpy<=2.5.1) fit the rest of this stack.
+desc = ["desc-opt>=0.17.3,<0.18"]
 # Equilibrium refinement. OpenFUSIONToolkit is not on PyPI and must be
 # installed separately; supernova.refine raises a pointed ImportError if it
 # is missing. The solver itself never imports it.
-tokamaker = ["freeqdsk", "matplotlib"]
+tokamaker = ["freeqdsk<0.4.0"]
+dev = ["pytest>=8"]
+gui = ["pyside6-essentials", "matplotlib", "h5netcdf"]
+
+[project.scripts]
+supernova = "supernova.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

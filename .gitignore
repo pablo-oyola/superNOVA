@@ -19,3 +19,9 @@ tests/__pycache__/
 *.geqdsk
 *.npz
 *.png
+# build products and environments
+build/
+dist/
+.venv/
+*.whl
+install-stack.log
