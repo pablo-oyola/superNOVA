@@ -19,6 +19,7 @@ Steps 1-2 are cached on the instance; a frequency scan repeats only 6.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -52,7 +53,54 @@ from supernova.operators.project import _project_local_tensor_mixed
 from supernova.eigen.dispatch import build_eigensolver
 from supernova.eigen.gevp import LinearGeneralizedEPSSolver
 from supernova.eigen.pep import QuadraticPEPSolver
+from supernova.eigen.petsc import NEPResult
 from supernova.eigen.region import _as_scalar_complex, _ellipse_region_dict
+
+
+@dataclass(frozen=True)
+class WindowSolution:
+    """One window's eigenpairs as plain arrays.
+
+    Exactly what :meth:`StabilitySolver.pack_window` needs from an eigensolver,
+    and nothing that holds PETSc state, so a window can be solved in another
+    process -- one that never saw the solver -- and packed where it lives.
+    """
+
+    eigenvalues: np.ndarray
+    eigenvectors: np.ndarray
+    nconv: int
+    reason: int
+    iterations: int
+    backend: str
+    eps_type: str
+    residual_norms: np.ndarray | None = None
+    absolute_residual_norms: np.ndarray | None = None
+    backward_errors: np.ndarray | None = None
+    slepc_error_estimates: np.ndarray | None = None
+    slepc_backward_errors: np.ndarray | None = None
+
+    @classmethod
+    def from_solver(cls, eigensolver, result) -> "WindowSolution":
+        return cls(
+            eigenvalues=np.asarray(result.eigenvalues),
+            eigenvectors=np.asarray(result.eigenvectors),
+            nconv=int(result.nconv),
+            reason=int(result.reason),
+            iterations=int(result.iterations),
+            backend=getattr(eigensolver, "backend", "PEP"),
+            eps_type=getattr(eigensolver, "eps_type", "KRYLOVSCHUR"),
+            residual_norms=getattr(eigensolver, "last_residual_norms", None),
+            absolute_residual_norms=getattr(
+                eigensolver, "last_absolute_residual_norms", None
+            ),
+            backward_errors=getattr(eigensolver, "last_backward_errors", None),
+            slepc_error_estimates=getattr(
+                eigensolver, "last_slepc_error_estimates", None
+            ),
+            slepc_backward_errors=getattr(
+                eigensolver, "last_slepc_backward_errors", None
+            ),
+        )
 
 
 class StabilitySolver:
@@ -887,8 +935,13 @@ class StabilitySolver:
                 pass
             elif slepc_dofs == bc.get_sparse_free_dofs(tol=bc_tol):
                 slepc_eigenvector_space = "reduced"
-                eigenvectors = np.vstack(
-                    [bc.expand_sparse(vector, tol=bc_tol) for vector in solver_eigenvectors]
+                eigenvectors = (
+                    np.vstack(
+                        [bc.expand_sparse(vector, tol=bc_tol)
+                         for vector in solver_eigenvectors]
+                    )
+                    if len(solver_eigenvectors)
+                    else np.empty((0, layout.n_trial), dtype=np.complex128)
                 )
                 bc_expanded_eigenvectors = True
             else:
@@ -1159,37 +1212,9 @@ class StabilitySolver:
             compute_residuals=compute_residuals,
             m_values=m_values,
         )
-        backend = getattr(eigensolver, "backend", "PEP")
-        if backend == "EPS":
-            description = (
-                "SLEPc generalized EPS solution of the exact gamma_s=0 "
-                "pencil (-T0) x = s*T1 x."
-            )
-            extra_attrs = {
-                "problem_type": "GENERALIZED_LINEAR",
-                "eps_type": getattr(eigensolver, "eps_type", "KRYLOVSCHUR"),
-                "st_type": st_type,
-                "linear_coefficients": "[-T0, T1]",
-                "gamma_zero_reduction": True,
-                "requested_pep_type": pep_type,
-            }
-        else:
-            description = (
-                "SLEPc quadratic PEP solution of the sparse pencil "
-                "(Tminus1 + s*T0 + s**2*T1) x = 0."
-            )
-            extra_attrs = {
-                "problem_type": "POLYNOMIAL",
-                "pep_type": pep_type,
-                "st_type": st_type,
-                "polynomial_degree": 2,
-                "polynomial_coefficients": "[Tminus1, T0, T1]",
-                "gamma_zero_reduction": False,
-                "zero_root_caveat": (
-                    "Multiplication by s can introduce roots at s=0; "
-                    "the configured search region excludes zero."
-                ),
-            }
+        backend, description, extra_attrs = self._backend_attrs(
+            eigensolver, pep_type, st_type
+        )
         try:
             result = eigensolver.solve(max_eigenpairs=max_eigenpairs)
             output = self._split_result_dataset(
@@ -1225,4 +1250,205 @@ class StabilitySolver:
         else:
             eigensolver.destroy()
             return output
+
+    def solve_pep_windows(
+        self,
+        ntor: int,
+        windows,
+        mmax: int | None = None,
+        max_dm: int = 10,
+        regularizer: float = 0.0,
+        apply_bcs: bool = True,
+        bc_kind: str | None = "full",
+        bc_tol: float | None = None,
+        prefix: str = "nova_quadratic_pep",
+        pep_type: str = "TOAR",
+        st_type: str = "SINVERT",
+        which: str = "TARGET_MAGNITUDE",
+        nev: int = 6,
+        tol: float = 1e-8,
+        maxit: int = 100,
+        options: dict | None = None,
+        max_eigenpairs: int | None = None,
+        verbose: bool = False,
+        compute_residuals: bool = True,
+        m_values: np.ndarray | None = None,
+    ):
+        """Solve several frequency windows on this radial grid, assembling once.
+
+        ``windows`` yields ``(target_omega, region)`` pairs, each as
+        :meth:`solve_pep` takes them. The split matrices are projected and the
+        eigensolver is built for the first window only; every later window
+        retargets it, so only the shift-and-invert factorization is redone.
+        Re-projecting the same pencil per window is what dominates calling
+        :meth:`solve_pep` in a loop.
+
+        Yields one dataset per window, in order. A window in which nothing
+        converges yields a dataset with no eigenpairs instead of raising; its
+        ``nconv``, ``iterations`` and ``reason`` attributes say why. As a
+        generator it lets the caller report progress or stop between windows;
+        the eigensolver is destroyed when it is exhausted, closed or raises.
+        """
+        if m_values is not None and mmax is not None:
+            raise ValueError("Specify either mmax or m_values, not both.")
+        eigensolver = None
+        try:
+            for target_omega, region in windows:
+                target_omega = _as_scalar_complex(target_omega, "target_omega")
+                target_s = target_omega**2
+                region = _ellipse_region_dict(region, target_s)
+                if eigensolver is None:
+                    eigensolver = self.build_pep_solver(
+                        ntor=ntor,
+                        target_omega=target_omega,
+                        region=region,
+                        mmax=mmax,
+                        max_dm=max_dm,
+                        regularizer=regularizer,
+                        apply_bcs=apply_bcs,
+                        bc_kind=bc_kind,
+                        bc_tol=bc_tol,
+                        prefix=prefix,
+                        pep_type=pep_type,
+                        st_type=st_type,
+                        which=which,
+                        nev=nev,
+                        tol=tol,
+                        maxit=maxit,
+                        options=options,
+                        verbose=verbose,
+                        compute_residuals=compute_residuals,
+                        m_values=m_values,
+                    )
+                else:
+                    eigensolver.retarget(target_s, region)
+                result = eigensolver.solve(
+                    max_eigenpairs=max_eigenpairs, allow_empty=True
+                )
+                yield self.pack_window(
+                    WindowSolution.from_solver(eigensolver, result),
+                    ntor=ntor,
+                    target_omega=target_omega,
+                    region=region,
+                    mmax=mmax,
+                    max_dm=max_dm,
+                    regularizer=regularizer,
+                    apply_bcs=apply_bcs,
+                    bc_kind=bc_kind,
+                    bc_tol=bc_tol,
+                    pep_type=pep_type,
+                    st_type=st_type,
+                    which=which,
+                    verbose=verbose,
+                    compute_residuals=compute_residuals,
+                    m_values=m_values,
+                )
+        finally:
+            if eigensolver is not None:
+                eigensolver.destroy()
+
+    def pack_window(
+        self,
+        solution: WindowSolution,
+        *,
+        ntor: int,
+        target_omega: complex,
+        region: dict | None,
+        mmax: int | None = None,
+        max_dm: int = 10,
+        regularizer: float = 0.0,
+        apply_bcs: bool = True,
+        bc_kind: str | None = "full",
+        bc_tol: float | None = None,
+        pep_type: str = "TOAR",
+        st_type: str = "SINVERT",
+        which: str = "TARGET_MAGNITUDE",
+        verbose: bool = False,
+        compute_residuals: bool = True,
+        m_values: np.ndarray | None = None,
+    ) -> xr.Dataset:
+        """Pack one window's eigenpairs into the dataset :meth:`solve_pep` returns.
+
+        The arguments are the ones the window was solved with. Packing needs
+        this solver -- its harmonic band, mixed layout and boundary reduction
+        expand the eigenvectors -- but not the eigensolver, which may have run
+        in another process; see :class:`WindowSolution`.
+        """
+        target_omega = _as_scalar_complex(target_omega, "target_omega")
+        target_s = target_omega**2
+        region = _ellipse_region_dict(region, target_s)
+        nep = SimpleNamespace(
+            backend=solution.backend,
+            eps_type=solution.eps_type,
+            last_residual_norms=solution.residual_norms,
+            last_absolute_residual_norms=solution.absolute_residual_norms,
+            last_backward_errors=solution.backward_errors,
+            last_slepc_error_estimates=solution.slepc_error_estimates,
+            last_slepc_backward_errors=solution.slepc_backward_errors,
+        )
+        backend, description, extra_attrs = self._backend_attrs(nep, pep_type, st_type)
+        result = NEPResult(
+            solution.eigenvalues,
+            solution.eigenvectors,
+            solution.nconv,
+            solution.reason,
+            solution.iterations,
+        )
+        return self._split_result_dataset(
+            result=result,
+            nep=nep,
+            ntor=ntor,
+            target_omega=target_omega,
+            target_s=target_s,
+            region=region,
+            mmax=mmax,
+            max_dm=max_dm,
+            regularizer=regularizer,
+            apply_bcs=apply_bcs,
+            bc_kind=bc_kind,
+            bc_tol=bc_tol,
+            verbose=verbose,
+            compute_residuals=compute_residuals,
+            which=which,
+            nep_type=backend,
+            description=description,
+            m_values=m_values,
+            extra_attrs=extra_attrs,
+        )
+
+    @staticmethod
+    def _backend_attrs(eigensolver, pep_type: str, st_type: str):
+        """``(backend, description, extra_attrs)`` for a built eigensolver."""
+        backend = getattr(eigensolver, "backend", "PEP")
+        if backend == "EPS":
+            description = (
+                "SLEPc generalized EPS solution of the exact gamma_s=0 "
+                "pencil (-T0) x = s*T1 x."
+            )
+            extra_attrs = {
+                "problem_type": "GENERALIZED_LINEAR",
+                "eps_type": getattr(eigensolver, "eps_type", "KRYLOVSCHUR"),
+                "st_type": st_type,
+                "linear_coefficients": "[-T0, T1]",
+                "gamma_zero_reduction": True,
+                "requested_pep_type": pep_type,
+            }
+        else:
+            description = (
+                "SLEPc quadratic PEP solution of the sparse pencil "
+                "(Tminus1 + s*T0 + s**2*T1) x = 0."
+            )
+            extra_attrs = {
+                "problem_type": "POLYNOMIAL",
+                "pep_type": pep_type,
+                "st_type": st_type,
+                "polynomial_degree": 2,
+                "polynomial_coefficients": "[Tminus1, T0, T1]",
+                "gamma_zero_reduction": False,
+                "zero_root_caveat": (
+                    "Multiplication by s can introduce roots at s=0; "
+                    "the configured search region excludes zero."
+                ),
+            }
+        return backend, description, extra_attrs
 

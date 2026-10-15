@@ -30,6 +30,7 @@ from supernova.solve.evidence import (
     mesh_perturbation_evidence,
     migrate_legacy_mode_dataset,
 )
+from supernova.solve.modelocate import ModeLocateThresholds, locate_modes
 from supernova.solve.multigrid import (
     EvidenceConfig,
     ModeClassificationThresholds,

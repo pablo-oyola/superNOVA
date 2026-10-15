@@ -5,19 +5,29 @@ until you ask for a name from it: the imports are deferred so that
 ``python -m supernova.gui.continuum`` does not import the module twice (which
 warns), and so that merely touching ``supernova.gui`` costs nothing.
 
-Launch with ``python -m supernova gui``.
+Launch with ``python -m supernova gui``: one window with an equilibrium, a
+continuum and a solver tab (:mod:`supernova.gui.app`). Each tab also opens on
+its own with ``python -m supernova.gui.<equilibrium|continuum|solver>``.
 """
 
 from __future__ import annotations
 
-__all__ = ["ContinuumWindow", "main"]
+_HOMES = {
+    "SupernovaWindow": "app",
+    "main": "app",
+    "EquilibriumWindow": "equilibrium",
+    "ContinuumWindow": "continuum",
+    "SolverWindow": "solver",
+}
+
+__all__ = sorted(_HOMES)
 
 
 def __getattr__(name: str):
-    if name in __all__:
-        from supernova.gui import continuum
+    if name in _HOMES:
+        from importlib import import_module
 
-        return getattr(continuum, name)
+        return getattr(import_module(f"supernova.gui.{_HOMES[name]}"), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

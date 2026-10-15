@@ -20,6 +20,7 @@ and computing mode centroids and widths -- live here once.
     modes.frequency_khz
     modes.field("xi_psi", n=512)
     modes.centroid, modes.width
+    modes.gap_modes()          # GJK's modelocate filter; .locate() for all
 
 The low-level objects stay reachable: :class:`~supernova.solve.stability.
 StabilitySolver` and :class:`~supernova.solve.multigrid.MultigridSolver`
@@ -41,6 +42,13 @@ from supernova.continuum import superContinuum
 from supernova.equilibrium import superEquilibrium
 from supernova.radial.bspline import BSplineFE
 from supernova.radial.profile import Profile
+from supernova.solve.modelocate import (
+    GAP,
+    ModeLocateThresholds,
+    branch_crossings,
+    locate_modes,
+)
+from supernova.solve.multigrid import _solve_master_continuum
 from supernova.solve.stability import StabilitySolver
 
 
@@ -433,14 +441,9 @@ class ModeSet:
         if key in self._cache:
             return self._cache[key]
 
-        pair = self._scan.compatible_pair
-        basis = pair.high if _FIELD_SPACE[name] == "high" else pair.low
-        mesh = np.asarray(basis.get_mesh(), dtype=float)
+        mesh = self._mesh(name)
         points = np.linspace(mesh[0], mesh[-1], int(n))
-        phi = np.asarray(basis.eval_basis(points), dtype=float).T
-
-        coefficients = self.dataset[f"{name}_coefficient"]
-        values = np.einsum("ij,kjm->kim", phi, np.asarray(coefficients))
+        values = self._evaluate(name, points)
         array = xr.DataArray(
             values,
             coords={"x": points, "eigenpair": self.dataset["eigenpair"],
@@ -451,6 +454,50 @@ class ModeSet:
         array.x.attrs = {"units": "psi_N", "long_name": "normalized poloidal flux"}
         self._cache[key] = array
         return array
+
+    def _basis(self, name: str):
+        pair = self._scan.compatible_pair
+        return pair.high if _FIELD_SPACE[name] == "high" else pair.low
+
+    def _mesh(self, name: str) -> np.ndarray:
+        """The finite-element breakpoints of the space ``name`` lives in."""
+        return np.asarray(self._basis(name).get_mesh(), dtype=float)
+
+    def _evaluate(self, name: str, points: np.ndarray) -> np.ndarray:
+        """``name`` at ``points``, shaped ``(eigenpair, x, m_pol)``."""
+        phi = np.asarray(self._basis(name).eval_basis(points), dtype=float).T
+        coefficients = np.asarray(self.dataset[f"{name}_coefficient"])
+        return np.einsum("ij,kjm->kim", phi, coefficients)
+
+    def locate(self, points=None,
+               thresholds: ModeLocateThresholds | None = None) -> xr.Dataset:
+        """Gerrit Kramer's ``modelocate`` classification of every eigenpair.
+
+        Flags each mode as a gap mode or as peaking on a single grid point, in
+        the core, at the edge, or on a continuum crossing; see
+        :mod:`supernova.solve.modelocate`.  The envelope is sampled on the
+        finite-element breakpoints unless ``points`` is given: they play the
+        part of NOVA's radial grid, and the spike and continuum tests compare
+        neighbouring grid points.
+        """
+        points = (np.unique(self._mesh("xi_psi")) if points is None
+                  else np.asarray(points, dtype=float))
+        continuum = self._scan.continuum
+        psi, branches = continuum.coords["psi"].values, continuum["omega"].values
+        located = locate_modes(
+            points,
+            self._evaluate("xi_psi", points),
+            self.omega,
+            [branch_crossings(psi, branches, omega) for omega in self.omega],
+            rho=self._scan.rho_pol(points),
+            thresholds=thresholds,
+        )
+        return located.assign_coords(eigenpair=self.dataset["eigenpair"].values)
+
+    def gap_modes(self, **kwargs) -> "ModeSet":
+        """The eigenpairs :meth:`locate` classifies as gap modes."""
+        keep = np.flatnonzero(self.locate(**kwargs)["mode_class"].values == GAP)
+        return ModeSet(self.dataset.isel(eigenpair=keep), self._scan)
 
     def _envelope(self, n: int = 512):
         power = np.sum(np.abs(np.asarray(self.field("xi_psi", n=n)))**2, axis=2)
@@ -525,6 +572,7 @@ class Scan:
         self.max_dm = int(max_dm)
         self.regularizer = float(regularizer)
         self.solver = StabilitySolver(case.equilibrium, case.continuum, grid.build())
+        self._continuum: xr.Dataset | None = None
 
     def __repr__(self) -> str:
         return (f"<Scan n={self.ntor} spans={self.grid.spans} "
@@ -534,6 +582,33 @@ class Scan:
     def compatible_pair(self):
         """The high/low B-spline pair the solver assembled against."""
         return self.solver._get_mixed_radial_data().pair
+
+    @property
+    def continuum(self) -> xr.Dataset:
+        """The solver's own sound-Alfven continuum, on its quadrature points.
+
+        Built from the same blocks, harmonics and coupling cut-off as the
+        eigensolve, so its crossings are the ones the modes actually see.
+        """
+        if self._continuum is None:
+            blocks = self.solver.build_solver_blocks(
+                ntor=self.ntor, mmax=self.mmax, max_dm=self.max_dm)
+            self._continuum = _solve_master_continuum(
+                blocks, np.asarray(self.solver.unique_points, dtype=float))
+        return self._continuum
+
+    def rho_pol(self, x) -> np.ndarray:
+        """``sqrt(psi_N)`` at solver radii ``x``.
+
+        The solver's ``x`` spans the active Boozer interval, which is the
+        physical ``psi_N`` only when that interval is ``(0, 1)``.
+        """
+        x = np.asarray(x, dtype=float)
+        magspace = self.case.equilibrium.magspace
+        if "psi_physical_norm" in magspace.coords:
+            x = np.interp(x, magspace.coords["psi"].values,
+                          magspace.coords["psi_physical_norm"].values)
+        return np.sqrt(np.clip(x, 0.0, None))
 
     @property
     def backend(self) -> str:
