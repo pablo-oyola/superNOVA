@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import numpy as np
 import unyt
 import xarray as xr
-from scipy.sparse import csr_matrix
+from scipy.sparse import coo_array, csr_matrix
 
 from supernova.equilibrium import superEquilibrium, _active_poloidal_flux_span
 from supernova.continuum import superContinuum
@@ -55,6 +55,16 @@ from supernova.eigen.gevp import LinearGeneralizedEPSSolver
 from supernova.eigen.pep import QuadraticPEPSolver
 from supernova.eigen.petsc import NEPResult
 from supernova.eigen.region import _as_scalar_complex, _ellipse_region_dict
+
+
+_SOUND_MODELS = ("ideal", "nova")
+
+
+def _validate_sound_model(sound_model: str) -> str:
+    """Return a known sound model or fail loudly."""
+    if sound_model not in _SOUND_MODELS:
+        raise ValueError(f"sound_model must be one of {_SOUND_MODELS}, got {sound_model!r}.")
+    return sound_model
 
 
 @dataclass(frozen=True)
@@ -702,8 +712,15 @@ class StabilitySolver:
         bc_tol: float | None = None,
         verbose: bool = False,
         m_values: np.ndarray | None = None,
+        sound_model: str = "ideal",
     ) -> tuple[csr_matrix, csr_matrix, csr_matrix]:
         r"""Assemble the mixed ``T0``, ``T1`` and ``Tminus1`` matrices.
+
+        ``sound_model="nova"`` is legacy NOVA's default ``ksound=1``: the
+        parallel-acoustic operator ``mu_0*gamma_s*p_0*G^H M G`` -- exactly the
+        ``1/s`` tensor ``Mminus1`` -- is dropped, removing the slow-sound
+        continuum while ``gamma_s*p_0`` stays in the fast-wave compressibility
+        and the geodesic coupling.  ``Tminus1`` is then identically zero.
 
         ``m_values`` is an opt-in verification interface for an explicit,
         possibly noncontiguous signed harmonic list.  It bypasses the
@@ -722,6 +739,8 @@ class StabilitySolver:
             )
         mixed = self._get_mixed_radial_data()
         M0, M1, Mminus1 = _build_local_M_split(sb, regularizer=regularizer)
+        if _validate_sound_model(sound_model) == "nova":
+            Mminus1 = coo_array(Mminus1.shape, dtype=np.complex128)
         return self._assemble_split_matrices_from_local(
             sb,
             mixed,
@@ -1110,6 +1129,7 @@ class StabilitySolver:
         verbose: bool = False,
         compute_residuals: bool = True,
         m_values: np.ndarray | None = None,
+        sound_model: str = "ideal",
     ) -> QuadraticPEPSolver | LinearGeneralizedEPSSolver:
         """Assemble and build the appropriate eigensolver.
 
@@ -1136,9 +1156,12 @@ class StabilitySolver:
             bc_tol=bc_tol,
             verbose=verbose,
             m_values=m_values,
+            sound_model=sound_model,
         )
+        # Without the parallel-acoustic term Tminus1 vanishes and the pencil
+        # is linear in s, exactly as at gamma_s == 0.
         return build_eigensolver(
-            gamma_s=self.gamma_s,
+            gamma_s=0.0 if _validate_sound_model(sound_model) == "nova" else self.gamma_s,
             T0=T0,
             T1=T1,
             Tminus1=Tminus1,
@@ -1179,6 +1202,7 @@ class StabilitySolver:
         verbose: bool = False,
         compute_residuals: bool = True,
         m_values: np.ndarray | None = None,
+        sound_model: str = "ideal",
     ) -> xr.Dataset:
         """Solve with transparent exact-zero EPS dispatch.
 
@@ -1211,9 +1235,10 @@ class StabilitySolver:
             verbose=verbose,
             compute_residuals=compute_residuals,
             m_values=m_values,
+            sound_model=sound_model,
         )
         backend, description, extra_attrs = self._backend_attrs(
-            eigensolver, pep_type, st_type
+            eigensolver, pep_type, st_type, sound_model
         )
         try:
             result = eigensolver.solve(max_eigenpairs=max_eigenpairs)
@@ -1273,6 +1298,7 @@ class StabilitySolver:
         verbose: bool = False,
         compute_residuals: bool = True,
         m_values: np.ndarray | None = None,
+        sound_model: str = "ideal",
     ):
         """Solve several frequency windows on this radial grid, assembling once.
 
@@ -1319,6 +1345,7 @@ class StabilitySolver:
                         verbose=verbose,
                         compute_residuals=compute_residuals,
                         m_values=m_values,
+                        sound_model=sound_model,
                     )
                 else:
                     eigensolver.retarget(target_s, region)
@@ -1342,6 +1369,7 @@ class StabilitySolver:
                     verbose=verbose,
                     compute_residuals=compute_residuals,
                     m_values=m_values,
+                    sound_model=sound_model,
                 )
         finally:
             if eigensolver is not None:
@@ -1366,6 +1394,7 @@ class StabilitySolver:
         verbose: bool = False,
         compute_residuals: bool = True,
         m_values: np.ndarray | None = None,
+        sound_model: str = "ideal",
     ) -> xr.Dataset:
         """Pack one window's eigenpairs into the dataset :meth:`solve_pep` returns.
 
@@ -1386,7 +1415,7 @@ class StabilitySolver:
             last_slepc_error_estimates=solution.slepc_error_estimates,
             last_slepc_backward_errors=solution.slepc_backward_errors,
         )
-        backend, description, extra_attrs = self._backend_attrs(nep, pep_type, st_type)
+        backend, description, extra_attrs = self._backend_attrs(nep, pep_type, st_type, sound_model)
         result = NEPResult(
             solution.eigenvalues,
             solution.eigenvectors,
@@ -1417,7 +1446,7 @@ class StabilitySolver:
         )
 
     @staticmethod
-    def _backend_attrs(eigensolver, pep_type: str, st_type: str):
+    def _backend_attrs(eigensolver, pep_type: str, st_type: str, sound_model: str = "ideal"):
         """``(backend, description, extra_attrs)`` for a built eigensolver."""
         backend = getattr(eigensolver, "backend", "PEP")
         if backend == "EPS":
@@ -1450,5 +1479,6 @@ class StabilitySolver:
                     "the configured search region excludes zero."
                 ),
             }
+        extra_attrs["sound_model"] = _validate_sound_model(sound_model)
         return backend, description, extra_attrs
 
