@@ -1,10 +1,20 @@
 """The solver tab without Qt: its state, the solve, and what gets drawn.
 
 The tab runs the simple pass: one radial grid, the band cut into windows,
-one shift-and-invert solve per window. Every root it finds then goes through Gerrit Kramer's
-MODELOCATE filter (:meth:`supernova.api.ModeSet.locate`), which calls a mode a
-gap mode unless its envelope peaks on a single grid point, in the core, at the
-edge, or on a continuum crossing.
+one shift-and-invert solve per window. Every root it finds then goes through a
+mode filter. Gerrit Kramer's MODELOCATE (:meth:`supernova.api.ModeSet.locate`)
+calls a mode a gap mode unless its envelope peaks on a single grid point, in the
+core, at the edge, or on a continuum crossing. The global-path filter keeps
+MODELOCATE's spike, core and edge tests but replaces its continuum test: each
+remaining mode is re-solved on the complex radial paths ``alpha`` and
+``-alpha`` (:mod:`supernova.operators.contour`), with ``alpha`` kept below the
+singular points of the nearest continuum extrema (:func:`supernova.solve.gaps.
+path_alpha`); a discrete mode does not move, a continuum approximant does.
+
+Before a solve the continuum preview also locates the gaps (TAE, EAE, ...) and
+estimates how wide their modes are and what element size resolves them
+(:mod:`supernova.solve.gaps`). After one, selected modes can be refined: re-solved
+on meshes graded towards them, finer each time, to see the frequency converge.
 
 The sweep goes through :meth:`~supernova.solve.stability.StabilitySolver.
 solve_pep_windows` rather than :meth:`~supernova.api.Scan.run`: the pencil is
@@ -38,6 +48,20 @@ PEP_TYPES = ("TOAR", "STOAR", "QARNOLDI", "LINEAR", "JD")
 ST_TYPES = ("SINVERT", "CAYLEY", "SHIFT")
 WHICH = ("TARGET_MAGNITUDE", "TARGET_REAL", "TARGET_IMAGINARY")
 FIELDS = ("xi_psi", "p1", "xi_s", "div_xi")
+SOUND_MODELS = ("ideal", "nova")
+SOUND_TITLES = {"ideal": "ideal MHD", "nova": "NOVA ksound=1 (no parallel sound)"}
+MODE_FILTERS = ("modelocate", "path")
+FILTER_TITLES = {"modelocate": "MODELOCATE (Kramer)",
+                 "path": "global path alpha (+ MODELOCATE spikes)"}
+BACKWARD_ERROR_GATE = 1.0e-8      # the production acceptance of an eigenpair
+FOLLOW_UP_TOL = 1.0e-10           # SLEPc tol of the path and refinement solves
+# Path and refinement solves aim at a known root. Shift-and-invert exactly on
+# it factorizes a singular operator; aim this far off instead (relative, in omega).
+TARGET_OFFSET = 1.0e-4
+# Some shifts give a factorization too inaccurate for the gate; such a solve is
+# repeated with the target moved by these (relative, in omega) before giving up.
+RETRY_OFFSETS = (3.0e-3, -3.0e-3)
+INCONCLUSIVE = 32                 # mode_class code of a path test that could not decide
 PARTS = ("real", "imag", "abs")
 MAX_WINDOWS = 2000
 DUPLICATE_RELATIVE = 1.0e-8       # two windows returning one root
@@ -74,6 +98,7 @@ LOCATE_STYLE = {
     "core": {"title": "peaks in the core", "color": "#758295", "marker": "<"},
     "edge": {"title": "peaks at the edge", "color": "#758295", "marker": ">"},
     "ideal": {"title": "ideal (omega^2 < 0)", "color": "#7C3AED", "marker": "*"},
+    "inconclusive": {"title": "path test inconclusive", "color": "#B45309", "marker": "s"},
 }
 LOCATE_ORDER = tuple(LOCATE_STYLE)
 LOCATE_WHY = {
@@ -87,12 +112,27 @@ LOCATE_WHY = {
     "core": "the envelope peaks inside the core edge",
     "edge": "the envelope peaks outside the boundary edge",
     "ideal": "Re(omega^2) < 0: a purely growing ideal mode, not tested further",
+    "inconclusive": "the path test could not decide",
+}
+# the same verdicts, as the global-path filter reaches them
+PATH_WHY = {
+    "gap": "it stays put on the complex paths +alpha and -alpha: same frequency "
+           "within the tolerance and the same shape. A discrete eigenvalue does "
+           "not depend on the path",
+    "continuum": "it moves on the complex paths (or no eigenvalue of its shape is "
+                 "left there): a continuum approximant, which the path rotates "
+                 "into the complex plane",
+    "inconclusive": "either nothing converged on a path, or the singular points of "
+                    "a continuum extremum next to it are so close that the path "
+                    "cannot rise a quarter element there. Refine the mode first",
 }
 
 # fields that never change what is solved: what is drawn, and how the
 # windows are spread over worker processes
 _VIEW_FIELDS = frozenset({"field", "part", "continuum_preview", "gap_only",
-                          "workers", "threads_per_worker"})
+                          "workers", "threads_per_worker", "resolution_target",
+                          "refine_h_mm", "refine_levels", "refine_growth",
+                          "refine_path_check"})
 
 
 def locate_family(label: str) -> str:
@@ -147,6 +187,7 @@ class SolverState(JsonState):
     regularizer: float = 0.0
     gamma_s: float = 5.0 / 3.0
     species: str = "D"
+    sound_model: str = "ideal"        # "nova": legacy ksound=1, no parallel sound
 
     # the frequency search
     f_low_khz: float = 50.0
@@ -174,8 +215,21 @@ class SolverState(JsonState):
     mumps_icntl_14: int = 200         # % workspace headroom; 20 fails on SLEPc 3.25
     extra_options: str = ""
 
-    # MODELOCATE, as overrides of ModeLocateThresholds
+    # the mode filter, and MODELOCATE as overrides of ModeLocateThresholds
+    mode_filter: str = "modelocate"
     modelocate: dict = field(default_factory=dict)
+    path_alpha_max: float = 0.05      # the global path's largest amplitude
+    path_kappa: float = 0.4           # path height, as a fraction of d
+    path_tolerance: float = 3.0e-4    # relative frequency change still invariant
+    path_correlation: float = 0.9     # harmonic correlation still the same mode
+    path_nev: int = 4                 # roots per path solve, nearest the mode
+
+    # refinement of selected modes, and the resolution guide
+    resolution_target: str = "1e-5"   # "1e-4" or "1e-5": the guide's accuracy
+    refine_h_mm: float = 0.0          # finest element at a mode; 0 picks it
+    refine_levels: int = 3            # meshes, each halving the element
+    refine_growth: float = 0.15       # how fast the elements relax to the base
+    refine_path_check: bool = True    # path-test the modes on the finest mesh
 
     # parallel windows: worker processes, each with its own OpenMP threads
     workers: int = 2
@@ -240,6 +294,8 @@ class SolverState(JsonState):
             problems.append("gamma_s must be finite and non-negative.")
         if self.species not in SPECIES:
             problems.append(f"Species must be one of {', '.join(SPECIES)}.")
+        if self.sound_model not in SOUND_MODELS:
+            problems.append(f"The sound model must be one of {', '.join(SOUND_MODELS)}.")
 
         band_ok = (np.isfinite(self.f_low_khz) and np.isfinite(self.f_high_khz)
                    and 0.0 < self.f_low_khz < self.f_high_khz)
@@ -283,6 +339,26 @@ class SolverState(JsonState):
             problems.append("Reconstruct on at least 16 points.")
         if self.field not in FIELDS or self.part not in PARTS:
             problems.append("Unknown field or part to draw.")
+        if self.mode_filter not in MODE_FILTERS:
+            problems.append(f"The mode filter must be one of {', '.join(MODE_FILTERS)}.")
+        if not 0.0 < self.path_alpha_max <= 0.5:
+            problems.append("The path's largest alpha must lie in (0, 0.5].")
+        if not 0.0 < self.path_kappa < 1.0:
+            problems.append("The path height fraction kappa must lie in (0, 1).")
+        if not 0.0 < self.path_tolerance < 1.0:
+            problems.append("The path tolerance must lie in (0, 1).")
+        if not 0.0 < self.path_correlation <= 1.0:
+            problems.append("The path correlation must lie in (0, 1].")
+        if self.path_nev < 1:
+            problems.append("Ask the path solves for at least one root.")
+        if self.resolution_target not in ("1e-4", "1e-5"):
+            problems.append("The resolution target must be 1e-4 or 1e-5.")
+        if not np.isfinite(self.refine_h_mm) or self.refine_h_mm < 0.0:
+            problems.append("The refined element size must be non-negative (0 picks it).")
+        if not 1 <= self.refine_levels <= 8:
+            problems.append("Refine on 1 to 8 meshes.")
+        if not 0.0 < self.refine_growth < 1.0:
+            problems.append("The refinement growth must lie in (0, 1).")
 
         if not problems:
             try:
@@ -304,7 +380,13 @@ class SolverState(JsonState):
         return tuple(items)
 
     def preview_key(self) -> tuple:
-        return (self.ntor, self.mmax, self.max_dm, self.gamma_s, self.species)
+        return (self.ntor, self.mmax, self.max_dm, self.gamma_s, self.species,
+                self.sound_model)
+
+    @property
+    def drops_sound(self) -> bool:
+        """No slow-sound continuum: gamma_s = 0, or the NOVA sound model."""
+        return float(self.gamma_s) == 0.0 or self.sound_model == "nova"
 
 
 # ----------------------------------------------------------------------------
@@ -345,6 +427,20 @@ class ContinuumPreview:
     which: str
     key: tuple
     seconds: float
+    gaps: tuple = ()                  # GapEstimate per Alfvenic gap found
+    solver_x: np.ndarray | None = None  # the solver's x at each of ``x``
+
+    def x_of_psi_n(self, psi_n):
+        """The solver coordinate at ``psi_n``, for element sizes."""
+        grid = self.x if self.solver_x is None else self.solver_x
+        return np.interp(np.asarray(psi_n, dtype=float), self.x, grid)
+
+    def element_mm(self, gap, state) -> float:
+        """The current grid's element size at ``gap``, in mm of rho_tor * a."""
+        # as radial_domain places the walls
+        low = 0.0 if state.rho_min <= 0.0 else float(self.x_of_psi_n(state.rho_min ** 2))
+        high = 1.0 if state.rho_max >= 1.0 else float(self.x_of_psi_n(state.rho_max ** 2))
+        return max(high - low, 0.0) / max(int(state.spans), 1) * gap.dr_dx_mm
 
 
 @dataclass(frozen=True)
@@ -398,6 +494,18 @@ class SolverResult:
     handle: int | None = None         # the compute process's name for it
 
     @property
+    def filter_method(self) -> str:
+        if self.located is None:
+            return self.state.mode_filter
+        return "path" if self.located.attrs.get("method") == "global_path" else "modelocate"
+
+    def why(self, label: str) -> str:
+        """Why the filter gave ``label``, as the filter that ran would say it."""
+        texts = PATH_WHY if self.filter_method == "path" else {}
+        return " and ".join(texts.get(flag, LOCATE_WHY.get(flag, flag))
+                            for flag in str(label).split("|"))
+
+    @property
     def mode_count(self) -> int:
         return int(self.frequency_khz.size)
 
@@ -430,8 +538,16 @@ class SolverResult:
                 "dominant_m": int(self.dominant_m[index]),
                 "backward_error": float(self.backward_error[index]),
                 "window": int(self.window_of[index]),
+                "path_alpha": self._path_value("path_alpha", index),
+                "path_drift": self._path_value("path_drift", index),
+                "path_correlation": self._path_value("path_correlation", index),
             })
         return rows
+
+    def _path_value(self, name: str, index: int) -> float:
+        if self.located is None or name not in self.located:
+            return np.nan
+        return float(self.located[name].values[index])
 
     def field(self, mode: int, name: str, part: str) -> np.ndarray:
         values = self.fields[name][int(mode)]
@@ -441,6 +557,24 @@ class SolverResult:
         """MODELOCATE's envelope for one mode, on the grid it was judged on."""
         return (self.envelope_x,
                 np.asarray(self.located["envelope"].values[int(mode)], dtype=float))
+
+
+@dataclass(frozen=True)
+class RefineResult:
+    """Selected modes re-solved on meshes graded towards them, coarse to fine."""
+
+    state: SolverState                # as refined
+    title: str
+    modes: tuple                      # the original mode indices
+    rows: tuple                       # one dict per (mode, level); see SolverModel.refine
+    x: np.ndarray                     # psi_N of the envelopes
+    envelopes: dict                   # mode -> (nlevel, nx) |xi^psi| envelopes
+    path: dict                        # mode -> path verdict on the finest mesh, or {}
+    seconds: float
+    handle: int | None = None
+
+    def rows_for(self, mode: int) -> list[dict]:
+        return [row for row in self.rows if row["mode"] == int(mode)]
 
 
 class SolverModel:
@@ -464,25 +598,89 @@ class SolverModel:
             self._equilibrium = equilibrium
         return self._continuum
 
-    def preview(self, equilibrium, state: SolverState, *, points: int = 256,
-                progress=None) -> ContinuumPreview:
-        """The continuum for this n, to choose a band against before solving."""
-        started = time.perf_counter()
+    def continuum_khz(self, equilibrium, state: SolverState, x, progress=None):
+        """``(which, (nx, nbranch) kHz)`` of the continuum the solve sees.
+
+        The full sound-Alfven continuum; at gamma_s = 0 the Alfven one; with the
+        NOVA sound model the solver's own continuum with the parallel-acoustic
+        rows dropped, exactly as the pencil drops them.
+        """
         continuum = self.continuum_for(equilibrium, state, progress)
-        which = "alfven" if float(state.gamma_s) == 0.0 else "full"
-        x = np.linspace(0.0, 1.0, int(points))
-        if progress:
-            progress(f"Solving the {which} continuum for n = {state.ntor}...")
+        if state.sound_model == "nova" and float(state.gamma_s) != 0.0:
+            omega = _nova_continuum(equilibrium, continuum, state, np.asarray(x, dtype=float))
+            return "nova", _khz(equilibrium, omega)
+        which = "alfven" if state.drops_sound else "full"
         eigenvalues = continuum.solve(ntor=int(state.ntor), mmax=int(state.mmax),
-                                      psi_vals=x, which=which, normalize_eigvals=True,
-                                      max_dm=int(state.max_dm))
+                                      psi_vals=np.asarray(x, dtype=float), which=which,
+                                      normalize_eigvals=True, max_dm=int(state.max_dm))
         with np.errstate(invalid="ignore"):
             khz = np.sqrt(eigenvalues.real).to("kHz").v / (2.0 * np.pi)
+        return which, np.asarray(khz, dtype=float)
+
+    def preview(self, equilibrium, state: SolverState, *, points: int = 256,
+                progress=None) -> ContinuumPreview:
+        """The continuum for this n, and the gaps in it, to choose a band and a
+        grid against before solving."""
+        started = time.perf_counter()
+        x = np.linspace(0.0, 1.0, int(points))
+        if progress:
+            progress(f"Solving the continuum for n = {state.ntor}...")
+        which, khz = self.continuum_khz(equilibrium, state, x, progress)
+        if progress:
+            progress("Locating the gaps and estimating their mode widths...")
+        try:
+            gaps = tuple(self.gap_estimates(equilibrium, state, x, khz))
+        except Exception:              # the guide is a help, never a blocker
+            gaps = ()
         grid, psi_n = _flux_maps(equilibrium)
         return ContinuumPreview(x=np.interp(x, grid, psi_n),
-                                frequency_khz=np.asarray(khz, dtype=float),
-                                which=which, key=state.preview_key(),
-                                seconds=time.perf_counter() - started)
+                                frequency_khz=khz, which=which, key=state.preview_key(),
+                                seconds=time.perf_counter() - started, gaps=gaps,
+                                solver_x=x)
+
+    def gap_estimates(self, equilibrium, state: SolverState, x, khz) -> list:
+        """Every Alfvenic gap in this continuum, typed and sized.
+
+        A gap is typed by the two harmonics that dominate its lower edge's
+        continuum eigenvector (TAE: m and m+1, EAE: m and m+2, ...); an edge
+        made of one harmonic is a lone extremum, not a gap, and a sound-like
+        edge is not an Alfven gap -- neither is listed.
+        """
+        from supernova.solve.gaps import (
+            RadialGeometry, continuum_tips, estimate_gap, find_gaps, gap_name)
+
+        geometry = RadialGeometry.from_equilibrium(equilibrium)
+        continuum = self.continuum_for(equilibrium, state)
+        estimates = []
+        for gap in find_gaps(continuum_tips(x, khz)):
+            w, _, classifier = continuum.solve(
+                ntor=int(state.ntor), mmax=int(state.mmax), psi_vals=np.array([gap.x]),
+                which="full", classify=True, max_dm=int(state.max_dm))
+            with np.errstate(invalid="ignore"):
+                f = np.asarray(np.sqrt(w.real).to("kHz").v / (2.0 * np.pi), dtype=float)[0]
+            data = classifier.data
+            edges = [int(np.nanargmin(np.abs(f - value))) for value in (gap.f_low, gap.f_high)]
+            families = [str(data["family"].values[0][k]) for k in edges]
+            if "Alfvenic" not in families:
+                continue
+            k = edges[0] if families[0] == "Alfvenic" else edges[1]
+            top_m = np.asarray(data["top_m"].values[0][k][:2], dtype=int)
+            weight = np.asarray(data["top_weight"].values[0][k][:2], dtype=float)
+            if not weight[1] >= 0.2 * weight[0]:
+                continue                       # one harmonic: an extremum, not a gap
+            delta_m = abs(int(top_m[1]) - int(top_m[0]))
+            estimates.append(estimate_gap(gap, geometry, int(state.ntor),
+                                          kind=gap_name(delta_m), m=tuple(sorted(top_m)),
+                                          family="Alfvenic"))
+        return estimates
+
+    def continuum_tips(self, equilibrium, state: SolverState, points: int = 512):
+        """The smooth extrema of the continuum the solve sees, in solver x."""
+        from supernova.solve.gaps import continuum_tips
+
+        x = np.linspace(0.0, 1.0, int(points))
+        _, khz = self.continuum_khz(equilibrium, state, x)
+        return continuum_tips(x, khz)
 
     def solve(self, equilibrium, state: SolverState, *, title: str = "",
               progress=None, log=None, cancel=None, pool=None) -> SolverResult:
@@ -527,13 +725,323 @@ class SolverModel:
                 rows = self._solve_windows_pooled(scan, band, state, found, progress,
                                                   cancel, pool, log)
 
+        crossing_continuum = self._crossing_continuum(equilibrium, scan, state)
         modes = _merge_windows(found, scan)
         if modes is None:
-            return self._pack(state, title, rows, None, None, scan, started, equilibrium)
+            return self._pack(state, title, rows, None, None, scan, started, equilibrium,
+                              crossing_continuum)
+        thresholds = state.locate_thresholds()
+        if state.mode_filter == "path":
+            if progress:
+                progress(f"Reconstructing {len(modes)} modes; MODELOCATE's spike, core "
+                         "and edge tests...")
+            # no crossings: the continuum test is the path test's job
+            located = modes.locate(thresholds=thresholds, continuum=_NO_CONTINUUM)
+            located = self._path_filter(equilibrium, scan, modes, located, state, band,
+                                        progress, cancel, pool)
+        else:
+            if progress:
+                progress(f"Reconstructing {len(modes)} modes and running MODELOCATE...")
+            located = modes.locate(thresholds=thresholds, continuum=crossing_continuum)
+        return self._pack(state, title, rows, modes, located, scan, started, equilibrium,
+                          crossing_continuum)
+
+    def _crossing_continuum(self, equilibrium, scan, state):
+        """The continuum MODELOCATE's crossings come from; None for the scan's own.
+
+        The scan's continuum is the full sound-Alfven one. With the NOVA sound
+        model the slow sound is gone from the pencil, so its crossings must go
+        too: the Alfven continuum on the same radii is used instead.
+        """
+        if state.sound_model != "nova" or float(state.gamma_s) == 0.0:
+            return None
+        from supernova.solve.multigrid import _solve_master_continuum
+
+        blocks = scan.solver.build_solver_blocks(ntor=int(state.ntor), mmax=int(state.mmax),
+                                                 max_dm=int(state.max_dm))
+        dataset = _solve_master_continuum(
+            _without_parallel_sound(blocks),
+            np.asarray(scan.solver.unique_points, dtype=float))
+        return (np.asarray(dataset.coords["psi"].values, dtype=float),
+                np.asarray(dataset["omega"].values, dtype=complex))
+
+    # ------------------------------------------------------- the path test
+
+    def _path_filter(self, equilibrium, scan, modes, located, state, band, progress,
+                     cancel, pool):
+        """MODELOCATE's gap modes (spike, core and edge already set aside) put
+        to the global-path test; the verdicts replace their labels."""
+        labels = np.asarray(located["mode_label"].values).astype(object)
+        codes = np.asarray(located["mode_class"].values).copy()
+        count = labels.size
+        alpha = np.full(count, np.nan)
+        drift = np.full(count, np.nan)
+        correlation = np.full(count, np.nan)
+        candidates = [index for index in range(count) if labels[index] == "gap"]
+        if candidates:
+            reference = modes.field("xi_psi", n=int(state.reconstruction_points))
+            targets = [(index, complex(modes.omega[index]),
+                        float(located["peak_x"].values[index]),
+                        np.asarray(reference.values[index]))
+                       for index in candidates]
+            verdicts = self.path_test(equilibrium, scan, state, band, targets,
+                                      np.asarray(reference.coords["x"].values),
+                                      progress=progress, cancel=cancel, pool=pool)
+            for index, verdict in verdicts.items():
+                labels[index] = verdict["label"]
+                codes[index] = {"gap": 0, "continuum": 8}.get(verdict["label"], INCONCLUSIVE)
+                alpha[index] = verdict["alpha"]
+                drift[index] = verdict["drift"]
+                correlation[index] = verdict["correlation"]
+        located = located.copy()
+        located["mode_label"] = ("eigenpair", labels.astype(str))
+        located["mode_class"] = ("eigenpair", codes.astype(np.int32))
+        located["mode_class"].attrs["legend"] = (
+            "0 gap (path-invariant), 1 spike, 2 core, 4 edge, 8 continuum (moves "
+            f"on the path), 16 ideal, {INCONCLUSIVE} path test inconclusive")
+        located["path_alpha"] = ("eigenpair", alpha)
+        located["path_drift"] = ("eigenpair", drift)
+        located["path_correlation"] = ("eigenpair", correlation)
+        located.attrs.update({
+            "method": "global_path", "path_alpha_max": float(state.path_alpha_max),
+            "path_kappa": float(state.path_kappa),
+            "path_tolerance": float(state.path_tolerance),
+            "path_correlation": float(state.path_correlation)})
+        return located
+
+    def path_test(self, equilibrium, scan, state, band, targets, x, *, progress=None,
+                  cancel=None, pool=None, tips=None) -> dict:
+        """Re-solve each target on the paths ``+alpha`` and ``-alpha``.
+
+        ``targets`` are ``(key, omega, peak x, xi^psi on x)``. Each gets the
+        largest alpha whose path stays below ``path_kappa`` of the singular-
+        pair distance of every continuum extremum its frequency faces
+        (:func:`supernova.solve.gaps.path_alpha`), rounded down to a shared
+        level so modes can share pencils. A path that cannot rise a quarter of
+        the local element at the mode's peak is no test: inconclusive.
+        Returns ``{key: {"label", "alpha", "drift", "correlation"}}``.
+        """
+        from supernova.eigen.region import _ellipse_region_dict
+        from supernova.operators.contour import GlobalPath
+        from supernova.solve.contour import ContourProblem
+        from supernova.solve.gaps import path_alpha
+
+        if not targets:
+            return {}
         if progress:
-            progress(f"Reconstructing {len(modes)} modes and running MODELOCATE...")
-        located = modes.locate(thresholds=state.locate_thresholds())
-        return self._pack(state, title, rows, modes, located, scan, started, equilibrium)
+            progress(f"Path test: the complex-path operator for {len(targets)} mode(s)...")
+        problem = ContourProblem(scan.solver, int(state.ntor), max_dm=int(state.max_dm),
+                                 mmax=int(state.mmax), regularizer=float(state.regularizer),
+                                 sound="nova" if state.sound_model == "nova" else "ideal")
+        if tips is None:
+            tips = self.continuum_tips(equilibrium, state)
+        low, high = problem.domain
+        mesh = np.asarray(scan.grid.knots, dtype=float)
+        verdicts, levels, regions = {}, {}, {}
+        for key, omega, peak, _ in targets:
+            frequency = float(scan.band_for(omega.real, units="kHz"))
+            wanted, _ = path_alpha(frequency, tips, problem.domain,
+                                   kappa=float(state.path_kappa),
+                                   alpha_max=float(state.path_alpha_max))
+            level = _alpha_level(wanted, float(state.path_alpha_max))
+            span = np.clip(np.searchsorted(mesh, peak) - 1, 0, mesh.size - 2)
+            height = level * (peak - low) * (high - peak)
+            if height < 0.25 * (mesh[span + 1] - mesh[span]):
+                verdicts[key] = {"label": "inconclusive", "alpha": level,
+                                 "drift": np.nan, "correlation": np.nan}
+                continue
+            half = max(float(state.window_width_khz), 0.02 * frequency)
+            _, region = band.region(max(frequency - half, 1.0e-6), frequency + half)
+            target_s = complex(omega.real * (1.0 + TARGET_OFFSET)) ** 2
+            regions[key] = (target_s, dict(_ellipse_region_dict(region, target_s), vscale=1.0))
+            levels.setdefault(level, []).append(key)
+
+        found = {key: [] for members in levels.values() for key in members}
+        reference = {key: (omega, fields) for key, omega, _, fields in targets}
+        # converge well inside the acceptance gate: at tol = gate a true root
+        # can land just outside it
+        settings = dict(prefix="nova_path_pep", pep_type=state.pep_type,
+                        st_type=state.st_type, which=state.which, nev=int(state.path_nev),
+                        tol=min(float(state.tol), FOLLOW_UP_TOL), maxit=int(state.maxit),
+                        options=state.petsc_options().as_dict(), verbose=False,
+                        compute_residuals=True)
+        for level, members in sorted(levels.items(), reverse=True):
+            for sign in (1.0, -1.0):
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("Stopped during the path test.")
+                if progress:
+                    progress(f"Path test: alpha = {sign * level:+.4g} for {len(members)} "
+                             "mode(s)...")
+                pencil = problem.pencil(GlobalPath(sign * level, domain=problem.domain))
+                solutions = _solve_gated(
+                    {"gamma_s": pencil.gamma_s, "T0": pencil.T0, "T1": pencil.T1,
+                     "Tminus1": pencil.Tminus1, "settings": settings},
+                    [(key, *regions[key]) for key in members], pool, cancel)
+                for key in members:
+                    found[key].append(_best_match(solutions.get(key), pencil, x,
+                                                  reference[key][1], reference[key][0]))
+        for level, members in levels.items():
+            for key in members:
+                matches = found[key]
+                if any(match is None for match in matches):
+                    label, worst_drift, worst_correlation = "inconclusive", np.nan, np.nan
+                else:
+                    worst_drift = max(match[0] for match in matches)
+                    worst_correlation = min(match[1] for match in matches)
+                    invariant = (worst_drift <= float(state.path_tolerance)
+                                 and worst_correlation >= float(state.path_correlation))
+                    label = "gap" if invariant else "continuum"
+                verdicts[key] = {"label": label, "alpha": level, "drift": worst_drift,
+                                 "correlation": worst_correlation}
+        return verdicts
+
+    # ------------------------------------------------------- refinement
+
+    def refine(self, equilibrium, state: SolverState, request: dict, *, title: str = "",
+               progress=None, cancel=None, pool=None) -> RefineResult:
+        """Re-solve selected modes on meshes graded towards them, coarse to fine.
+
+        ``request`` holds, per mode, ``modes`` (indices), ``omega`` (normalized),
+        ``frequency_khz``, ``peak_psi`` (where its envelope peaks, psi_N) and
+        ``fields`` -- ``xi^psi`` on the solve's reconstruction grid -- to
+        follow it by shape from mesh to mesh.
+
+        The finest element at a mode is ``refine_h_mm``, or when that is 0 the
+        smaller of the resolution guide's element for its width and edge
+        distance and a quarter of the current element. Each coarser mesh
+        doubles it, never above the current element. With
+        ``refine_path_check`` the modes are path-tested on the finest mesh.
+        Each row: ``mode, level, elements, h_mm, frequency_khz, growth_ratio,
+        correlation, backward_error, fwhm_mm`` (``frequency_khz`` nan when
+        nothing converged).
+        """
+        from supernova.api import Band, Case, ModeSet, RadialGrid, Scan
+        from supernova.eigen.region import _ellipse_region_dict
+        from supernova.radial.grading import graded_breakpoints
+        from supernova.solve.gaps import RadialGeometry, harmonic_correlation, local_scales_mm
+
+        state = state.copy()
+        started = time.perf_counter()
+        modes = [int(mode) for mode in request["modes"]]
+        omega = np.asarray(request["omega"], dtype=complex)
+        frequency = np.asarray(request["frequency_khz"], dtype=float)
+        references = np.asarray(request["fields"], dtype=complex)
+        points = references.shape[1]
+        continuum = self.continuum_for(equilibrium, state, progress)
+        case = Case(equilibrium, continuum,
+                    metadata={"gamma_s": float(state.gamma_s), "species": state.species})
+        domain = radial_domain(equilibrium, float(state.rho_min), float(state.rho_max))
+        geometry = RadialGeometry.from_equilibrium(equilibrium)
+        tips = self.continuum_tips(equilibrium, state)
+        centers = geometry.x_of_psi_n(np.asarray(request["peak_psi"], dtype=float))
+        dr_dx_mm = geometry.dr_dx(centers) * 1.0e3
+        base = (domain[1] - domain[0]) / int(state.spans)
+        current_mm = base * dr_dx_mm
+        if float(state.refine_h_mm) > 0.0:
+            finest = np.full(len(modes), float(state.refine_h_mm))
+        else:
+            finest = []
+            for center, f_khz, current in zip(centers, frequency, current_mm):
+                w, d = local_scales_mm(geometry, tips, int(state.ntor), center, f_khz)
+                guide = (min(w, d) if state.resolution_target == "1e-4"
+                         else min(w / 4.0, d / 2.0))
+                finest.append(min(guide if np.isfinite(guide) else current, current / 4.0))
+            finest = np.maximum(np.asarray(finest), 0.01)
+        band = Band(*state.band, units="kHz", vscale=float(state.region_vscale)).for_case(case)
+        settings = dict(prefix="nova_refine_pep", pep_type=state.pep_type,
+                        st_type=state.st_type, which=state.which,
+                        nev=max(int(state.path_nev), 4),
+                        tol=min(float(state.tol), FOLLOW_UP_TOL),
+                        maxit=int(state.maxit), options=state.petsc_options().as_dict(),
+                        verbose=False, compute_residuals=True)
+
+        rows, envelopes, path = [], {mode: [] for mode in modes}, {}
+        tracked = references.copy()
+        levels = int(state.refine_levels)
+        x_psi = None
+        for level in range(levels):
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("Stopped during the refinement.")
+            h_mm = np.minimum(finest * 2.0 ** (levels - 1 - level), current_mm)
+            breakpoints = graded_breakpoints(domain, base, centers, h_mm / dr_dx_mm,
+                                             growth=float(state.refine_growth))
+            elements = int(breakpoints.size - 1)
+            if progress:
+                progress(f"Refinement mesh {level + 1} of {levels}: {elements} elements, "
+                         f"{h_mm.min():.3g} mm at the finest...")
+            scan = Scan(case, RadialGrid(breakpoints, int(state.order),
+                                         int(state.quadrature_order), domain),
+                        ntor=int(state.ntor), mmax=int(state.mmax),
+                        max_dm=int(state.max_dm), regularizer=float(state.regularizer))
+            T0, T1, Tminus1 = scan.solver.assemble_split_matrices(
+                ntor=int(state.ntor), mmax=int(state.mmax), max_dm=int(state.max_dm),
+                regularizer=float(state.regularizer), sound_model=state.sound_model)
+            jobs, regions = [], {}
+            for index, f_khz in enumerate(frequency):
+                half = max(float(state.window_width_khz), 0.02 * f_khz)
+                target_omega, region = band.region(max(f_khz - half, 1.0e-6), f_khz + half)
+                target_s = complex(omega[index].real * (1.0 + TARGET_OFFSET)) ** 2
+                region = _ellipse_region_dict(region, target_s)
+                regions[index] = (target_s, region)
+                jobs.append((index, target_s, region))
+            solutions = _solve_gated({"gamma_s": _dispatch_gamma(scan, state), "T0": T0,
+                                      "T1": T1, "Tminus1": Tminus1, "settings": settings},
+                                     jobs, pool, cancel)
+            for index, mode in enumerate(modes):
+                row = {"mode": mode, "level": level, "elements": elements,
+                       "h_mm": float(h_mm[index]), "frequency_khz": np.nan,
+                       "growth_ratio": np.nan, "correlation": np.nan,
+                       "backward_error": np.nan, "fwhm_mm": np.nan}
+                solution = solutions.get(index)
+                if solution is not None and np.size(solution.eigenvalues):
+                    target_s, region = regions[index]
+                    dataset = scan.solver.pack_window(
+                        solution, ntor=int(state.ntor), target_omega=np.sqrt(target_s),
+                        region=region, mmax=int(state.mmax), max_dm=int(state.max_dm),
+                        regularizer=float(state.regularizer), pep_type=state.pep_type,
+                        st_type=state.st_type, which=state.which,
+                        sound_model=state.sound_model)
+                    found = ModeSet(dataset, scan)
+                    xi = found.field("xi_psi", n=points)
+                    if x_psi is None:
+                        x_psi = geometry.at("psi_n", np.asarray(xi.coords["x"].values))
+                    fields = np.asarray(xi.values)
+                    errors = (np.asarray(dataset["backward_error"].values, dtype=float)
+                              if "backward_error" in dataset else np.zeros(len(found)))
+                    correlations = np.array([
+                        harmonic_correlation(field, tracked[index]) if error <= BACKWARD_ERROR_GATE
+                        else -1.0 for field, error in zip(fields, errors)])
+                    best = int(np.argmax(correlations))
+                    if correlations[best] > 0.0:
+                        w = complex(found.omega[best])
+                        envelope = np.sqrt(np.sum(np.abs(fields[best]) ** 2, axis=1))
+                        envelope = envelope / max(envelope.max(), 1e-300)
+                        r_mm = geometry.at("r", np.asarray(xi.coords["x"].values)) * 1.0e3
+                        above = np.flatnonzero(envelope >= 0.5)
+                        row.update(frequency_khz=float(found.frequency_khz[best]),
+                                   growth_ratio=float(w.imag / w.real) if w.real else np.nan,
+                                   correlation=float(correlations[best]),
+                                   backward_error=float(errors[best]),
+                                   fwhm_mm=float(r_mm[above[-1]] - r_mm[above[0]]))
+                        tracked[index] = fields[best]
+                        omega[index] = w
+                        frequency[index] = row["frequency_khz"]
+                        envelopes[mode].append(envelope)
+                rows.append(row)
+            if level == levels - 1 and state.refine_path_check:
+                targets = [(mode, complex(omega[index]), float(centers[index]),
+                            tracked[index]) for index, mode in enumerate(modes)
+                           if np.isfinite(rows[-len(modes) + index]["frequency_khz"])]
+                if targets:
+                    path = self.path_test(
+                        equilibrium, scan, state, band, targets,
+                        np.linspace(domain[0], domain[1], points), progress=progress,
+                        cancel=cancel, pool=pool, tips=tips)
+        return RefineResult(
+            state=state, title=title, modes=tuple(modes), rows=tuple(rows),
+            x=np.asarray(x_psi if x_psi is not None else np.empty(0), dtype=float),
+            envelopes={mode: np.asarray(values) for mode, values in envelopes.items()},
+            path=path, seconds=time.perf_counter() - started)
 
     @staticmethod
     def _solve_windows(scan, band, state, found, progress, cancel) -> list:
@@ -548,7 +1056,7 @@ class SolverModel:
             regularizer=float(state.regularizer), pep_type=state.pep_type,
             st_type=state.st_type, which=state.which, nev=nev, tol=float(state.tol),
             maxit=int(state.maxit), options=state.petsc_options().as_dict(),
-            verbose=bool(state.verbose),
+            verbose=bool(state.verbose), sound_model=state.sound_model,
         )
         windows = state.windows_khz()
         remaining = list(enumerate(windows))
@@ -602,9 +1110,10 @@ class SolverModel:
             progress(f"Assembling the pencil once for {len(windows)} windows...")
         T0, T1, Tminus1 = scan.solver.assemble_split_matrices(
             ntor=int(state.ntor), mmax=int(state.mmax), max_dm=int(state.max_dm),
-            regularizer=float(state.regularizer), verbose=bool(state.verbose))
+            regularizer=float(state.regularizer), verbose=bool(state.verbose),
+            sound_model=state.sound_model)
         pencil = {
-            "gamma_s": float(scan.solver.gamma_s), "T0": T0, "T1": T1,
+            "gamma_s": _dispatch_gamma(scan, state), "T0": T0, "T1": T1,
             "Tminus1": Tminus1,
             "settings": dict(
                 prefix="nova_quadratic_pep", pep_type=state.pep_type,
@@ -635,7 +1144,7 @@ class SolverModel:
                         region=region, mmax=int(state.mmax), max_dm=int(state.max_dm),
                         regularizer=float(state.regularizer), pep_type=state.pep_type,
                         st_type=state.st_type, which=state.which,
-                        verbose=bool(state.verbose))
+                        verbose=bool(state.verbose), sound_model=state.sound_model)
                 except Exception as packing:
                     solution, error = None, f"{type(packing).__name__}: {packing}"
             if solution is None:
@@ -658,13 +1167,17 @@ class SolverModel:
                 for index, window in enumerate(windows)]
 
     @staticmethod
-    def _pack(state, title, rows, modes, located, scan, started, equilibrium):
+    def _pack(state, title, rows, modes, located, scan, started, equilibrium,
+              crossing_continuum=None):
         """Copy out everything the window draws, on this (the worker) thread."""
         from supernova.solve.modelocate import branch_crossings
 
-        continuum = scan.continuum
-        psi = np.asarray(continuum.coords["psi"].values, dtype=float)
-        branches = np.asarray(continuum["omega"].values, dtype=complex)
+        if crossing_continuum is None:
+            continuum = scan.continuum
+            psi = np.asarray(continuum.coords["psi"].values, dtype=float)
+            branches = np.asarray(continuum["omega"].values, dtype=complex)
+        else:
+            psi, branches = crossing_continuum
         continuum_khz = scan.band_for(branches.real, units="kHz")
         # a root with s < 0 has an imaginary omega; it is not on a kHz axis
         continuum_khz = np.where(np.abs(branches.imag) > 1.0e-6 * np.abs(branches),
@@ -814,3 +1327,165 @@ def _merge_windows(found: list, scan):
     merged = merged.isel(eigenpair=np.asarray(keep))
     merged = merged.assign_coords(eigenpair=np.arange(merged.sizes["eigenpair"]))
     return ModeSet(merged, scan)
+
+
+def _without_parallel_sound(blocks):
+    """The solver blocks with the parallel-acoustic rows of ``A`` dropped.
+
+    In the continuum pencil ``A - mu_0 rho s B`` the rows past the Alfven ones
+    are the parallel sound; without them the slow-sound roots fall to s = 0,
+    which is the continuum the NOVA sound model (``ksound=1``) leaves.
+    """
+    import copy
+
+    from scipy.sparse import coo_array
+
+    A = coo_array(blocks.A)
+    q, rows, cols = A.coords
+    keep = rows < len(blocks.m_range)
+    out = copy.copy(blocks)
+    out.A = coo_array((A.data[keep], (q[keep], rows[keep], cols[keep])), shape=A.shape)
+    return out
+
+
+def _nova_continuum(equilibrium, continuum, state, x) -> np.ndarray:
+    """``(nx, nbranch)`` normalized omega of the NOVA-sound continuum at ``x``."""
+    from supernova.api import RadialGrid
+    from supernova.solve.contour import _SampleGrid
+    from supernova.solve.multigrid import _solve_master_continuum
+    from supernova.solve.stability import StabilitySolver
+
+    # a solver whose "quadrature points" are x evaluates every block there
+    sampler = StabilitySolver(equilibrium, continuum,
+                              _SampleGrid(x, RadialGrid.uniform(8).build()))
+    blocks = sampler.build_solver_blocks(ntor=int(state.ntor), mmax=int(state.mmax),
+                                         max_dm=int(state.max_dm))
+    dataset = _solve_master_continuum(_without_parallel_sound(blocks), x)
+    return np.asarray(dataset["omega"].values, dtype=complex)
+
+
+def _khz(equilibrium, omega) -> np.ndarray:
+    """Normalized omega to kHz; nan where omega is not real (s < 0)."""
+    import unyt
+
+    omega = np.asarray(omega, dtype=complex)
+    real = np.where(np.abs(omega.imag) > 1.0e-6 * np.abs(omega), np.nan, omega.real)
+    return np.asarray(unyt.unyt_array(real / (2.0 * np.pi), "omegaA",
+                                      registry=equilibrium.registry).to("kHz").v, dtype=float)
+
+
+# no continuum at all: MODELOCATE then runs its spike, core and edge tests only
+_NO_CONTINUUM = (np.array([0.0, 1.0]), np.full((2, 0), np.nan, dtype=complex))
+
+
+def _dispatch_gamma(scan, state) -> float:
+    """What the eigensolver dispatches on: without the 1/s term it is linear."""
+    return 0.0 if state.sound_model == "nova" else float(scan.solver.gamma_s)
+
+
+def _alpha_level(alpha: float, alpha_max: float) -> float:
+    """``alpha_max * 2**(-k/2)``: the largest such level not above ``alpha``."""
+    if alpha >= alpha_max:
+        return float(alpha_max)
+    if not alpha > 0.0:
+        return 0.0
+    k = int(np.ceil(2.0 * np.log2(alpha_max / alpha) - 1.0e-12))
+    return float(alpha_max * 2.0 ** (-k / 2.0))
+
+
+def _solve_jobs(pencil: dict, jobs, pool, cancel) -> dict:
+    """``{key: WindowSolution or None}`` for ``(key, target_s, region)`` jobs.
+
+    In the pool's worker processes when there is one -- the compute process
+    never runs an eigensolver itself -- else here, one after another.
+    """
+    out = {}
+    if pool is not None:
+        from supernova.gui._workers import new_pencil_key
+
+        def on_window(index, solution, error, text, seconds):
+            out[index] = solution
+
+        pool.solve(new_pencil_key(), pencil, list(jobs), on_window, cancel)
+        return out
+
+    from supernova.eigen.dispatch import build_eigensolver
+    from supernova.solve.stability import WindowSolution
+
+    eigensolver = None
+    try:
+        for key, target_s, region in jobs:
+            if cancel is not None and cancel.is_set():
+                break
+            try:
+                if eigensolver is None:
+                    eigensolver = build_eigensolver(
+                        gamma_s=pencil["gamma_s"], T0=pencil["T0"], T1=pencil["T1"],
+                        Tminus1=pencil["Tminus1"], target_s=target_s, region=region,
+                        **pencil["settings"])
+                else:
+                    eigensolver.retarget(target_s, region)
+                result = eigensolver.solve(allow_empty=True)
+                out[key] = WindowSolution.from_solver(eigensolver, result)
+            except Exception:
+                out[key] = None
+                if eigensolver is not None:
+                    with contextlib.suppress(Exception):
+                        eigensolver.destroy()
+                eigensolver = None
+    finally:
+        if eigensolver is not None:
+            with contextlib.suppress(Exception):
+                eigensolver.destroy()
+    return out
+
+
+def _gated(solution) -> bool:
+    """True if the solution holds a root inside the production backward-error gate."""
+    if solution is None or np.size(solution.eigenvalues) == 0:
+        return False
+    errors = solution.backward_errors
+    return errors is None or bool(np.any(np.asarray(errors, dtype=float) <= BACKWARD_ERROR_GATE))
+
+
+def _solve_gated(pencil: dict, jobs, pool, cancel) -> dict:
+    """:func:`_solve_jobs`, repeating with a moved target every job that
+    returned no root inside the gate (see ``RETRY_OFFSETS``)."""
+    jobs = list(jobs)
+    out = _solve_jobs(pencil, jobs, pool, cancel)
+    for offset in RETRY_OFFSETS:
+        again = [(key, target_s * (1.0 + offset) ** 2, region)
+                 for key, target_s, region in jobs if not _gated(out.get(key))]
+        if not again or (cancel is not None and cancel.is_set()):
+            break
+        for key, solution in _solve_jobs(pencil, again, pool, cancel).items():
+            if _gated(solution) or out.get(key) is None:
+                out[key] = solution
+    return out
+
+
+def _best_match(solution, pencil, x, reference, omega_reference):
+    """``(drift, correlation, omega)`` of the root most like ``reference``.
+
+    Only roots inside the production backward-error gate count; None when
+    there are none.
+    """
+    from supernova.solve.gaps import harmonic_correlation
+
+    if solution is None or np.size(solution.eigenvalues) == 0:
+        return None
+    s = np.asarray(solution.eigenvalues, dtype=complex)
+    errors = solution.backward_errors
+    keep = (np.ones(s.size, dtype=bool) if errors is None
+            else np.asarray(errors, dtype=float) <= BACKWARD_ERROR_GATE)
+    if not keep.any():
+        return None
+    vectors = np.asarray(solution.eigenvectors)[keep]
+    fields = pencil.xi_psi(vectors, x)
+    correlations = np.array([harmonic_correlation(field, reference) for field in fields])
+    best = int(np.argmax(correlations))
+    omega = np.sqrt(s[keep][best])
+    if omega.real < 0.0:
+        omega = -omega
+    return (float(abs(omega - omega_reference) / abs(omega_reference)),
+            float(correlations[best]), complex(omega))

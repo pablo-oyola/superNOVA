@@ -23,6 +23,9 @@ Requests are ``(kind, job, *args)`` and run one at a time, in order:
 ``("solve", job, handle, state, title)``
     answers with a :class:`~supernova.gui._solver.SolverResult`, stripped
     likewise
+``("refine", job, handle, state, request, title)``
+    re-solves the modes in ``request`` on graded meshes; answers with a
+    :class:`~supernova.gui._solver.RefineResult`
 
 plus ``("cancel", job)``, acted on at once, and ``("shutdown",)``. Replies are
 ``("progress", job, text)``, ``("log", job, text)``, ``("done", job, result)``
@@ -114,6 +117,17 @@ class _Server:
                 self._equilibrium(handle), state, title=title, progress=progress,
                 log=_Log(self.sender, job), cancel=cancel, pool=self.pool)
             return dataclasses.replace(result, equilibrium=None, handle=handle)
+
+        if kind == "refine":
+            from supernova.gui._solver import SolverState
+
+            handle, state, request, title = args
+            state = SolverState.from_dict(state)
+            self.pool.configure(state.workers, state.threads_per_worker)
+            result = self.solver_model.refine(
+                self._equilibrium(handle), state, request, title=title,
+                progress=progress, cancel=cancel, pool=self.pool)
+            return dataclasses.replace(result, handle=handle)
 
         raise ValueError(f"Unknown request {kind!r}.")
 
