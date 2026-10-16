@@ -221,6 +221,20 @@ class RadialGrid:
         return cls(np.linspace(domain[0], domain[1], spans + 1),
                    order, quad_order, domain)
 
+    @classmethod
+    def graded(cls, spans: int, centers, local, *, growth: float = 0.15,
+               order: int = 3, quad_order: int = 6,
+               domain: tuple[float, float] = (0.0, 1.0)) -> "RadialGrid":
+        """``spans`` equal elements, refined to ``local`` around ``centers``.
+
+        See :func:`supernova.radial.grading.graded_breakpoints`.
+        """
+        from supernova.radial.grading import graded_breakpoints
+
+        base = (domain[1] - domain[0]) / int(spans)
+        return cls(graded_breakpoints(domain, base, centers, local, growth=growth),
+                   order, quad_order, domain)
+
     def build(self) -> BSplineFE:
         return BSplineFE(knots=np.asarray(self.knots, dtype=float),
                          order=self.order, domain=self.domain,
@@ -470,7 +484,8 @@ class ModeSet:
         return np.einsum("ij,kjm->kim", phi, coefficients)
 
     def locate(self, points=None,
-               thresholds: ModeLocateThresholds | None = None) -> xr.Dataset:
+               thresholds: ModeLocateThresholds | None = None,
+               continuum: tuple | None = None) -> xr.Dataset:
         """Gerrit Kramer's ``modelocate`` classification of every eigenpair.
 
         Flags each mode as a gap mode or as peaking on a single grid point, in
@@ -478,12 +493,18 @@ class ModeSet:
         :mod:`supernova.solve.modelocate`.  The envelope is sampled on the
         finite-element breakpoints unless ``points`` is given: they play the
         part of NOVA's radial grid, and the spike and continuum tests compare
-        neighbouring grid points.
+        neighbouring grid points.  ``continuum`` is ``(psi, omega)`` -- solver
+        radii and ``(npsi, nbranch)`` normalized frequencies -- to test the
+        crossings against instead of the scan's full sound-Alfven continuum,
+        e.g. the Alfven branches alone when the slow sound is dropped.
         """
         points = (np.unique(self._mesh("xi_psi")) if points is None
                   else np.asarray(points, dtype=float))
-        continuum = self._scan.continuum
-        psi, branches = continuum.coords["psi"].values, continuum["omega"].values
+        if continuum is None:
+            continuum = self._scan.continuum
+            psi, branches = continuum.coords["psi"].values, continuum["omega"].values
+        else:
+            psi, branches = (np.asarray(value) for value in continuum)
         located = locate_modes(
             points,
             self._evaluate("xi_psi", points),

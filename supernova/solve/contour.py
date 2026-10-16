@@ -80,6 +80,39 @@ def native_sample_points(solver) -> np.ndarray:
     return np.unique(x)
 
 
+def _xi_psi(mixed, prolongation, layout, vectors, x: np.ndarray) -> np.ndarray:
+    """``xi^psi`` harmonics of reduced eigenvectors on ``x``: (eigenpair, x, m)."""
+    basis = np.asarray(mixed.pair.high.eval_basis(np.asarray(x, dtype=np.float64)))
+    out = []
+    for vector in np.atleast_2d(vectors):
+        full = prolongation @ vector
+        coeff = full[layout.trial_slice(1)].reshape(layout.n_high, layout.n_modes)
+        out.append(basis.T @ coeff)
+    return np.asarray(out)
+
+
+@dataclass
+class PathPencil:
+    """The BC-reduced pencil on one path, ready for any eigensolver.
+
+    ``gamma_s`` is what :func:`~supernova.eigen.dispatch.build_eigensolver`
+    dispatches on: zero (the linear EPS) for ``sound="nova"``.
+    """
+
+    path: GlobalPath
+    T0: object
+    T1: object
+    Tminus1: object
+    gamma_s: float
+    mixed: object
+    prolongation: object
+    layout: MixedFieldLayout
+
+    def xi_psi(self, vectors, x: np.ndarray) -> np.ndarray:
+        """``xi^psi`` of reduced eigenvectors on the path parameter ``x``."""
+        return _xi_psi(self.mixed, self.prolongation, self.layout, vectors, x)
+
+
 @dataclass
 class ContourSolution:
     """Eigenpairs of one window, with what is needed to rebuild the fields."""
@@ -100,16 +133,8 @@ class ContourSolution:
 
     def xi_psi(self, x: np.ndarray, index: int | None = None) -> np.ndarray:
         """``xi^psi`` harmonics on the path parameter ``x``: (eigenpair, x, m)."""
-        x = np.asarray(x, dtype=np.float64)
-        basis = np.asarray(self.mixed.pair.high.eval_basis(x))  # (n_high, nx)
-        rows = range(self.s.size) if index is None else [index]
-        out = []
-        for k in rows:
-            full = self.prolongation @ self.vectors[k]
-            coeff = full[self.layout.trial_slice(1)].reshape(self.layout.n_high,
-                                                              self.layout.n_modes)
-            out.append(basis.T @ coeff)
-        return np.asarray(out)
+        vectors = self.vectors if index is None else self.vectors[[index]]
+        return _xi_psi(self.mixed, self.prolongation, self.layout, vectors, x)
 
 
 class ContourProblem:
@@ -203,10 +228,22 @@ class ContourProblem:
         sb.weights_q = mixed.weights_q
         return sb, mixed
 
+    @property
+    def gamma_s(self) -> float:
+        """The adiabatic index the eigensolver dispatches on."""
+        return 0.0 if self.sound == "nova" else float(self.solver.gamma_s)
+
+    def pencil(self, path: GlobalPath, breakpoints: np.ndarray | None = None) -> PathPencil:
+        """Assemble and BC-reduce the pencil on ``path``, for solving elsewhere."""
+        (T0, T1, Tminus1), sb, mixed = self.matrices(path, breakpoints=breakpoints)
+        bc = self.solver._build_nep_boundary_condition(sb, bc_kind="full", mixed=mixed)
+        return PathPencil(path=path, T0=T0, T1=T1, Tminus1=Tminus1, gamma_s=self.gamma_s,
+                          mixed=mixed, prolongation=bc.get_sparse_prolongation(),
+                          layout=self.solver._mixed_layout(sb, mixed=mixed))
+
     def _eigensolver(self, T0, T1, Tminus1, target_s, region, nev, tol, maxit, options, verbose):
-        gamma = 0.0 if self.sound == "nova" else self.solver.gamma_s
         return build_eigensolver(
-            gamma_s=gamma, T0=T0, T1=T1, Tminus1=Tminus1,
+            gamma_s=self.gamma_s, T0=T0, T1=T1, Tminus1=Tminus1,
             target_s=target_s, region=region, prefix="nova_contour_pep",
             pep_type="TOAR", st_type="SINVERT", which="TARGET_MAGNITUDE",
             nev=nev, tol=tol, maxit=maxit, options=options, verbose=verbose,
@@ -229,12 +266,9 @@ class ContourProblem:
         region = _ellipse_region_dict(region, target_s)
         if region_vscale is not None:
             region = dict(region, vscale=float(region_vscale))
-        (T0, T1, Tminus1), sb, mixed = self.matrices(path, breakpoints=breakpoints)
-        bc = self.solver._build_nep_boundary_condition(sb, bc_kind="full", mixed=mixed)
-        prolongation = bc.get_sparse_prolongation()
-        layout = self.solver._mixed_layout(sb, mixed=mixed)
-        eigensolver = self._eigensolver(T0, T1, Tminus1, target_s, region, nev, tol,
-                                        maxit, options, verbose)
+        pencil = self.pencil(path, breakpoints=breakpoints)
+        eigensolver = self._eigensolver(pencil.T0, pencil.T1, pencil.Tminus1, target_s,
+                                        region, nev, tol, maxit, options, verbose)
         try:
             result = eigensolver.solve(max_eigenpairs=None, allow_empty=True)
             s = np.asarray(result.eigenvalues, dtype=np.complex128)
@@ -245,5 +279,6 @@ class ContourProblem:
         bp = (np.asarray(breakpoints) if breakpoints is not None
               else np.asarray(self.solver.radialfe.get_mesh()))
         return ContourSolution(s=s, backward_error=berr, vectors=vectors, path=path,
-                               mixed=mixed, prolongation=prolongation, layout=layout,
-                               m_pol=np.asarray(self.sb.m_range), breakpoints=bp)
+                               mixed=pencil.mixed, prolongation=pencil.prolongation,
+                               layout=pencil.layout, m_pol=np.asarray(self.sb.m_range),
+                               breakpoints=bp)
