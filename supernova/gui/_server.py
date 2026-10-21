@@ -20,6 +20,10 @@ Requests are ``(kind, job, *args)`` and run one at a time, in order:
 ``("preview", job, handle, state)``
     a :class:`~supernova.gui._solver.SolverState` as a dict; answers with a
     continuum preview
+``("continuum", job, handle, state)``
+    a :class:`~supernova.gui._state.ContinuumState` as a dict; answers with the
+    continuum tab's :class:`~supernova.gui._model.ContinuumResult`, solved on
+    that equilibrium
 ``("solve", job, handle, state, title)``
     answers with a :class:`~supernova.gui._solver.SolverResult`, stripped
     likewise
@@ -76,11 +80,13 @@ class _Server:
 
     def __init__(self, sender: _Sender):
         from supernova.gui._equilibrium import EquilibriumModel
+        from supernova.gui._model import ContinuumModel
         from supernova.gui._solver import SolverModel
         from supernova.gui._workers import WindowPool
 
         self.sender = sender
         self.equilibrium_model = EquilibriumModel()
+        self.continuum_model = ContinuumModel()
         self.solver_model = SolverModel()
         self.pool = WindowPool()
         self.equilibria: OrderedDict[int, object] = OrderedDict()
@@ -105,6 +111,14 @@ class _Server:
             handle, state = args
             return self.solver_model.preview(
                 self._equilibrium(handle), SolverState.from_dict(state),
+                progress=progress)
+
+        if kind == "continuum":
+            from supernova.gui._state import ContinuumState
+
+            handle, state = args
+            return self.continuum_model.solve(
+                ContinuumState.from_dict(state), self._equilibrium(handle), handle,
                 progress=progress)
 
         if kind == "solve":

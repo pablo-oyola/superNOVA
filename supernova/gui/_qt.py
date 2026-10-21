@@ -246,16 +246,178 @@ class ComputeClient(QtCore.QObject):
 # Widgets
 # ----------------------------------------------------------------------------
 
-def figure_page(window, figsize=(6.4, 4.8)):
-    """A figure with its navigation toolbar, ready to drop into a layout."""
+class ViewMemory:
+    """The axis limits the user chose on one canvas, kept across redraws.
+
+    The tabs redraw from scratch whenever a setting changes, which would put
+    every zoom back to the default view. So a redraw sets its own limits inside
+    :meth:`drawing` -- changes made there are the program's, not the user's --
+    and then calls :meth:`keep` for each axes under a stable key: whatever the
+    user last zoomed or panned that key to is put back, and the axes is watched
+    for the next change. :meth:`forget` drops the remembered limits; the tabs
+    call it when a new equilibrium is loaded, and the toolbar's Home does.
+    """
+
+    def __init__(self):
+        self._limits: dict = {}
+        self._watching: dict = {}
+        self._quiet = 0
+
+    @contextlib.contextmanager
+    def drawing(self):
+        self._quiet += 1
+        try:
+            yield
+        finally:
+            self._quiet -= 1
+
+    def keep(self, axes, key: str) -> None:
+        """Re-apply the user's limits for ``key`` and watch ``axes`` for new ones.
+
+        Call it inside :meth:`drawing`, after the draw has set its defaults.
+        """
+        axes.get_xlim(), axes.get_ylim()         # settle autoscaling now, quietly
+        limits = self._limits.get(key)
+        if limits is not None:
+            axes.set_xlim(limits[0])
+            axes.set_ylim(limits[1])
+        for registry, cid in self._watching.pop(id(axes), ()):
+            registry.disconnect(cid)
+        record = lambda changed, key=key: self._changed(changed, key)
+        self._watching[id(axes)] = [
+            (axes.callbacks, axes.callbacks.connect(signal, record))
+            for signal in ("xlim_changed", "ylim_changed")]
+
+    def _changed(self, axes, key: str) -> None:
+        if not self._quiet:
+            self._limits[key] = (tuple(axes.get_xlim()), tuple(axes.get_ylim()))
+
+    def forget(self, *_ignored) -> None:
+        """Drop every remembered limit; the next redraw uses the defaults."""
+        self._limits.clear()
+
+
+class HomeToolbar(NavigationToolbar2QT):
+    """The navigation toolbar, with Home meaning: forget the zoom and redraw.
+
+    Matplotlib's own Home walks back a view stack that a redraw from scratch
+    leaves behind, so here it forgets the canvas's :class:`ViewMemory` and asks
+    the tab to draw its defaults again.
+    """
+
+    def __init__(self, canvas, window, redraw=None):
+        super().__init__(canvas, window)
+        self._redraw = redraw
+
+    def home(self, *args):
+        if self._redraw is None:
+            super().home(*args)
+            return
+        self.canvas.view_memory.forget()
+        self._redraw()
+
+
+class LegendToggles:
+    """Legend entries that hide and show their lines.
+
+    A click on an entry, its line or its text, hides that label or shows it
+    again; a double-click shows it alone, and a double-click on the entry shown
+    alone brings every one back. The tab draws each labelled line with
+    ``visible=toggles.shows(label)``, hands the legend to :meth:`attach`, and
+    is redrawn through ``redraw`` after each pick. Hidden labels are kept by
+    name, so a hidden harmonic stays hidden on the next mode too.
+
+    With twin axes matplotlib delivers picks to the topmost axes only, so the
+    legend must be drawn on the twin.
+    """
+
+    DIMMED = 0.25
+
+    def __init__(self, canvas, redraw):
+        self.hidden: set[str] = set()
+        self._canvas = canvas
+        self._redraw = redraw
+        self._labels: dict = {}
+        self._shown: list[str] = []
+        self._before: set[str] = set()
+        canvas.mpl_connect("pick_event", self._picked)
+
+    def shows(self, label: str) -> bool:
+        return label not in self.hidden
+
+    def attach(self, legend) -> None:
+        """Make ``legend``'s entries pickable and dim the hidden ones."""
+        self._labels = {}
+        texts = legend.get_texts()
+        self._shown = [text.get_text() for text in texts]
+        for handle, text in zip(legend.legend_handles, texts):
+            label = text.get_text()
+            for artist in (handle, text):
+                if artist is None:
+                    continue
+                artist.set_picker(True)
+                self._labels[artist] = label
+            if hasattr(handle, "set_pickradius"):
+                handle.set_pickradius(6)
+            if label in self.hidden:
+                text.set_alpha(self.DIMMED)
+                if handle is not None:
+                    # the handle copied its line's visibility; keep it clickable
+                    handle.set_visible(True)
+                    handle.set_alpha(self.DIMMED)
+
+    def _picked(self, event) -> None:
+        label = self._labels.get(event.artist)
+        if label is None or toolbar_is_busy(self._canvas):
+            return
+        if event.mouseevent.dblclick:
+            # the first press of the double-click has already toggled the
+            # entry, so judge "shown alone" by the state before it
+            others = set(self._shown) - {label}
+            alone = (self._before & set(self._shown)) == others
+            self.hidden = set() if alone else others
+        else:
+            self._before = set(self.hidden)
+            self.hidden ^= {label}
+        self._redraw()
+
+
+def figure_page(window, figsize=(6.4, 4.8), redraw=None):
+    """A figure with its navigation toolbar, ready to drop into a layout.
+
+    The canvas carries a :class:`ViewMemory` as ``canvas.view_memory``;
+    ``redraw`` is what the toolbar's Home calls after forgetting it.
+    """
     figure = Figure(figsize=figsize, layout="constrained")
     canvas = FigureCanvasQTAgg(figure)
+    canvas.view_memory = ViewMemory()
     page = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(page)
     layout.setContentsMargins(0, 0, 0, 0)
-    layout.addWidget(NavigationToolbar2QT(canvas, window))
+    layout.addWidget(HomeToolbar(canvas, window, redraw))
     layout.addWidget(canvas, 1)
     return page, figure, canvas
+
+
+SESSION_FILTER = "superNOVA session (*.h5 *.hdf5)"
+OPEN_SESSION_FILTER = "superNOVA sessions (*.h5 *.hdf5 *.json);;All files (*)"
+
+
+def ask_session_to_save(parent, title: str, name: str) -> str:
+    """Where to save a session, with .h5 added unless it ends in .h5 or .hdf5."""
+    path, _ = QtWidgets.QFileDialog.getSaveFileName(parent, title, name, SESSION_FILTER)
+    if path and not path.lower().endswith((".h5", ".hdf5")):
+        path += ".h5"
+    return path
+
+
+def ask_session_to_open(parent, title: str) -> str:
+    """A session to open: HDF5, or JSON from before sessions held results."""
+    import os
+
+    path, _ = QtWidgets.QFileDialog.getOpenFileName(parent, title, os.getcwd(),
+                                                    OPEN_SESSION_FILTER)
+    return path
 
 
 def toolbar_is_busy(canvas) -> bool:

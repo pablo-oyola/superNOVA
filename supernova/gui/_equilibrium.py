@@ -14,6 +14,7 @@ loader plus a page of controls, not a change to the drawing code.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
@@ -24,6 +25,7 @@ from supernova.gui._session import JsonState
 from supernova.gui._state import COORDINATES
 
 SOURCES = ("eqdsk", "itpa")
+SPECIES = ("H", "D", "T", "He3", "He4")
 SOURCE_LABELS = {"eqdsk": "g-EQDSK file", "itpa": "ITPA TAE benchmark (analytic)"}
 PROFILE_AXES = ("psi_n", "rho_pol")
 
@@ -112,6 +114,9 @@ class EquilibriumState(JsonState):
     """Every control in the equilibrium tab, and nothing else."""
 
     source: str = "eqdsk"
+    # the ions: with the density they set the mass density, so every tab uses
+    # this one. It does not change the geometry, so it never forces a reload.
+    species: str = "D"
 
     # g-EQDSK
     eqdsk: str = ""
@@ -170,6 +175,8 @@ class EquilibriumState(JsonState):
     def validate(self) -> list[str]:
         """Return the reasons this state cannot be loaded, in reading order."""
         problems = []
+        if self.species not in SPECIES:
+            problems.append(f"Species must be one of {', '.join(SPECIES)}.")
         if self.source not in SOURCES:
             problems.append(f"Source must be one of {', '.join(SOURCES)}.")
         elif self.source == "eqdsk":
@@ -361,6 +368,8 @@ class EquilibriumView:
     load_seconds: float
     inputs: dict = field(default_factory=dict)   # what the other tabs may take over
     handle: int | None = None         # the compute process's name for ``equilibrium``
+    species: str = "D"                # the ions every tab uses with this equilibrium
+    key: tuple = ()                   # the state's equilibrium_key it was loaded from
 
     @property
     def theta_closes(self) -> bool:
@@ -485,7 +494,7 @@ class EquilibriumModel:
             raise ValueError(problems[0])
         key = state.equilibrium_key()
         if self.view is not None and key == self._key:
-            return self.view
+            return dataclasses.replace(self.view, species=state.species)
 
         started = time.perf_counter()
         equilibrium, extra = _LOADERS[state.source](state, progress)
@@ -494,6 +503,7 @@ class EquilibriumModel:
         view = build_view(equilibrium, source=state.source,
                           load_seconds=time.perf_counter() - started,
                           inputs=state.shared_inputs(), **extra)
+        view = dataclasses.replace(view, species=state.species, key=key)
         self.view, self._key = view, key
         return view
 

@@ -1,9 +1,10 @@
-"""The continuum window's state and caching, without Qt or physics.
+"""The continuum tab's state and caching, without Qt or physics.
 
-The window is deliberately thin: it edits a ContinuumState and hands it to a
-ContinuumModel. Both are plain objects, so what is worth testing -- validation,
-session round-trips, and which expensive step gets skipped on which edit -- is
-testable without a display and without loading an equilibrium.
+The tab is deliberately thin: it edits a ContinuumState, and the compute
+process hands it to a ContinuumModel together with the equilibrium the
+Equilibrium tab loaded. Both are plain objects, so what is worth testing --
+validation, session round-trips, and which expensive step gets skipped on which
+edit -- is testable without a display and without loading an equilibrium.
 """
 
 from __future__ import annotations
@@ -13,37 +14,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from supernova.gui._state import BRANCHES, COORDINATES, ContinuumState
+from supernova.gui._state import BRANCHES, COORDINATES, ContinuumState, split_legacy
 
 
 # --------------------------------------------------------------- validation
 
-def test_an_empty_state_asks_for_the_two_files_it_needs():
-    problems = ContinuumState().validate()
-    assert any("equilibrium" in p.lower() for p in problems)
-    assert any("density" in p.lower() for p in problems)
-
-
-def test_validation_reports_missing_files_by_path(tmp_path):
-    state = ContinuumState(eqdsk=str(tmp_path / "absent.eqdsk"),
-                           density_file=str(tmp_path / "absent.dat"))
-    problems = state.validate()
-    assert any("absent.eqdsk" in p for p in problems)
-    assert any("absent.dat" in p for p in problems)
+def test_the_default_state_needs_nothing_more():
+    """The equilibrium comes from the Equilibrium tab, so there are no files here."""
+    assert ContinuumState().validate() == []
 
 
 def _valid(tmp_path, **overrides) -> ContinuumState:
-    eqdsk = tmp_path / "eq.eqdsk"; eqdsk.write_text("x")
-    density = tmp_path / "ne.dat"; density.write_text("x")
-    return ContinuumState(eqdsk=str(eqdsk), density_file=str(density), **overrides)
-
-
-def test_a_complete_state_has_nothing_to_report(tmp_path):
-    assert _valid(tmp_path).validate() == []
+    return ContinuumState(**overrides)
 
 
 @pytest.mark.parametrize("overrides, expected", [
-    ({"boozer_min": 0.9, "boozer_max": 0.1}, "Boozer domain"),
     ({"mmax": 0}, "mmax"),
     ({"npsi": 4}, "Radial points"),
     ({"which": "sound"}, "Branch"),
@@ -69,6 +54,24 @@ def test_a_session_round_trips_through_json(tmp_path):
     assert ContinuumState.from_json(path) == state
 
 
+def test_an_old_session_keeps_its_equilibrium_inputs_aside(tmp_path):
+    """Sessions from when this tab loaded its own equilibrium still open."""
+    from supernova.gui._session import read_session
+
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"eqdsk": "/shot.geqdsk", "cocos_in": 7,
+                                "density_file": "/ne.dat", "boozer_max": 0.98,
+                                "ntor": 4, "mmax": 30, "species": "T"}))
+    state = ContinuumState.from_json(path)
+    assert (state.ntor, state.mmax) == (4, 30)
+    settings, legacy = split_legacy(json.loads(path.read_text()))
+    assert "eqdsk" not in settings and legacy["cocos_in"] == 7
+    sessions = read_session(path)
+    equilibrium = sessions["continuum_equilibrium"]
+    assert (equilibrium.eqdsk, equilibrium.cocos_in, equilibrium.boozer_max,
+            equilibrium.species) == ("/shot.geqdsk", 7, 0.98, "T")
+
+
 def test_loading_a_session_with_an_unknown_key_says_which(tmp_path):
     path = tmp_path / "session.json"
     path.write_text(json.dumps({"ntor": 3, "flux_surface_count": 17}))
@@ -77,32 +80,6 @@ def test_loading_a_session_with_an_unknown_key_says_which(tmp_path):
 
 
 # -------------------------------------------------------- what invalidates what
-
-def test_the_equilibrium_key_ignores_continuum_settings():
-    """Changing n or mmax must not trigger a Boozer transform."""
-    base = ContinuumState()
-    for field, value in (("ntor", 9), ("mmax", 99), ("npsi", 1024),
-                         ("which", "full"), ("gamma_s", 0.0), ("species", "T"),
-                         ("fmax_khz", 200.0), ("band_low_khz", 10.0)):
-        changed = ContinuumState(**{**vars(base), field: value})
-        assert changed.equilibrium_key() == base.equilibrium_key(), field
-
-
-@pytest.mark.parametrize("field, value", [
-    ("eqdsk", "/other.eqdsk"),
-    ("cocos_in", 7),
-    ("boozer_min", 0.01),
-    ("boozer_max", 0.99),
-    ("density_file", "/other.dat"),
-    ("density_x", "rho_pol"),
-    ("density_interpolate_in", "psi_n"),
-    ("density_units", "cm^-3"),
-])
-def test_the_equilibrium_key_changes_when_its_inputs_do(field, value):
-    base = ContinuumState()
-    changed = ContinuumState(**{**vars(base), field: value})
-    assert changed.equilibrium_key() != base.equilibrium_key()
-
 
 def test_only_gamma_and_species_rebuild_the_continuum():
     base = ContinuumState()
@@ -137,72 +114,75 @@ class _FakeContinuum:
         return unyt.unyt_array(values, "omegaA**2", registry=_alfven_registry())
 
 
-class _FakeCase:
-    def __init__(self, counters):
-        self.counters = counters
-        self.continuum = _FakeContinuum()
-        self.equilibrium = SimpleNamespace(
-            qprof=SimpleNamespace(data=__import__("numpy").linspace(1.0, 3.0, 8)))
+def _fake_equilibrium():
+    import numpy as np
 
-    def with_continuum(self, *, gamma_s=None, species=None, dense=True):
-        self.counters["continuum"] += 1
-        fresh = _FakeCase(self.counters)
-        return fresh
+    return SimpleNamespace(
+        qprof=SimpleNamespace(data=np.linspace(1.0, 3.0, 8)),
+        magspace=SimpleNamespace(coords={"psi": SimpleNamespace(values=np.linspace(0, 1, 8))}),
+        registry=_alfven_registry())
 
 
 @pytest.fixture
-def counting_model(monkeypatch, tmp_path):
-    """A model whose expensive steps only count themselves."""
+def counting_model(monkeypatch):
+    """A model whose continuum construction only counts itself."""
+    from supernova import continuum as continuum_module
     from supernova.gui import _model
 
-    counters = {"equilibrium": 0, "continuum": 0}
+    counters = {"continuum": 0}
 
-    def fake_from_eqdsk(*args, **kwargs):
-        counters["equilibrium"] += 1
-        return _FakeCase(counters)
+    def fake_continuum(equilibrium, **kwargs):
+        counters["continuum"] += 1
+        return _FakeContinuum()
 
-    monkeypatch.setattr(_model.Case, "from_eqdsk", staticmethod(fake_from_eqdsk))
-    monkeypatch.setattr(_model, "profile_from_columns",
-                        lambda *a, **k: object())
-    return _model.ContinuumModel(), counters, _valid(tmp_path)
+    monkeypatch.setattr(continuum_module, "superContinuum", fake_continuum)
+    return _model.ContinuumModel(), counters, ContinuumState(), _fake_equilibrium()
 
 
-def test_changing_n_reuses_the_equilibrium_and_the_continuum(counting_model):
-    model, counters, state = counting_model
-    model.solve(state)
-    assert counters == {"equilibrium": 1, "continuum": 0}
+def test_changing_n_reuses_the_continuum(counting_model):
+    model, counters, state, equilibrium = counting_model
+    first = model.solve(state, equilibrium, key=1)
+    assert counters == {"continuum": 1} and first.reloaded_equilibrium
 
     state.ntor = 4
-    result = model.solve(state)
-    assert counters == {"equilibrium": 1, "continuum": 0}
+    result = model.solve(state, equilibrium, key=1)
+    assert counters == {"continuum": 1}
     assert not result.reloaded_equilibrium and not result.rebuilt_continuum
 
 
 def test_changing_gamma_rebuilds_only_the_continuum(counting_model):
-    model, counters, state = counting_model
-    model.solve(state)
+    model, counters, state, equilibrium = counting_model
+    model.solve(state, equilibrium, key=1)
     state.gamma_s = 0.0
-    result = model.solve(state)
-    assert counters == {"equilibrium": 1, "continuum": 1}
+    result = model.solve(state, equilibrium, key=1)
+    assert counters == {"continuum": 2}
     assert result.rebuilt_continuum and not result.reloaded_equilibrium
 
 
-def test_changing_the_eqdsk_reloads_everything(counting_model, tmp_path):
-    model, counters, state = counting_model
-    model.solve(state)
-    other = tmp_path / "other.eqdsk"; other.write_text("x")
-    state.eqdsk = str(other)
-    result = model.solve(state)
-    assert counters["equilibrium"] == 2
+def test_another_equilibrium_rebuilds_and_says_so(counting_model):
+    model, counters, state, equilibrium = counting_model
+    model.solve(state, equilibrium, key=1)
+    result = model.solve(state, _fake_equilibrium(), key=2)
+    assert counters == {"continuum": 2}
     assert result.reloaded_equilibrium
 
 
 def test_the_model_refuses_an_invalid_state_before_touching_anything(counting_model):
-    model, counters, state = counting_model
+    model, counters, state, equilibrium = counting_model
     state.mmax = 0
     with pytest.raises(ValueError, match="mmax"):
-        model.solve(state)
-    assert counters == {"equilibrium": 0, "continuum": 0}
+        model.solve(state, equilibrium, key=1)
+    assert counters == {"continuum": 0}
+
+
+def test_radii_are_the_physical_psi_n(counting_model):
+    import numpy as np
+
+    model, _, state, equilibrium = counting_model
+    x = equilibrium.magspace.coords["psi"].values
+    equilibrium.magspace.coords["psi_physical_norm"] = SimpleNamespace(values=0.01 + 0.9 * x)
+    result = model.solve(state, equilibrium, key=1)
+    assert np.isclose(result.psi_n[0], 0.01) and np.isclose(result.psi_n[-1], 0.91)
 
 
 def test_branch_and_coordinate_vocabularies_are_what_the_solver_accepts():

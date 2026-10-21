@@ -1,8 +1,14 @@
-"""The window's state, as plain data.
+"""The continuum tab's state, as plain data.
 
 Everything the user can set lives here and nowhere else. Two reasons: a session
 round-trips through JSON, so a GUI run reproduces without the GUI; and the
-solve is a pure function of this object, so it can be tested without Qt.
+solve is a pure function of this object and the equilibrium, so it can be
+tested without Qt.
+
+The equilibrium itself is not here: the continuum is solved on the one the
+Equilibrium tab loaded. Sessions written when this window loaded its own still
+carry its inputs; :func:`split_legacy` sets them aside so they can be handed to
+the Equilibrium tab instead.
 """
 
 from __future__ import annotations
@@ -20,22 +26,22 @@ BRANCH_LABELS = {
 }
 COORDINATES = ("psi_n", "rho_pol")
 
+# what the window used to load its own equilibrium from
+LEGACY_EQUILIBRIUM_KEYS = ("eqdsk", "cocos_in", "boozer_min", "boozer_max",
+                           "density_file", "density_units", "density_x",
+                           "density_interpolate_in")
+
+
+def split_legacy(data: dict) -> tuple[dict, dict]:
+    """``(continuum settings, old equilibrium inputs)`` from a session dict."""
+    data = dict(data)
+    legacy = {key: data.pop(key) for key in LEGACY_EQUILIBRIUM_KEYS if key in data}
+    return data, legacy
+
 
 @dataclass
 class ContinuumState:
-    """Every control in the window, and nothing else."""
-
-    # equilibrium
-    eqdsk: str = ""
-    cocos_in: int = 5
-    boozer_min: float = 0.005
-    boozer_max: float = 0.995
-
-    # profiles
-    density_file: str = ""
-    density_units: str = "m^-3"
-    density_x: str = "psi_n"          # what the file's first column is
-    density_interpolate_in: str = "rho_pol"
+    """Every control in the tab, and nothing else."""
 
     # continuum
     ntor: int = 2
@@ -55,16 +61,6 @@ class ContinuumState:
     def validate(self) -> list[str]:
         """Return the reasons this state cannot be solved, in reading order."""
         problems = []
-        if not self.eqdsk:
-            problems.append("Choose an equilibrium file.")
-        elif not Path(self.eqdsk).is_file():
-            problems.append(f"Equilibrium not found: {self.eqdsk}")
-        if not self.density_file:
-            problems.append("Choose a density profile file.")
-        elif not Path(self.density_file).is_file():
-            problems.append(f"Density file not found: {self.density_file}")
-        if not 0.0 <= self.boozer_min < self.boozer_max <= 1.0:
-            problems.append("Boozer domain must satisfy 0 <= min < max <= 1.")
         if self.mmax < 1:
             problems.append("mmax must be at least 1.")
         if self.npsi < 8:
@@ -82,34 +78,37 @@ class ContinuumState:
             problems.append("The mode frequency cannot be negative.")
         return problems
 
-    # what the equilibrium depends on; a change here means a slow reload
-    def equilibrium_key(self) -> tuple:
-        return (self.eqdsk, self.cocos_in, self.boozer_min, self.boozer_max,
-                self.density_file, self.density_units, self.density_x,
-                self.density_interpolate_in)
-
     # what the continuum object depends on, given an equilibrium
     def continuum_key(self) -> tuple:
         return (self.gamma_s, self.species)
 
     def solve_key(self) -> tuple:
-        """Everything the solved arrays depend on.
+        """Everything the solved arrays depend on, given the equilibrium.
 
         The band, the frequency cursor and the axis limit are not here: they
         are drawn from the result that already exists, so moving the cursor
         never re-solves.
         """
-        return (self.equilibrium_key(), self.continuum_key(), self.ntor,
-                self.mmax, self.npsi, self.which, self.classify)
+        return (self.continuum_key(), self.ntor, self.mmax, self.npsi,
+                self.which, self.classify)
 
     def to_json(self, path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
 
     @classmethod
-    def from_json(cls, path) -> "ContinuumState":
-        data = json.loads(Path(path).read_text())
+    def from_dict(cls, data: dict) -> "ContinuumState":
+        """The settings in ``data``; an old session's equilibrium inputs are
+        ignored here (see :func:`split_legacy`), anything else unknown is an error."""
+        data, _ = split_legacy(data)
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(data) - known)
         if unknown:
             raise ValueError(f"Unknown session keys: {', '.join(unknown)}")
         return cls(**data)
+
+    @classmethod
+    def from_json(cls, path) -> "ContinuumState":
+        return cls.from_dict(json.loads(Path(path).read_text()))
+
+    def to_dict(self) -> dict:
+        return asdict(self)

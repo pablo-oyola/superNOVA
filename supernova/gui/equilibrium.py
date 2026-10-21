@@ -24,6 +24,7 @@ EquilibriumView` that comes back.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -39,6 +40,7 @@ from supernova.gui._equilibrium import (
     PROFILE_AXES,
     SOURCE_LABELS,
     SOURCES,
+    SPECIES,
     SURFACE_GROUPS,
     SURFACE_LABELS,
     SURFACE_NAMES,
@@ -52,12 +54,15 @@ from supernova.gui._qt import (
     WARNING,
     ComputeClient,
     SciEdit,
+    ask_session_to_open,
+    ask_session_to_save,
     double_spin,
     figure_page,
     int_spin,
     toolbar_is_busy,
 )
 from supernova.gui._refine_job import RESULT_MARKER
+from supernova.gui._session import read_session, write_session
 from supernova.gui._state import COORDINATES
 
 SURFACE_COLOUR = "#2B5EA6"
@@ -96,6 +101,7 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
         self._comparison_pending = False     # the next load is a refinement's
         self._share_refined = True           # ...and whether to pass it on
         self.shared = True                   # whether the view on show was passed on
+        self.session_owner = None            # in the app: the window whose session the buttons save
         self._loading_ui = False
         self._process: QtCore.QProcess | None = None
         self._process_output = ""
@@ -131,11 +137,11 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
         scroll.setMaximumWidth(470)
 
         self.pages = QtWidgets.QTabWidget()
-        page, self.shape_figure, self.shape_canvas = figure_page(self, (6.0, 7.0))
+        page, self.shape_figure, self.shape_canvas = figure_page(self, (6.0, 7.0), self._draw_shape)
         self.pages.addTab(page, "Shape")
-        page, self.profile_figure, self.profile_canvas = figure_page(self, (11.0, 6.0))
+        page, self.profile_figure, self.profile_canvas = figure_page(self, (11.0, 6.0), self._draw_profiles)
         self.pages.addTab(page, "Profiles")
-        page, self.surface_figure, self.surface_canvas = figure_page(self, (8.0, 7.0))
+        page, self.surface_figure, self.surface_canvas = figure_page(self, (8.0, 7.0), self._draw_surface)
         self.pages.addTab(page, "Surface")
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -196,6 +202,19 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
         self.source_stack.addWidget(self._eqdsk_page())
         self.source_stack.addWidget(self._itpa_page())
         layout.addWidget(self.source_stack)
+
+        species_row = QtWidgets.QHBoxLayout()
+        species_row.addWidget(QtWidgets.QLabel("ion species"))
+        self.species_combo = QtWidgets.QComboBox()
+        self.species_combo.addItems(SPECIES)
+        self.species_combo.setToolTip(
+            "The ions. With the density they set the mass density, and so the "
+            "Alfven speed, so the continuum and solver tabs use this one -- they "
+            "cannot differ. Changing it does not reload: the geometry does not "
+            "depend on it.")
+        species_row.addWidget(self.species_combo, 1)
+        layout.addLayout(species_row)
+        self.species_combo.currentIndexChanged.connect(self._on_species_edit)
 
         self.load_button = QtWidgets.QPushButton("Load equilibrium")
         self.load_button.setToolTip(
@@ -269,8 +288,7 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
 
         self.density_uniform = SciEdit(0.0, minimum=0.0, tooltip=(
             "A constant density in m^-3, used when no file is given -- the "
-            "ITPA benchmark's 2e19, say. 0 leaves the flagged placeholder. "
-            "The continuum tab reads files only, so this is not passed on."))
+            "ITPA benchmark's 2e19, say. 0 leaves the flagged placeholder."))
         grid.addWidget(QtWidgets.QLabel("or uniform [m^-3]"), 8, 0)
         grid.addWidget(self.density_uniform, 8, 1, 1, 3)
 
@@ -515,6 +533,7 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
         self._loading_ui = True
         s = self.state
         self.source_combo.setCurrentIndex(max(self.source_combo.findData(s.source), 0))
+        self.species_combo.setCurrentText(s.species)
         self.eqdsk_edit.setText(s.eqdsk)
         self.cocos_spin.setValue(s.cocos_in)
         self.density_edit.setText(s.density_file)
@@ -570,6 +589,7 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
     def _read_widgets_into_state(self) -> None:
         s = self.state
         s.source = self.source_combo.currentData()
+        s.species = self.species_combo.currentText()
         s.eqdsk = self.eqdsk_edit.text().strip()
         s.cocos_in = self.cocos_spin.value()
         s.density_file = self.density_edit.text().strip()
@@ -634,6 +654,21 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
         source = self.source_combo.currentData()
         self.source_stack.setCurrentIndex(SOURCES.index(source))
         self.refine_box.setEnabled(source == "eqdsk")
+
+    def _on_species_edit(self, *_) -> None:
+        """Pass the new ions on with the loaded equilibrium; nothing reloads."""
+        if self._loading_ui:
+            return
+        self.state.species = self.species_combo.currentText()
+        if self.view is None or self.view.species == self.state.species:
+            return
+        self.view = dataclasses.replace(self.view, species=self.state.species)
+        self._write_summary()
+        if self.shared:
+            self.equilibriumChanged.emit(self.view, True)
+        self.status.showMessage(f"Ion species {self.state.species}: passed on to the "
+                                "continuum and solver tabs" if self.shared else
+                                f"Ion species {self.state.species}")
 
     def _on_input_edit(self, *_) -> None:
         """An input changed: the loaded equilibrium is now stale, not reloaded."""
@@ -728,6 +763,10 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
         self.export_action.setEnabled(True)
         self.load_button.setText("Load equilibrium")
         self._write_summary()
+        if changed:
+            # a new equilibrium: the zooms chosen on the old one no longer apply
+            for canvas in (self.shape_canvas, self.profile_canvas, self.surface_canvas):
+                canvas.view_memory.forget()
         self._draw_all()
         message = (f"{view.title}: {view.psi_n.size} x {view.theta.size} Boozer grid "
                    f"in {view.load_seconds:.1f} s")
@@ -792,7 +831,8 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
                          f"uniform placeholder is used. Geometry only -- the solver "
                          f"tab needs a real density.</span>")
         elif "n_axis_m3" in s:
-            lines.append(f"n<sub>axis</sub> = {s['n_axis_m3']:.3g} m<sup>-3</sup>")
+            lines.append(f"n<sub>axis</sub> = {s['n_axis_m3']:.3g} m<sup>-3</sup> "
+                         f"of {_escape(view.species)}")
         if not self.shared:
             lines.append(f"<span style='color:{WARNING}'>Kept to this tab: the "
                          "continuum and solver tabs still use the equilibrium they "
@@ -824,198 +864,209 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
         return values if self.view.theta_closes else np.append(values, values[:1])
 
     def _draw_shape(self) -> None:
-        figure = self.shape_figure
-        view = self.view
-        if view is None:
-            self.shape_axes = self._placeholder(figure, "Load an equilibrium")
+        memory = self.shape_canvas.view_memory
+        with memory.drawing():
+            figure = self.shape_figure
+            view = self.view
+            if view is None:
+                self.shape_axes = self._placeholder(figure, "Load an equilibrium")
+                self.shape_canvas.draw_idle()
+                return
+            figure.clear()
+            ax = figure.add_subplot(111)
+            self.shape_axes = ax
+            s = self.state
+            npsi, ntheta = view.R.shape
+            surfaces = np.unique(np.linspace(0, npsi - 1, s.grid_surfaces).round().astype(int))
+            periodic = ntheta - 1 if view.theta_closes else ntheta
+            spokes = np.unique((np.arange(s.grid_spokes) * periodic / s.grid_spokes).astype(int))
+            selected = view.surface_index(s.surface_psi_n)
+            handles = []
+
+            if view.limiter is not None:
+                ax.plot(view.limiter[:, 0], view.limiter[:, 1], color="0.2", lw=1.0)
+            if s.show_flux_contours and view.flux_map is not None:
+                R, Z, psi_n, inside = view.flux_map
+                levels = np.unique(view.psi_n[surfaces])
+                levels = levels[(levels > 1.0e-3) & (levels < 1.0)]
+                # Inside the plasma only: outside it, a re-solved file's flux is
+                # whatever the export padded it with, and the private-flux region
+                # repeats psi_N < 1 below the X-point.
+                core = np.where(inside, psi_n, np.nan)
+                if levels.size:
+                    ax.contour(R, Z, core.T, levels=levels, colors="0.55",
+                               linewidths=1.6, alpha=0.35)
+                    handles.append(Line2D([], [], color="0.55", lw=1.6, alpha=0.35,
+                                          label=r"$\psi_N$ contours of the file"))
+
+            ax.plot(view.boundary[:, 0], view.boundary[:, 1], color="k", lw=1.5)
+            for index in surfaces:
+                ax.plot(self._closed(view.R[index]), self._closed(view.Z[index]),
+                        color=SURFACE_COLOUR, lw=0.8)
+            for index in spokes:
+                ax.plot(view.R[:, index], view.Z[:, index], color=SPOKE_COLOUR,
+                        lw=1.6 if index == 0 else 0.6)
+            handles.append(Line2D([], [], color=SURFACE_COLOUR, lw=0.8, label="Boozer surfaces"))
+            handles.append(Line2D([], [], color=SPOKE_COLOUR, lw=0.6,
+                                  label=r"constant $\Theta$ (bold: $\Theta=0$)"))
+
+            # which way Theta increases, on the outermost surface
+            start, end = periodic // 16, periodic // 8
+            ax.annotate("", xy=(view.R[-1, end], view.Z[-1, end]),
+                        xytext=(view.R[-1, start], view.Z[-1, start]),
+                        arrowprops=dict(arrowstyle="->", color=SPOKE_COLOUR, lw=1.6))
+            ax.text(view.R[-1, end], view.Z[-1, end], r"  $\Theta$", color=SPOKE_COLOUR)
+
+            ax.plot(self._closed(view.R[selected]), self._closed(view.Z[selected]),
+                    color=SELECTED_COLOUR, lw=2.0)
+            handles.append(Line2D([], [], color=SELECTED_COLOUR, lw=2.0,
+                                  label=rf"$\psi_N$ = {view.psi_n[selected]:.4f}"))
+            ax.plot(*view.axis, marker="+", color="k", markersize=10)
+
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_xlabel("R [m]")
+            ax.set_ylabel("Z [m]")
+            ax.set_title(f"{view.title}: magnetic coordinates, {npsi} x {ntheta}",
+                         fontsize=10)
+            ax.legend(handles=handles, loc="upper right", fontsize=7, frameon=False)
+            ax.grid(alpha=0.2)
+            memory.keep(ax, "shape")
             self.shape_canvas.draw_idle()
-            return
-        figure.clear()
-        ax = figure.add_subplot(111)
-        self.shape_axes = ax
-        s = self.state
-        npsi, ntheta = view.R.shape
-        surfaces = np.unique(np.linspace(0, npsi - 1, s.grid_surfaces).round().astype(int))
-        periodic = ntheta - 1 if view.theta_closes else ntheta
-        spokes = np.unique((np.arange(s.grid_spokes) * periodic / s.grid_spokes).astype(int))
-        selected = view.surface_index(s.surface_psi_n)
-        handles = []
-
-        if view.limiter is not None:
-            ax.plot(view.limiter[:, 0], view.limiter[:, 1], color="0.2", lw=1.0)
-        if s.show_flux_contours and view.flux_map is not None:
-            R, Z, psi_n, inside = view.flux_map
-            levels = np.unique(view.psi_n[surfaces])
-            levels = levels[(levels > 1.0e-3) & (levels < 1.0)]
-            # Inside the plasma only: outside it, a re-solved file's flux is
-            # whatever the export padded it with, and the private-flux region
-            # repeats psi_N < 1 below the X-point.
-            core = np.where(inside, psi_n, np.nan)
-            if levels.size:
-                ax.contour(R, Z, core.T, levels=levels, colors="0.55",
-                           linewidths=1.6, alpha=0.35)
-                handles.append(Line2D([], [], color="0.55", lw=1.6, alpha=0.35,
-                                      label=r"$\psi_N$ contours of the file"))
-
-        ax.plot(view.boundary[:, 0], view.boundary[:, 1], color="k", lw=1.5)
-        for index in surfaces:
-            ax.plot(self._closed(view.R[index]), self._closed(view.Z[index]),
-                    color=SURFACE_COLOUR, lw=0.8)
-        for index in spokes:
-            ax.plot(view.R[:, index], view.Z[:, index], color=SPOKE_COLOUR,
-                    lw=1.6 if index == 0 else 0.6)
-        handles.append(Line2D([], [], color=SURFACE_COLOUR, lw=0.8, label="Boozer surfaces"))
-        handles.append(Line2D([], [], color=SPOKE_COLOUR, lw=0.6,
-                              label=r"constant $\Theta$ (bold: $\Theta=0$)"))
-
-        # which way Theta increases, on the outermost surface
-        start, end = periodic // 16, periodic // 8
-        ax.annotate("", xy=(view.R[-1, end], view.Z[-1, end]),
-                    xytext=(view.R[-1, start], view.Z[-1, start]),
-                    arrowprops=dict(arrowstyle="->", color=SPOKE_COLOUR, lw=1.6))
-        ax.text(view.R[-1, end], view.Z[-1, end], r"  $\Theta$", color=SPOKE_COLOUR)
-
-        ax.plot(self._closed(view.R[selected]), self._closed(view.Z[selected]),
-                color=SELECTED_COLOUR, lw=2.0)
-        handles.append(Line2D([], [], color=SELECTED_COLOUR, lw=2.0,
-                              label=rf"$\psi_N$ = {view.psi_n[selected]:.4f}"))
-        ax.plot(*view.axis, marker="+", color="k", markersize=10)
-
-        ax.set_aspect("equal", adjustable="datalim")
-        ax.set_xlabel("R [m]")
-        ax.set_ylabel("Z [m]")
-        ax.set_title(f"{view.title}: magnetic coordinates, {npsi} x {ntheta}",
-                     fontsize=10)
-        ax.legend(handles=handles, loc="upper right", fontsize=7, frameon=False)
-        ax.grid(alpha=0.2)
-        self.shape_canvas.draw_idle()
 
     def _draw_profiles(self) -> None:
-        figure = self.profile_figure
-        view = self.view
-        if view is None:
-            self._profile_axes = []
-            self._placeholder(figure, "Load an equilibrium")
-            self.profile_canvas.draw_idle()
-            return
-        figure.clear()
-        axes = figure.subplots(2, 4, sharex=True)
-        self._profile_axes = list(axes.ravel())
-        kind = self.state.profile_x
-        x = view.profile_x(kind)
-        p = view.profiles
-        before = self.before
-        xb = before.profile_x(kind) if before is not None else None
-        selected = view.profile_x(kind)[view.surface_index(self.state.surface_psi_n)]
+        memory = self.profile_canvas.view_memory
+        with memory.drawing():
+            figure = self.profile_figure
+            view = self.view
+            if view is None:
+                self._profile_axes = []
+                self._placeholder(figure, "Load an equilibrium")
+                self.profile_canvas.draw_idle()
+                return
+            figure.clear()
+            axes = figure.subplots(2, 4, sharex=True)
+            self._profile_axes = list(axes.ravel())
+            kind = self.state.profile_x
+            x = view.profile_x(kind)
+            p = view.profiles
+            before = self.before
+            xb = before.profile_x(kind) if before is not None else None
+            selected = view.profile_x(kind)[view.surface_index(self.state.surface_psi_n)]
 
-        def overlay(ax, name, scale=1.0):
-            if before is not None and name in before.profiles:
-                ax.plot(xb, before.profiles[name] * scale, color=BEFORE_COLOUR,
-                        ls=":", lw=1.4, label="before")
+            def overlay(ax, name, scale=1.0):
+                if before is not None and name in before.profiles:
+                    ax.plot(xb, before.profiles[name] * scale, color=BEFORE_COLOUR,
+                            ls=":", lw=1.4, label="before")
 
-        ax = axes[0, 0]
-        ax.plot(x, p["q"], color=SURFACE_COLOUR, label="Boozer")
-        if view.file_q is not None:
-            fx = np.sqrt(view.file_q[0]) if kind == "rho_pol" else view.file_q[0]
-            ax.plot(fx, view.file_q[1], color=SPOKE_COLOUR, ls="--", lw=1.0, label="file")
-        overlay(ax, "q")
-        ax.set_title("safety factor q", fontsize=9)
-        ax.legend(fontsize=7, frameon=False)
-
-        ax = axes[0, 1]
-        ax.plot(x, p["shear"], color=SURFACE_COLOUR)
-        overlay(ax, "shear")
-        ax.set_title(r"shear $\rho_{pol}\,q'/q$", fontsize=9)
-
-        ax = axes[0, 2]
-        ax.plot(x, p["pressure"] / 1.0e3, color=SURFACE_COLOUR)
-        overlay(ax, "pressure", 1.0e-3)
-        ax.set_title("pressure [kPa]", fontsize=9)
-
-        ax = axes[0, 3]
-        ax.plot(x, p["density"] / 1.0e19,
-                color=WARNING if view.density_is_placeholder else SURFACE_COLOUR)
-        overlay(ax, "density", 1.0e-19)
-        ax.set_title("density [1e19 m^-3]", fontsize=9)
-        if view.density_is_placeholder:
-            ax.text(0.5, 0.5, "uniform placeholder:\nno density file given",
-                    transform=ax.transAxes, ha="center", va="center",
-                    fontsize=8, color=WARNING)
-
-        ax = axes[1, 0]
-        for name, colour in (("F", SURFACE_COLOUR), ("I", SPOKE_COLOUR), ("h", "#0E7466")):
-            ax.plot(x, p[name], color=colour, label=name)
-        ax.set_title("F = g, I, h = qF + I  [T m]", fontsize=9)
-        ax.legend(fontsize=7, frameon=False)
-
-        ax = axes[1, 1]
-        if "B_avg" in p:
-            ax.fill_between(x, p["B_min"], p["B_max"], color=SURFACE_COLOUR, alpha=0.18,
-                            label="min - max")
-            ax.plot(x, p["B_avg"], color=SURFACE_COLOUR, label="surface average")
+            ax = axes[0, 0]
+            ax.plot(x, p["q"], color=SURFACE_COLOUR, label="Boozer")
+            if view.file_q is not None:
+                fx = np.sqrt(view.file_q[0]) if kind == "rho_pol" else view.file_q[0]
+                ax.plot(fx, view.file_q[1], color=SPOKE_COLOUR, ls="--", lw=1.0, label="file")
+            overlay(ax, "q")
+            ax.set_title("safety factor q", fontsize=9)
             ax.legend(fontsize=7, frameon=False)
-        ax.set_title("|B| on each surface [T]", fontsize=9)
 
-        ax = axes[1, 2]
-        ax.plot(x, p["dp_dpsi"] / 1.0e3, color=SURFACE_COLOUR)
-        overlay(ax, "dp_dpsi", 1.0e-3)
-        ax.set_title(r"$dp/d\psi$ [kPa rad/Wb]", fontsize=9)
+            ax = axes[0, 1]
+            ax.plot(x, p["shear"], color=SURFACE_COLOUR)
+            overlay(ax, "shear")
+            ax.set_title(r"shear $\rho_{pol}\,q'/q$", fontsize=9)
 
-        ax = axes[1, 3]
-        ax.plot(x, p["ffprime"], color=SURFACE_COLOUR)
-        overlay(ax, "ffprime")
-        ax.set_title(r"$F\,dF/d\psi$ [T rad]", fontsize=9)
+            ax = axes[0, 2]
+            ax.plot(x, p["pressure"] / 1.0e3, color=SURFACE_COLOUR)
+            overlay(ax, "pressure", 1.0e-3)
+            ax.set_title("pressure [kPa]", fontsize=9)
 
-        label = r"$\rho_{pol}$" if kind == "rho_pol" else r"$\psi_N$"
-        for ax in self._profile_axes:
-            ax.axvline(selected, color=SELECTED_COLOUR, lw=0.9, ls="--", alpha=0.8)
-            ax.grid(alpha=0.25)
-            ax.tick_params(labelsize=8)
-        for ax in axes[1]:
-            ax.set_xlabel(label)
-        self.profile_canvas.draw_idle()
+            ax = axes[0, 3]
+            ax.plot(x, p["density"] / 1.0e19,
+                    color=WARNING if view.density_is_placeholder else SURFACE_COLOUR)
+            overlay(ax, "density", 1.0e-19)
+            ax.set_title("density [1e19 m^-3]", fontsize=9)
+            if view.density_is_placeholder:
+                ax.text(0.5, 0.5, "uniform placeholder:\nno density file given",
+                        transform=ax.transAxes, ha="center", va="center",
+                        fontsize=8, color=WARNING)
+
+            ax = axes[1, 0]
+            for name, colour in (("F", SURFACE_COLOUR), ("I", SPOKE_COLOUR), ("h", "#0E7466")):
+                ax.plot(x, p[name], color=colour, label=name)
+            ax.set_title("F = g, I, h = qF + I  [T m]", fontsize=9)
+            ax.legend(fontsize=7, frameon=False)
+
+            ax = axes[1, 1]
+            if "B_avg" in p:
+                ax.fill_between(x, p["B_min"], p["B_max"], color=SURFACE_COLOUR, alpha=0.18,
+                                label="min - max")
+                ax.plot(x, p["B_avg"], color=SURFACE_COLOUR, label="surface average")
+                ax.legend(fontsize=7, frameon=False)
+            ax.set_title("|B| on each surface [T]", fontsize=9)
+
+            ax = axes[1, 2]
+            ax.plot(x, p["dp_dpsi"] / 1.0e3, color=SURFACE_COLOUR)
+            overlay(ax, "dp_dpsi", 1.0e-3)
+            ax.set_title(r"$dp/d\psi$ [kPa rad/Wb]", fontsize=9)
+
+            ax = axes[1, 3]
+            ax.plot(x, p["ffprime"], color=SURFACE_COLOUR)
+            overlay(ax, "ffprime")
+            ax.set_title(r"$F\,dF/d\psi$ [T rad]", fontsize=9)
+
+            label = r"$\rho_{pol}$" if kind == "rho_pol" else r"$\psi_N$"
+            for ax in self._profile_axes:
+                ax.axvline(selected, color=SELECTED_COLOUR, lw=0.9, ls="--", alpha=0.8)
+                ax.grid(alpha=0.25)
+                ax.tick_params(labelsize=8)
+            for ax in axes[1]:
+                ax.set_xlabel(label)
+            for (row, column), axis in np.ndenumerate(axes):
+                memory.keep(axis, f"profile {row} {column}")
+            self.profile_canvas.draw_idle()
 
     def _draw_surface(self) -> None:
-        figure = self.surface_figure
-        view = self.view
-        if view is None:
-            self._placeholder(figure, "Load an equilibrium")
+        memory = self.surface_canvas.view_memory
+        with memory.drawing():
+            figure = self.surface_figure
+            view = self.view
+            if view is None:
+                self._placeholder(figure, "Load an equilibrium")
+                self.surface_canvas.draw_idle()
+                self.surface_label.setText("")
+                return
+            names = [name for name in self.state.surface_quantities if view.available(name)]
+            data = view.surface(self.state.surface_psi_n, names)
+            self.surface_label.setText(
+                f"nearest Boozer surface: psi_N = {data['psi_n']:.5f} "
+                f"(surface {data['index'] + 1} of {view.psi_n.size})")
+            if not names:
+                self._placeholder(figure, "Tick some quantities in the list")
+                self.surface_canvas.draw_idle()
+                return
+            figure.clear()
+            axes = figure.subplots(len(names), 1, sharex=True, squeeze=False)[:, 0]
+            theta = data["theta"] / np.pi
+            for ax, name in zip(axes, names):
+                values = data["values"][name]
+                units = view.units_of(name)
+                label = SURFACE_LABELS[name]
+                ylabel = f"{label}\n[{_units(units)}]" if units else label
+                if self.state.normalize_surface:
+                    mean = np.nanmean(view.periodic(values))
+                    if np.isfinite(mean) and mean != 0.0:
+                        values = values / mean
+                        ylabel = f"{label}\n/ {mean:.4g} {_units(units)}".rstrip()
+                ax.plot(theta, values, color=SURFACE_COLOUR, lw=1.1)
+                ax.set_ylabel(ylabel, fontsize=8)
+                ax.grid(alpha=0.25)
+                ax.tick_params(labelsize=8)
+            axes[-1].set_xlabel(r"$\Theta/\pi$ (solver-facing Boozer angle)")
+            axes[-1].set_xlim(0.0, 2.0)
+            axes[-1].set_xticks([0.0, 0.5, 1.0, 1.5, 2.0])
+            figure.suptitle(rf"$\psi_N$ = {data['psi_n']:.5f}  ({view.title})", fontsize=10)
+            for axis, name in zip(axes, names):
+                memory.keep(axis, f"surface {name}")
             self.surface_canvas.draw_idle()
-            self.surface_label.setText("")
-            return
-        names = [name for name in self.state.surface_quantities if view.available(name)]
-        data = view.surface(self.state.surface_psi_n, names)
-        self.surface_label.setText(
-            f"nearest Boozer surface: psi_N = {data['psi_n']:.5f} "
-            f"(surface {data['index'] + 1} of {view.psi_n.size})")
-        if not names:
-            self._placeholder(figure, "Tick some quantities in the list")
-            self.surface_canvas.draw_idle()
-            return
-        figure.clear()
-        axes = figure.subplots(len(names), 1, sharex=True, squeeze=False)[:, 0]
-        theta = data["theta"] / np.pi
-        for ax, name in zip(axes, names):
-            values = data["values"][name]
-            units = view.units_of(name)
-            label = SURFACE_LABELS[name]
-            ylabel = f"{label}\n[{_units(units)}]" if units else label
-            if self.state.normalize_surface:
-                mean = np.nanmean(view.periodic(values))
-                if np.isfinite(mean) and mean != 0.0:
-                    values = values / mean
-                    ylabel = f"{label}\n/ {mean:.4g} {_units(units)}".rstrip()
-            ax.plot(theta, values, color=SURFACE_COLOUR, lw=1.1)
-            ax.set_ylabel(ylabel, fontsize=8)
-            ax.grid(alpha=0.25)
-            ax.tick_params(labelsize=8)
-        axes[-1].set_xlabel(r"$\Theta/\pi$ (solver-facing Boozer angle)")
-        axes[-1].set_xlim(0.0, 2.0)
-        axes[-1].set_xticks([0.0, 0.5, 1.0, 1.5, 2.0])
-        figure.suptitle(rf"$\psi_N$ = {data['psi_n']:.5f}  ({view.title})", fontsize=10)
-        self.surface_canvas.draw_idle()
 
-    # --------------------------------------------------------- picking
+        # --------------------------------------------------------- picking
 
     def _on_shape_click(self, event) -> None:
         if (self.view is None or event.inaxes is not self.shape_axes
@@ -1220,22 +1271,35 @@ class EquilibriumWindow(QtWidgets.QMainWindow):
             self.status.showMessage(f"Wrote {path}")
 
     def _save_session(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save equilibrium session", "equilibrium_session.json", "JSON (*.json)")
-        if path:
-            self._read_widgets_into_state()
-            self.state.to_json(path)
-            self.status.showMessage(f"Wrote {path}")
+        if self.session_owner is not None:      # in the app: the whole session
+            self.session_owner.save_session()
+            return
+        path = ask_session_to_save(self, "Save equilibrium session", "equilibrium_session.h5")
+        if not path:
+            return
+        self._read_widgets_into_state()
+        try:
+            write_session(path, equilibrium=self.state)
+        except (ValueError, OSError, TypeError) as error:
+            self.status.showMessage(f"Could not save the session: {error}")
+            return
+        self.status.showMessage(f"Wrote {path}")
 
     def _load_session(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load equilibrium session", str(Path.cwd()), "JSON (*.json)")
+        if self.session_owner is not None:
+            self.session_owner.open_session()
+            return
+        path = ask_session_to_open(self, "Load equilibrium session")
         if not path:
             return
         try:
-            state = EquilibriumState.from_json(path)
+            loaded = read_session(path)
         except (ValueError, OSError, TypeError) as error:
             self.status.showMessage(f"Could not load session: {error}")
+            return
+        state = loaded.get("equilibrium") or loaded.get("continuum_equilibrium")
+        if state is None:
+            self.status.showMessage(f"{path} holds no equilibrium settings.")
             return
         self.set_state(state)
 

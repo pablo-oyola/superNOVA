@@ -1,13 +1,17 @@
 """Solving the continuum for a given state, with the expensive parts cached.
 
-No Qt here. The window owns one of these and calls it; everything below is a
-plain object so the behaviour can be tested without a display.
+No Qt here. The compute process owns one of these and calls it with the
+equilibrium the Equilibrium tab loaded; everything below is a plain object so
+the behaviour can be tested without a display.
 
-The cost structure is what shapes it: loading an equilibrium takes seconds for
-a real eqdsk, constructing a continuum takes about 0.1 s, and solving one takes
-0.05-0.2 s. So the equilibrium is rebuilt only when its inputs change, the
-continuum only when gamma_s or the species changes, and the solve runs on every
-edit.
+The equilibrium is never loaded here: it comes in, with a key that names it
+(the compute process's handle). Constructing a continuum takes about 0.1 s and
+solving one 0.05-0.2 s, so the continuum is rebuilt only when the equilibrium,
+gamma_s or the species changes, and the solve runs on every edit.
+
+Radii in a result are the physical psi_N, as in the solver tab: the solver's
+own coordinate spans only the Boozer domain, and the two differ whenever that
+domain is not (0, 1).
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import time
 
 import numpy as np
 
-from supernova.api import Case, profile_from_columns
+from supernova.api import Case
 from supernova.gui._state import ContinuumState
 
 
@@ -85,6 +89,16 @@ class ContinuumResult:
         return np.unique(np.round(np.asarray(crossings, dtype=float), 9))
 
 
+def physical_psi_n(equilibrium, x) -> np.ndarray:
+    """The physical psi_N at the solver's radial coordinate ``x``."""
+    magspace = equilibrium.magspace
+    grid = np.asarray(magspace.coords["psi"].values, dtype=float)
+    if "psi_physical_norm" not in magspace.coords:
+        return np.asarray(x, dtype=float)
+    return np.interp(np.asarray(x, dtype=float), grid,
+                     np.asarray(magspace.coords["psi_physical_norm"].values, dtype=float))
+
+
 def _harmonic_band(q_min: float, q_max: float, ntor: int, mmax: int):
     """The poloidal band solve() will use, exactly as it computes it."""
     lowest = int(np.floor(ntor * q_min)) - 3
@@ -124,55 +138,40 @@ def classification_feasibility(case, ntor: int, mmax: int) -> tuple[bool, str]:
 
 
 class ContinuumModel:
-    """Holds the loaded Case and turns a state into a result."""
+    """Holds the continuum operators for one equilibrium and solves states."""
 
     def __init__(self):
         self.case: Case | None = None
         self._equilibrium_key = None
         self._continuum_key = None
 
-    def solve(self, state: ContinuumState, *, progress=None) -> ContinuumResult:
-        """Solve for ``state``, reusing whatever is still valid.
+    def solve(self, state: ContinuumState, equilibrium, key, *,
+              progress=None) -> ContinuumResult:
+        """Solve ``state`` on ``equilibrium``, reusing whatever is still valid.
 
-        ``progress(message)`` is called before each slow step so a caller can
-        say what it is waiting for.
+        ``key`` names the equilibrium; a different key means a different one.
+        ``progress(message)`` is called before each slow step.
         """
+        from supernova.continuum import superContinuum
+
         problems = state.validate()
         if problems:
             raise ValueError(problems[0])
 
-        reloaded = state.equilibrium_key() != self._equilibrium_key
-        if reloaded:
-            if progress:
-                progress("Loading equilibrium and computing Boozer coordinates...")
-            density = profile_from_columns(
-                state.density_file,
-                units=state.density_units,
-                x=state.density_x,
-                interpolate_in=state.density_interpolate_in,
-            )
-            self.case = Case.from_eqdsk(
-                state.eqdsk,
-                cocos_in=state.cocos_in,
-                density=density,
-                pressure="eqdsk",
-                boozer_domain=(state.boozer_min, state.boozer_max),
-                gamma_s=state.gamma_s,
-                species=state.species,
-            )
-            self._equilibrium_key = state.equilibrium_key()
-            self._continuum_key = state.continuum_key()
-
-        rebuilt = state.continuum_key() != self._continuum_key
+        reloaded = key != self._equilibrium_key
+        rebuilt = reloaded or state.continuum_key() != self._continuum_key
         if rebuilt:
             if progress:
-                progress("Rebuilding the continuum operators...")
-            self.case = self.case.with_continuum(
-                gamma_s=state.gamma_s, species=state.species
-            )
+                progress("Building the continuum operators...")
+            continuum = superContinuum(equilibrium, gamma_s=float(state.gamma_s),
+                                       species=state.species, dense=True)
+            self.case = Case(equilibrium, continuum,
+                             metadata={"gamma_s": float(state.gamma_s),
+                                       "species": state.species})
+            self._equilibrium_key = key
             self._continuum_key = state.continuum_key()
 
-        psi_n = np.linspace(0.0, 1.0, int(state.npsi))
+        x = np.linspace(0.0, 1.0, int(state.npsi))
         family_code = None
         classify_note = ""
         started = time.perf_counter()
@@ -188,17 +187,17 @@ class ContinuumModel:
                     progress("Family labels unavailable here; solving without them...")
                 eigenvalues = self.case.continuum.solve(
                     ntor=int(state.ntor), which="full", normalize_eigvals=True,
-                    psi_vals=psi_n, classify=False, mmax=int(state.mmax),
+                    psi_vals=x, classify=False, mmax=int(state.mmax),
                 )
                 elapsed = time.perf_counter() - started
-                return self._pack(state, psi_n, eigenvalues, elapsed, reloaded,
+                return self._pack(state, x, eigenvalues, elapsed, reloaded,
                                   rebuilt, None, classify_note)
             if progress:
                 progress("Solving and classifying families (slower)...")
             try:
                 eigenvalues, _vectors, classifier = self.case.continuum.solve(
                     ntor=int(state.ntor), which="full", normalize_eigvals=True,
-                    psi_vals=psi_n, mmax=int(state.mmax),
+                    psi_vals=x, mmax=int(state.mmax),
                     return_eigvecs=True, classify=True,
                 )
                 family_code = np.asarray(
@@ -215,7 +214,7 @@ class ContinuumModel:
                     progress("Classification unavailable; solving without it...")
                 eigenvalues = self.case.continuum.solve(
                     ntor=int(state.ntor), which="full", normalize_eigvals=True,
-                    psi_vals=psi_n, classify=False, mmax=int(state.mmax),
+                    psi_vals=x, classify=False, mmax=int(state.mmax),
                 )
         else:
             if progress:
@@ -224,24 +223,25 @@ class ContinuumModel:
                 ntor=int(state.ntor),
                 which=state.which,
                 normalize_eigvals=True,
-                psi_vals=psi_n,
+                psi_vals=x,
                 classify=False,
                 mmax=int(state.mmax),
             )
         elapsed = time.perf_counter() - started
 
-        return self._pack(state, psi_n, eigenvalues, elapsed, reloaded,
+        return self._pack(state, x, eigenvalues, elapsed, reloaded,
                           rebuilt, family_code, classify_note)
 
-    def _pack(self, state, psi_n, eigenvalues, elapsed, reloaded, rebuilt,
+    def _pack(self, state, x, eigenvalues, elapsed, reloaded, rebuilt,
               family_code, classify_note) -> ContinuumResult:
         """Turn solver output into the result the plot wants."""
         # eigenvalues are omega**2 normalised to the on-axis Alfven frequency
-        khz = np.sqrt(eigenvalues.real).to("kHz").v / (2.0 * np.pi)
+        with np.errstate(invalid="ignore"):
+            khz = np.sqrt(eigenvalues.real).to("kHz").v / (2.0 * np.pi)
         q = np.asarray(self.case.equilibrium.qprof.data).squeeze().real
 
         return ContinuumResult(
-            psi_n=psi_n,
+            psi_n=physical_psi_n(self.case.equilibrium, x),
             frequency_khz=np.asarray(khz, dtype=float),
             which=state.which,
             ntor=int(state.ntor),
