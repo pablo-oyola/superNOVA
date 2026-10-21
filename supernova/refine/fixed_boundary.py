@@ -131,6 +131,39 @@ def drop_closing_duplicate(curve: np.ndarray) -> np.ndarray:
     return curve.copy()
 
 
+def unconverged_fit_message(fit_result, coarse, config: RefinementConfig) -> str:
+    """Why the coarse q fit stopped, and where its q residual is worst.
+
+    A residual that refuses to shrink in one region -- the reversed-shear core
+    of DIII-D 202020 with 13 knots -- usually means the knots are too sparse
+    there for the current profile that q needs.
+    """
+    x = np.asarray(fit_result.target_locations, dtype=float)
+    dq = np.interp(x, coarse.psi, coarse.q) - np.asarray(fit_result.target_q, dtype=float)
+    worst = int(np.argmax(np.abs(dq)))
+    return (
+        f"TokaMaker q fit did not converge: {fit_result.reason}. The q RMS "
+        f"{fit_result.final_rms_error:.3g} is above the "
+        f"{config.fit.target_rms_error:.3g} target, and the residual is worst, "
+        f"dq={dq[worst]:+.3f}, at psi_N={x[worst]:.2f}. "
+        f"{config.ffp_knot_count} F F' knots may be too few to shape the "
+        "current there; try more."
+    )
+
+
+def header_cocos_candidates(path: Path) -> tuple[int, ...]:
+    """The COCOS indices the g-file's header signs allow, per pyCOCOS."""
+    from pycocos.io.cocos import identify_cocos
+
+    with Path(path).open("r", encoding="ascii") as stream:
+        raw = geqdsk.read(stream)
+    q = np.asarray(raw["qpsi"], dtype=float)
+    resolution = identify_cocos(float(q[q.size // 2]), float(raw["cpasma"]),
+                                float(raw["bcentr"]), float(raw["simagx"]),
+                                float(raw["sibdry"]))
+    return tuple(int(index) for index in resolution.candidates)
+
+
 def repair_fixed_boundary_export(
     path: Path,
     *,
@@ -225,16 +258,32 @@ def refine_equilibrium(config: RefinementConfig, *, plot: bool = True) -> dict:
         spectral_max_mode=config.boozer_spectral_max_mode,
     )
 
+    header_candidates = header_cocos_candidates(config.source_eqdsk)
+    if config.source_cocos not in header_candidates:
+        print(f"Warning: the g-file header signs allow COCOS {header_candidates}, "
+              f"not the {config.source_cocos} it was read as.", flush=True)
+
     psi_axis = float(source.geometry.attrs["psi_ax"])
     psi_lcfs = float(source.geometry.attrs["psi_bdy"])
     psi_span = psi_lcfs - psi_axis
-    if not psi_span > 0.0:
-        raise ValueError(
-            "The imported equilibrium must grow outward once converted to COCOS 1."
-        )
+    if psi_span == 0.0:
+        raise ValueError("The imported equilibrium has no poloidal flux span.")
+    # In COCOS 1 the flux grows outward for one current direction and falls for
+    # the other (or for a mis-declared COCOS).  Grad-Shafranov is invariant
+    # under psi -> -psi with p' and F F' reversed, so the fit always works on
+    # the outward-growing mirror: the refined file carries |Ip| and |F|.
+    orientation = 1.0 if psi_span > 0.0 else -1.0
+    if orientation < 0.0:
+        print("The source flux falls outward in COCOS 1; refining its mirror "
+              "psi -> -psi, so the refined file has the opposite current sign.",
+              flush=True)
 
     boozer_psi = (np.asarray(boozer.deriv.psi0, dtype=float) - psi_axis) / psi_span
     boozer_q = np.abs(np.asarray(boozer.deriv.q, dtype=float))
+    # pyCOCOS orders the Boozer surfaces by ascending psi, which runs from the
+    # edge inward when the flux falls outward.
+    order = np.argsort(boozer_psi)
+    boozer_psi, boozer_q = boozer_psi[order], boozer_q[order]
     gs = source.gs_profs
     gs_psi = np.asarray(gs.rhop, dtype=float) ** 2
     gs_q = np.abs(np.asarray(gs.q, dtype=float))
@@ -262,10 +311,10 @@ def refine_equilibrium(config: RefinementConfig, *, plot: bool = True) -> dict:
     )
 
     # TokaMaker's native absolute flux decreases outward for this positive-F
-    # branch: psi_TM = psi_LCFS - psi_COCOS1.  The variable change reverses both
-    # Grad-Shafranov derivatives.
-    pressure_prime_tm = -gs_pprime
-    ffprime_tm = -gs_ffprime
+    # branch: psi_TM = orientation * (psi_LCFS - psi_COCOS1).  The variable
+    # change reverses both Grad-Shafranov derivatives.
+    pressure_prime_tm = -orientation * gs_pprime
+    ffprime_tm = -orientation * gs_ffprime
     pressure_scale_seed = float(pressure_prime_tm[0])
     ffp_x = np.linspace(0.0, 1.0, config.ffp_knot_count)
     ffp_knots = np.interp(ffp_x, gs_psi, ffprime_tm)
@@ -293,8 +342,8 @@ def refine_equilibrium(config: RefinementConfig, *, plot: bool = True) -> dict:
 
     def initial_tokamaker_psi(node_locations: np.ndarray) -> np.ndarray:
         psi_cocos1 = np.asarray(psi_interpolator(node_locations), dtype=float)
-        psi_cocos1 = np.clip(psi_cocos1, psi_axis, psi_lcfs)
-        return psi_lcfs - psi_cocos1
+        psi_cocos1 = np.clip(psi_cocos1, min(psi_axis, psi_lcfs), max(psi_axis, psi_lcfs))
+        return orientation * (psi_lcfs - psi_cocos1)
 
     F0 = abs(float(gs_F[-1]))
     Ip_source = abs(float(source._gdata["Ip"]))
@@ -328,9 +377,11 @@ def refine_equilibrium(config: RefinementConfig, *, plot: bool = True) -> dict:
     initial = workflow.solve_initial()
     fit_result = workflow.fit_coarse()
     coarse = workflow.coarse_samples
-    fine = workflow.refine()
     if coarse is None:
         raise RuntimeError("The coarse fit produced no samples.")
+    if not fit_result.converged:
+        raise RuntimeError(unconverged_fit_message(fit_result, coarse, config))
+    fine = workflow.refine()
 
     target_initial = np.interp(initial.psi, q_profile["x"], q_profile["y"])
     target_coarse = np.interp(coarse.psi, q_profile["x"], q_profile["y"])
@@ -338,8 +389,6 @@ def refine_equilibrium(config: RefinementConfig, *, plot: bool = True) -> dict:
     fine_q_relative_rms = relative_rms(fine.q, target_fine)
     Ip_relative_error = abs(fine.plasma_current - Ip_source) / Ip_source
 
-    if not fit_result.converged:
-        raise RuntimeError(f"TokaMaker q fit did not converge: {fit_result.reason}")
     if fine_q_relative_rms > config.max_fine_q_relative_rms:
         raise RuntimeError(
             f"Fine-grid q relative RMS is too large: {fine_q_relative_rms}"
@@ -382,6 +431,8 @@ def refine_equilibrium(config: RefinementConfig, *, plot: bool = True) -> dict:
         "source_eqdsk": str(config.source_eqdsk),
         "output_eqdsk": str(config.eqdsk_path),
         "source_cocos": config.source_cocos,
+        "source_cocos_header_candidates": list(header_candidates),
+        "source_flux_orientation": int(orientation),
         "output_cocos": config.output_cocos,
         "source_grid": [int(source.Rgrid.size), int(source.zgrid.size)],
         "output_grid": [nr, nz],
@@ -403,6 +454,7 @@ def refine_equilibrium(config: RefinementConfig, *, plot: bool = True) -> dict:
         "refinement_dx_sequence_m": list(config.refinement_dx_sequence),
         "refinement_stage_initializers": list(workflow.refinement_stage_initializers),
         "refinement_stage_iterations": list(workflow.refinement_stage_iterations),
+        "nonlinear_tolerance": float(workflow.nonlinear_tolerance),
         "fixed_boundary_export_repair": continuation,
     }
     config.diagnostics_path.write_text(json.dumps(diagnostics, indent=2) + "\n")

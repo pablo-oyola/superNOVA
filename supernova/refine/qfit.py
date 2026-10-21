@@ -223,6 +223,9 @@ class FixedBoundaryQFitter:
         Optional physical source-amplitude seeds installed before the warm
         solve.  These are useful when ``ffp_profile`` and ``pressure_profile``
         contain dimensional derivatives imported from an equilibrium file.
+    nonlinear_tolerance, max_nonlinear_tolerance:
+        The Picard tolerance every solve starts with, and how far
+        :meth:`_solve` may loosen it, by decades, for an iteration that stalls.
     refinement_dx_sequence:
         Optional strictly decreasing mesh-size continuation from
         ``coarse_dx`` to ``fine_dx``.  This is useful for shaped equilibria
@@ -252,6 +255,7 @@ class FixedBoundaryQFitter:
         initial_ffp_scale: float | None = None,
         initial_pressure_scale: float | None = None,
         nonlinear_tolerance: float = 1.0e-8,
+        max_nonlinear_tolerance: float = 1.0e-5,
         nonlinear_max_iterations: int = 100,
         solver_output: bool = False,
         fit_config: QFitConfig | None = None,
@@ -287,6 +291,7 @@ class FixedBoundaryQFitter:
             None if initial_pressure_scale is None else float(initial_pressure_scale)
         )
         self.nonlinear_tolerance = float(nonlinear_tolerance)
+        self.max_nonlinear_tolerance = float(max_nonlinear_tolerance)
         self.nonlinear_max_iterations = int(nonlinear_max_iterations)
         self.solver_output = bool(solver_output)
         self.fit_config = fit_config or QFitConfig()
@@ -359,6 +364,7 @@ class FixedBoundaryQFitter:
 
         self._validate_fit_config()
         cfg = self.fit_config
+        self.ffp_bounds = self._covering_ffp_bounds()
         self.fit_locations = np.linspace(*cfg.fit_range, cfg.fit_points)
         self.target_q = np.interp(self.fit_locations, self.q_x, self.q_y)
         self.q_sample_psi = np.linspace(*cfg.q_sample_range, cfg.q_sample_points)
@@ -426,6 +432,30 @@ class FixedBoundaryQFitter:
         if lower is not None and upper is not None and lower >= upper:
             raise ValueError("ffp_bounds must be ordered")
 
+    def _covering_ffp_bounds(self) -> tuple[float | None, float | None]:
+        """``ffp_bounds`` widened, where needed, to contain the source shape.
+
+        The configured bounds suit an F F' that keeps its axis sign and stays
+        within a few times its axis value.  A source whose F F' changes sign
+        (DIII-D) or peaks well off axis has knots outside them, and such a
+        knot could neither be perturbed nor kept by the fit.  A violated bound
+        therefore moves past the source's extreme knot by a quarter of the
+        shape's spread, and never by less than two finite-difference steps.
+        """
+        cfg = self.fit_config
+        lower, upper = cfg.ffp_bounds
+        margin = max(0.25 * float(np.ptp(self.ffp_y)), 2.0 * cfg.profile_fd_step_abs)
+        if lower is not None and self.ffp_y.min() < lower:
+            lower = float(self.ffp_y.min()) - margin
+        if upper is not None and self.ffp_y.max() > upper:
+            upper = float(self.ffp_y.max()) + margin
+        if (lower, upper) != tuple(cfg.ffp_bounds) and cfg.verbose:
+            shown = ", ".join("None" if v is None else f"{v:.3g}" for v in (lower, upper))
+            print(f"The source F F' shape spans [{self.ffp_y.min():.3g}, "
+                  f"{self.ffp_y.max():.3g}] of its axis value; fitting its knots "
+                  f"within [{shown}] instead of {cfg.ffp_bounds}.")
+        return lower, upper
+
     @property
     def solver(self) -> TokaMaker:
         """Return the finest completed solver, or the coarse solver."""
@@ -465,6 +495,35 @@ class FixedBoundaryQFitter:
         solver.settings.pm = self.solver_output
         solver.setup(order=self.fe_order, F0=self.F0)
         return solver
+
+    def _solve(self, solver: TokaMaker) -> tuple[Any, int]:
+        """``solver.solve``, loosening ``nl_tol`` by decades while it stalls.
+
+        A source F F' that changes sign (DIII-D) gives the Ip target only a
+        weak hold on its scale, and the Picard iteration can settle into a
+        two-state cycle a few 1e-6 above a tight tolerance.  On "Exceeded
+        maxits" the solve resumes from its stalled iterate at ten times the
+        tolerance, up to ``max_nonlinear_tolerance``.  The loosened tolerance
+        holds for every later solve and mesh, so each decade costs one
+        ``maxits`` run at most.
+        """
+        while True:
+            try:
+                equilibrium, iterations = solver.solve(return_its=True)
+                return equilibrium, int(iterations)
+            except ValueError as error:
+                loosened = 10.0 * self.nonlinear_tolerance
+                ceiling = self.max_nonlinear_tolerance * (1.0 + 1.0e-9)
+                if "maxits" not in str(error) or loosened > ceiling:
+                    raise
+                print(
+                    "The nonlinear solve stalled above "
+                    f"nl_tol={self.nonlinear_tolerance:.0e}; continuing at {loosened:.0e}.",
+                    flush=True,
+                )
+                self.nonlinear_tolerance = loosened
+                solver.settings.nl_tol = loosened
+                solver.update_settings()
 
     def _set_inputs(
         self,
@@ -528,7 +587,7 @@ class FixedBoundaryQFitter:
                 solver.p_scale = self.initial_pressure_scale
             solver.set_psi(psi_initial, update_bounds=True)
             self.initialization_used_external_psi = True
-        equilibrium, iterations = solver.solve(return_its=True)
+        equilibrium, iterations = self._solve(solver)
 
         self.initial_equilibrium = equilibrium
         self.coarse_equilibrium = equilibrium
@@ -576,13 +635,13 @@ class FixedBoundaryQFitter:
         solver = self.coarse_solver
         solver.replace_eq(source_eq=starting_equilibrium)
         self._set_inputs(solver, ffp_y, plasma_current)
-        equilibrium, iterations = solver.solve(return_its=True)
+        equilibrium, iterations = self._solve(solver)
         return self._q_at_fit_locations(solver), equilibrium, int(iterations)
 
     def _profile_fd_delta(self, knot: int) -> float:
         cfg = self.fit_config
         delta = cfg.profile_fd_step_abs
-        lower, upper = cfg.ffp_bounds
+        lower, upper = self.ffp_bounds
         if upper is not None and self.ffp_y[knot] + delta > upper:
             delta = -delta
         if lower is not None and self.ffp_y[knot] + delta < lower:
@@ -758,7 +817,7 @@ class FixedBoundaryQFitter:
             equilibrium_after = accepted_equilibrium
             iterations_after = accepted_iterations
 
-            lower, upper = cfg.ffp_bounds
+            lower, upper = self.ffp_bounds
             lower_bound = -np.inf if lower is None else lower
             upper_bound = np.inf if upper is None else upper
             for damping in cfg.damping_factors:
@@ -949,7 +1008,7 @@ class FixedBoundaryQFitter:
             stage.ffp_scale = source.ffp_scale
             stage.p_scale = source.p_scale
             stage.set_psi(psi_stage, update_bounds=True)
-            equilibrium, iterations = stage.solve(return_its=True)
+            equilibrium, iterations = self._solve(stage)
             check_q("mesh-prolongated")
             return stage, equilibrium, int(iterations), "interpolated", None
         except Exception as interpolation_or_solve_error:
@@ -971,7 +1030,7 @@ class FixedBoundaryQFitter:
                 print(
                     f"retrying dx={mesh_dx:g} from the external absolute-psi seed"
                 )
-            equilibrium, iterations = stage.solve(return_its=True)
+            equilibrium, iterations = self._solve(stage)
             check_q("externally warm-started")
             return stage, equilibrium, int(iterations), "external", first_error
         except Exception as external_warm_start_error:
@@ -985,7 +1044,7 @@ class FixedBoundaryQFitter:
         stage.replace_eq(source_eq=stage_baseline)
         self._set_inputs(stage, self.ffp_y, self._Ip_fit)
         stage.init_psi()
-        equilibrium, iterations = stage.solve(return_its=True)
+        equilibrium, iterations = self._solve(stage)
         combined_error = (
             f"mesh continuation: {first_error}; "
             f"external seed: {second_error}"
