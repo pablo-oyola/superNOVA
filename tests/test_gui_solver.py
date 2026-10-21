@@ -126,7 +126,7 @@ def test_a_combined_modelocate_label_is_drawn_as_its_first_flag():
 
 def test_the_solve_key_ignores_what_only_changes_the_drawing():
     base = SolverState()
-    for field, value in (("field", "p1"), ("part", "abs"),
+    for field, value in (("field", "p1"), ("part", "abs"), ("mode_view", "harmonics"),
                          ("continuum_preview", False), ("gap_only", True),
                          ("workers", 7), ("threads_per_worker", 1)):
         changed = SolverState.from_dict({**base.to_dict(), field: value})
@@ -144,7 +144,7 @@ def test_a_three_tab_session_round_trips(tmp_path):
     from supernova.gui._equilibrium import EquilibriumState
     from supernova.gui._state import ContinuumState
 
-    path = tmp_path / "session.json"
+    path = tmp_path / "session.h5"
     states = dict(equilibrium=EquilibriumState(source="itpa", refine_share=False),
                   continuum=ContinuumState(ntor=5),
                   solver=SolverState(nev=3, modelocate={"core_edge": 0.1}))
@@ -160,6 +160,152 @@ def test_a_continuum_only_session_from_the_old_window_still_loads(tmp_path):
     loaded = read_session(path)
     assert set(loaded) == {"continuum"}
     assert loaded["continuum"].ntor == 7
+
+
+def _small_result():
+    """A pass in miniature: three modes from two of three windows."""
+    import xarray as xr
+
+    from supernova.gui._solver import SolverResult, WindowRow
+
+    rng = np.random.default_rng(0)
+    found_by = np.array([0, 1, 1])
+    omega = rng.normal(size=3) + 1j * rng.normal(size=3)
+    dataset = xr.Dataset(
+        {"omega": ("eigenpair", omega),
+         "eigenvector": (("eigenpair", "dof"),
+                         rng.normal(size=(3, 6)) + 1j * rng.normal(size=(3, 6)))},
+        coords={"eigenpair": np.arange(3), "window": ("eigenpair", found_by),
+                "dof": np.arange(6)},
+        attrs={"ntor": 6, "apply_bcs": True, "sound_model": "ideal"})
+    located = xr.Dataset(
+        {"mode_label": ("eigenpair", np.array(["gap", "continuum", "spike|core"])),
+         "envelope": (("eigenpair", "x"), rng.random((3, 5)))},
+        coords={"eigenpair": np.arange(3), "x": np.linspace(0.0, 1.0, 5)},
+        attrs={"method": "modelocate", "core_edge": 0.05})
+    windows = (WindowRow(0, (60.0, 68.0), 4, nconv=1, kept=1),
+               WindowRow(1, (68.0, 76.0), 4, nconv=2, kept=2, reason="-1",
+                         status="unconverged"),
+               WindowRow(2, (76.0, 84.0), 4, status="failed", message="no luck"))
+    return SolverResult(
+        state=SolverState(nev=4), title="test", windows=windows, dataset=dataset,
+        frequency_khz=np.array([65.0, 69.0, 70.0]), omega=omega,
+        center=rng.random(3), width=rng.random(3), dominant_m=np.array([10, 11, 10]),
+        backward_error=np.array([1e-12, 1e-11, np.nan]), window_of=found_by,
+        located=located, crossings=(np.empty(0), np.array([0.2]), np.array([0.3, 0.5])),
+        x=np.linspace(0.0, 1.0, 5), m_pol=np.array([10, 11]),
+        fields={"xi_psi": rng.normal(size=(3, 5, 2)) + 1j * rng.normal(size=(3, 5, 2))},
+        envelope_x=np.linspace(0.0, 1.0, 5), continuum_x=np.linspace(0.0, 1.0, 4),
+        continuum_khz=np.array([[60.0, np.nan]] * 4), psi_core=0.0025, psi_edge=0.92,
+        walls=(0.0025, 0.9025), seconds=1.5, equilibrium=None, handle=7)
+
+
+def test_a_session_keeps_the_pass_window_by_window(tmp_path):
+    """Everything a pass holds comes back as it was, the eigenpairs filed by window."""
+    import dataclasses
+
+    import h5py
+    import xarray as xr
+
+    from supernova.gui._model import ContinuumResult
+    from supernova.gui._solver import RefineResult
+
+    result = _small_result()
+    refinement = RefineResult(
+        state=SolverState(refine_levels=2), title="test", modes=(0,),
+        rows=({"mode": 0, "level": 0, "h_mm": 4.0, "frequency_khz": float("nan")},
+              {"mode": 0, "level": 1, "h_mm": 2.0, "frequency_khz": 65.1}),
+        x=np.linspace(0.0, 1.0, 5), envelopes={0: np.ones((1, 5))},
+        path={0: {"label": "gap", "alpha": 0.01, "drift": 1e-8, "correlation": 0.999}},
+        seconds=3.0, handle=7)
+    continuum = ContinuumResult(
+        psi_n=np.linspace(0.0, 1.0, 4), frequency_khz=np.ones((4, 2)), which="alfven",
+        ntor=6, gamma_s=0.0, q_min=1.0, q_max=2.0, solve_seconds=0.01,
+        reloaded_equilibrium=True, rebuilt_continuum=False)
+    key = ("itpa", 1.0, 10.0, 3.0, 1.71, 1.87, 1, 48, 48, 20)
+    path = tmp_path / "session.h5"
+    write_session(path, solver=SolverState(nev=4), results={
+        "continuum": {"result": continuum, "equilibrium_key": key},
+        "solver": {"result": result, "refinement": refinement, "selected": 2,
+                   "log": "solved\n" * 20000, "equilibrium_key": key}})
+
+    with h5py.File(path, "r") as h5:
+        windows = h5["solver/result/windows"]
+        assert list(windows) == ["w000", "w001", "w002"]
+        assert windows["w001/eigenpairs/omega"].shape == (2,)
+        assert "eigenpairs" not in windows["w002"]       # it found nothing
+
+    loaded = read_session(path)
+    assert loaded["solver"] == SolverState(nev=4)
+    solver = loaded["results"]["solver"]
+    assert solver["equilibrium_key"] == key and solver["selected"] == 2
+    assert solver["log"] == "solved\n" * 20000            # longer than an attribute holds
+    back = solver["result"]
+    xr.testing.assert_identical(back.dataset, result.dataset)
+    xr.testing.assert_identical(back.located, result.located)
+    assert back.windows == result.windows and back.state == result.state
+    assert back.handle is None                    # the compute process names it anew
+    for item in dataclasses.fields(result):
+        mine, theirs = getattr(result, item.name), getattr(back, item.name)
+        if isinstance(mine, np.ndarray):
+            np.testing.assert_array_equal(theirs, mine)
+            assert theirs.dtype == mine.dtype, item.name
+    for mine, theirs in zip(result.crossings, back.crossings, strict=True):
+        np.testing.assert_array_equal(theirs, mine)
+    np.testing.assert_array_equal(back.fields["xi_psi"], result.fields["xi_psi"])
+    assert back.labels[2] == "spike|core"
+
+    refined = solver["refinement"]
+    assert refined.path == refinement.path and refined.modes == (0,)
+    assert np.isnan(refined.rows[0]["frequency_khz"]) and refined.rows[1] == refinement.rows[1]
+    np.testing.assert_array_equal(refined.envelopes[0], refinement.envelopes[0])
+    continuum_back = loaded["results"]["continuum"]["result"]
+    assert continuum_back.which == "alfven" and continuum_back.reloaded_equilibrium is True
+    np.testing.assert_array_equal(continuum_back.frequency_khz, continuum.frequency_khz)
+
+
+def test_path_verdicts_follow_the_thresholds_without_a_solve():
+    """Every mode keeps its drift and correlation; moving a threshold relabels."""
+    import dataclasses
+
+    import xarray as xr
+
+    from supernova.gui._solver import SolverResult
+
+    small = _small_result()
+    located = small.located.copy()
+    located["path_drift"] = ("eigenpair", np.array([2.0e-5, 6.0e-4, np.nan]))
+    located["path_correlation"] = ("eigenpair", np.array([0.99, 0.95, np.nan]))
+    located["path_alpha"] = ("eigenpair", np.array([0.05, 0.05, 0.05]))
+    located["path_ideal"] = ("eigenpair", np.array([False, False, False]))
+    located.attrs["method"] = "global_path"
+    result = dataclasses.replace(small, located=located,
+                                 state=SolverState(mode_filter="path"))
+    assert isinstance(result, SolverResult)
+
+    strict = result.with_path_thresholds(3.0e-4, 0.9)
+    assert list(strict.labels) == ["gap", "continuum", "inconclusive"]
+    loose = strict.with_path_thresholds(1.0e-3, 0.9)
+    assert list(loose.labels) == ["gap", "gap", "inconclusive"]
+    assert list(loose.with_path_thresholds(1.0e-3, 0.97).labels) == [
+        "gap", "continuum", "inconclusive"]
+    # the measurements and the solve itself are untouched
+    xr.testing.assert_identical(loose.located["path_drift"], located["path_drift"])
+    assert loose.state.solve_key() == result.state.solve_key()
+    assert loose.state.path_tolerance == 1.0e-3
+    # a MODELOCATE pass has nothing to re-judge
+    assert small.with_path_thresholds(1.0, 0.0) is small
+
+
+def test_one_tabs_old_json_file_opens_in_that_tab(tmp_path):
+    """The tabs' own buttons used to save their bare state; those open again."""
+    from supernova.gui._equilibrium import EquilibriumState
+
+    for name, state in (("equilibrium", EquilibriumState(source="itpa", itpa_ns=40)),
+                        ("solver", SolverState(nev=7))):
+        path = tmp_path / f"{name}.json"
+        state.to_json(path)
+        assert read_session(path) == {name: state}
 
 
 def test_an_unknown_section_is_refused_by_name(tmp_path):

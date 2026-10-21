@@ -24,7 +24,7 @@ window stays responsive through a solve of any length.
 
 from __future__ import annotations
 
-from pathlib import Path
+import dataclasses
 import os
 import sys
 
@@ -42,7 +42,10 @@ from supernova.gui._qt import (
     Collapsible,
     ComputeClient,
     DataclassForm,
+    LegendToggles,
     SciEdit,
+    ask_session_to_open,
+    ask_session_to_save,
     double_spin,
     figure_page,
     int_spin,
@@ -50,13 +53,17 @@ from supernova.gui._qt import (
     toolbar_is_busy,
 )
 from supernova.gui._equilibrium import same_equilibrium
+from supernova.gui._session import read_session, write_session
 from supernova.gui._solver import (
+    BACKWARD_ERROR_GATE,
     FACTORIZATIONS,
     FIELDS,
     FILTER_TITLES,
     LOCATE_ORDER,
     LOCATE_STYLE,
     MODE_FILTERS,
+    MODE_VIEW_TITLES,
+    MODE_VIEWS,
     PARTS,
     PEP_TYPES,
     SOUND_MODELS,
@@ -79,14 +86,23 @@ PREVIEW_DEBOUNCE_MS = 400
 PICK_PIXELS = 12
 CONTINUUM_COLOUR = "#708090"
 SELECTED_COLOUR = "#A33636"
+# past this many harmonics the legend names only the strongest; the rest share
+# one entry that hides and shows them together
+LEGEND_HARMONICS = 12
+WEAKER_HARMONICS = "weaker harmonics"
+WEAKER_COLOUR = "#CDB08A"
 MODE_HEADERS = ("mode", "f [kHz]", "Im/Re omega", "filter", "peak rho_pol",
                 "centre psi_N", "width", "dominant m", "backward error", "window")
 REFINE_HEADERS = ("mode", "mesh", "elements", "h at mode [mm]", "f [kHz]", "change [kHz]",
                   "Im/Re omega", "correlation", "FWHM [mm]", "backward error")
 GAP_COLOUR = "#7A4FB5"
+VERDICT_COLOURS = {"gap": "#159A8A", "continuum-coupled": "#2B5EA6", "continuum": "#D64B5F",
+                   "inconclusive": "#B45309"}
 RESOLUTION_COLOURS = {"resolved": "#159A8A", "marginal": "#E39A31", "coarse": "#D64B5F"}
-WINDOW_HEADERS = ("window", "range [kHz]", "converged", "kept", "nev",
+WINDOW_HEADERS = ("window", "range [kHz]", "converged", "kept", "dropped", "nev",
                   "iterations", "SLEPc stopped", "seconds", "status")
+# the path test's measurements, after the mode table's own columns
+PATH_HEADERS = ("path drift", "path correlation", "path alpha")
 
 
 class SolverWindow(QtWidgets.QMainWindow):
@@ -104,6 +120,8 @@ class SolverWindow(QtWidgets.QMainWindow):
         self.result: SolverResult | None = None
         self.selected: int | None = None
         self.refinement: RefineResult | None = None
+        self._restored: dict | None = None   # a session's results, until their equilibrium loads
+        self.session_owner = None            # in the app: the window whose session the buttons save
         self._refining = False
         self._refine_job = None
         self._gap_points = []                # (pixel-space picking) gap estimates drawn
@@ -244,6 +262,10 @@ class SolverWindow(QtWidgets.QMainWindow):
             "PEP. Accepts fractions like 5/3.")
         self.species_combo = QtWidgets.QComboBox()
         self.species_combo.addItems(SPECIES)
+        self.species_combo.setEnabled(False)
+        self.species_combo.setToolTip(
+            "Set in the Equilibrium tab, next to the density: every tab uses the "
+            "same ions.")
         grid.addWidget(QtWidgets.QLabel("gamma_s / species"), 2, 0)
         grid.addWidget(self.gamma_combo, 2, 1)
         grid.addWidget(self.species_combo, 2, 2)
@@ -262,7 +284,7 @@ class SolverWindow(QtWidgets.QMainWindow):
         grid.addWidget(QtWidgets.QLabel("sound"), 3, 0)
         grid.addWidget(self.sound_combo, 3, 1, 1, 2)
         for widget in (self.ntor_spin, self.mmax_spin, self.max_dm_spin,
-                       self.regularizer_edit, self.species_combo, self.sound_combo):
+                       self.regularizer_edit, self.sound_combo):
             self._connect(widget)
         self.gamma_combo.lineEdit().editingFinished.connect(self._on_edit)
         self.gamma_combo.activated.connect(self._on_edit)
@@ -399,10 +421,10 @@ class SolverWindow(QtWidgets.QMainWindow):
             "MODELOCATE judges each envelope on the grid: a gap mode unless it "
             "is a one-point spike, in the core, at the edge, or above the "
             "continuum level next to a continuum crossing.\n"
-            "The global path keeps the spike, core and edge tests and replaces "
-            "the continuum one: every remaining mode is re-solved on the complex "
-            "radial paths +alpha and -alpha. A discrete mode stays put; a "
-            "continuum approximant moves. Costs two extra solves per mode.")
+            "The global path is a separate filter, with none of MODELOCATE's "
+            "tests: every mode is re-solved on the complex radial paths +alpha "
+            "and -alpha. A discrete mode stays put; a continuum approximant "
+            "moves. Costs two extra solves per mode.")
         layout.addWidget(self.filter_combo)
         self.filter_intro = QtWidgets.QLabel()
         self.filter_intro.setWordWrap(True)
@@ -428,10 +450,11 @@ class SolverWindow(QtWidgets.QMainWindow):
             "Largest relative change of omega on a path for a mode to count as "
             "invariant. It must exceed the path's own discretization error, "
             "which is larger on a coarse mesh (a resolved gap mode moves "
-            "1e-5 - 1e-4; a continuum approximant 1e-3 and more)."))
+            "1e-5 - 1e-4; a continuum approximant 1e-3 and more). Applied after "
+            "the solve: change it and the labels follow, nothing is solved again."))
         self.path_correlation_spin = double_spin(0.1, 1.0, 0.9, 3, 0.01, tooltip=(
             "Smallest harmonic correlation with the real-axis mode for a path "
-            "root to be the same mode."))
+            "root to be the same mode. Applied after the solve, like the tolerance."))
         path.addWidget(QtWidgets.QLabel("tolerance / correlation"), 1, 0)
         path.addWidget(self.path_tolerance_edit, 1, 1)
         path.addWidget(self.path_correlation_spin, 1, 2)
@@ -442,9 +465,11 @@ class SolverWindow(QtWidgets.QMainWindow):
         path.addWidget(self.path_nev_spin, 2, 1)
         layout.addWidget(self.path_box)
         for widget in (self.filter_combo, self.alpha_max_spin, self.kappa_spin,
-                       self.path_tolerance_edit, self.path_correlation_spin,
                        self.path_nev_spin):
             self._connect(widget)
+        # judged again on the spot: the pass keeps every mode's drift and correlation
+        self.path_tolerance_edit.valueChanged.connect(self._on_path_thresholds)
+        self.path_correlation_spin.valueChanged.connect(self._on_path_thresholds)
 
         self.gap_only_check = QtWidgets.QCheckBox("show gap modes only")
         self.gap_only_check.toggled.connect(self._on_view_edit)
@@ -533,7 +558,7 @@ class SolverWindow(QtWidgets.QMainWindow):
         return box
 
     def _spectrum_page(self) -> QtWidgets.QWidget:
-        page, self.spectrum_figure, self.spectrum_canvas = figure_page(self, (8.0, 5.5))
+        page, self.spectrum_figure, self.spectrum_canvas = figure_page(self, (8.0, 5.5), self._draw_spectrum)
         self.spectrum_canvas.mpl_connect("button_press_event", self._on_spectrum_click)
         self.spectrum_canvas.mpl_connect("motion_notify_event", self._on_spectrum_hover)
         self.mode_table = QtWidgets.QTableWidget()
@@ -561,9 +586,22 @@ class SolverWindow(QtWidgets.QMainWindow):
         row.addWidget(self.field_combo)
         row.addWidget(QtWidgets.QLabel("part"))
         row.addWidget(self.part_combo)
+        self.mode_view_combo = QtWidgets.QComboBox()
+        for name in MODE_VIEWS:
+            self.mode_view_combo.addItem(MODE_VIEW_TITLES[name], name)
+        self.mode_view_combo.setToolTip(
+            "harmonics: the mode alone, over MODELOCATE's envelope. On the continuum: the "
+            "continuum in kHz, with the harmonics drawn about the mode's frequency (zero on "
+            "its dashed line), to read the structure against the crossings.")
+        row.addWidget(QtWidgets.QLabel("view"))
+        row.addWidget(self.mode_view_combo)
         row.addStretch(1)
+        hint = QtWidgets.QLabel("click a legend entry to hide it; double-click to show it alone")
+        hint.setStyleSheet(f"color: {MUTED}")
+        row.addWidget(hint)
         layout.addLayout(row)
-        figure, self.mode_figure, self.mode_canvas = figure_page(self, (8.0, 5.5))
+        figure, self.mode_figure, self.mode_canvas = figure_page(self, (8.0, 5.5), self._draw_mode)
+        self.mode_toggles = LegendToggles(self.mode_canvas, self._draw_mode)
         layout.addWidget(figure, 1)
         self.reason_label = QtWidgets.QLabel()
         self.reason_label.setWordWrap(True)
@@ -571,6 +609,7 @@ class SolverWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.reason_label)
         self.field_combo.currentIndexChanged.connect(self._on_view_edit)
         self.part_combo.currentIndexChanged.connect(self._on_view_edit)
+        self.mode_view_combo.currentIndexChanged.connect(self._on_view_edit)
         return page
 
     def _windows_page(self) -> QtWidgets.QWidget:
@@ -601,8 +640,13 @@ class SolverWindow(QtWidgets.QMainWindow):
             "Select modes in the Spectrum table, then press 'Refine selected modes'.")
         self.refine_summary.setWordWrap(True)
         self.refine_summary.setTextFormat(QtCore.Qt.RichText)
-        layout.addWidget(self.refine_summary)
-        figure, self.refine_figure, self.refine_canvas = figure_page(self, (8.0, 4.0))
+        self.refine_summary.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        summary = QtWidgets.QScrollArea()
+        summary.setWidget(self.refine_summary)
+        summary.setWidgetResizable(True)
+        summary.setMaximumHeight(220)
+        layout.addWidget(summary)
+        figure, self.refine_figure, self.refine_canvas = figure_page(self, (8.0, 4.0), self._draw_refinement)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         splitter.addWidget(figure)
         self.refine_table = QtWidgets.QTableWidget()
@@ -672,6 +716,7 @@ class SolverWindow(QtWidgets.QMainWindow):
         self.preview_check.setChecked(s.continuum_preview)
         self.field_combo.setCurrentIndex(max(self.field_combo.findData(s.field), 0))
         self.part_combo.setCurrentText(s.part)
+        self.mode_view_combo.setCurrentIndex(max(self.mode_view_combo.findData(s.mode_view), 0))
         self._loading_ui = False
 
     def _read_widgets_into_state(self) -> None:
@@ -682,8 +727,7 @@ class SolverWindow(QtWidgets.QMainWindow):
         s.max_dm = self.max_dm_spin.value()
         s.regularizer = self.regularizer_edit.value()
         s.gamma_s = _parse_gamma(self.gamma_combo.currentText())
-        s.species = self.species_combo.currentText()
-        s.sound_model = self.sound_combo.currentData()
+        s.sound_model = self.sound_combo.currentData()   # species: from the equilibrium
         s.f_low_khz = self.f_low.value()
         s.f_high_khz = self.f_high.value()
         s.window_width_khz = self.window_width.value()
@@ -723,9 +767,12 @@ class SolverWindow(QtWidgets.QMainWindow):
         s.continuum_preview = self.preview_check.isChecked()
         s.field = self.field_combo.currentData()
         s.part = self.part_combo.currentText()
+        s.mode_view = self.mode_view_combo.currentData()
 
     def set_state(self, state: SolverState) -> None:
         self.state = state
+        if self.view is not None:
+            state.species = self.view.species     # the Equilibrium tab's, always
         self._write_state_to_widgets()
         self._on_edit()
 
@@ -756,6 +803,7 @@ class SolverWindow(QtWidgets.QMainWindow):
             return
         self.state.field = self.field_combo.currentData()
         self.state.part = self.part_combo.currentText()
+        self.state.mode_view = self.mode_view_combo.currentData()
         self.state.gap_only = self.gap_only_check.isChecked()
         self.state.resolution_target = self.target_combo.currentData()
         self._update_resolution_guide()
@@ -767,15 +815,40 @@ class SolverWindow(QtWidgets.QMainWindow):
         self._draw_spectrum()
         self._draw_mode()
 
+    def _on_path_thresholds(self, *_) -> None:
+        """Re-judge a path pass at the new thresholds; nothing is solved again."""
+        if self._loading_ui:
+            return
+        self._on_edit()
+        result = self.result
+        if result is None or result.filter_method != "path" or self._result_is_stale():
+            return
+        self.result = result.with_path_thresholds(self.state.path_tolerance,
+                                                  self.state.path_correlation)
+        if (self.state.gap_only and self.selected is not None
+                and self.result.labels[self.selected] != "gap"):
+            gaps = np.flatnonzero(self.result.labels == "gap")
+            self.selected = int(gaps[0]) if gaps.size else None
+        counts = ", ".join(f"{count} {label}" for label, count
+                           in sorted(self.result.label_counts().items()))
+        self.status.showMessage(f"Path verdicts at tolerance {self.state.path_tolerance:g}, "
+                                f"correlation {self.state.path_correlation:g}: {counts}")
+        self._fill_mode_table()
+        self._draw_spectrum()
+        self._draw_mode()
+
     def _update_derived(self) -> None:
         s = self.state
         path = s.mode_filter == "path"
         self.path_box.setVisible(path)
+        self.locate_form.setVisible(not path)
         self.filter_intro.setText(
-            "MODELOCATE's spike, core and edge tests run first; every mode they "
-            "pass is then re-solved on the paths +alpha and -alpha, alpha kept "
+            "Every mode is re-solved on the paths +alpha and -alpha, alpha kept "
             "below kappa x the singular-point distance of the continuum extrema "
-            "next to it. The continuum level is not used." if path else
+            "next to it; MODELOCATE does not run. Each mode keeps how far it "
+            "moved and how its shape held (the table's path columns), and the "
+            "tolerance and correlation decide the label after the solve: change "
+            "them to re-judge the pass without solving it again." if path else
             "Each mode's envelope sum_m |xi_m| is judged on the grid's "
             "breakpoints: a gap mode unless it peaks on one point, inside the "
             "core edge, outside the boundary edge, or above the continuum level "
@@ -812,6 +885,11 @@ class SolverWindow(QtWidgets.QMainWindow):
             return []
         low, high = self.state.band
         return [gap for gap in preview.gaps if gap.f_high > low and gap.f_low < high]
+
+    def _gap_marker_f(self, gap) -> float:
+        """Where a gap's marker sits: the middle of its part inside the band."""
+        low, high = self.state.band
+        return 0.5 * (max(gap.f_low, low) + min(gap.f_high, high))
 
     def _resolution(self, gap) -> tuple[str, float, float]:
         """``(verdict, current element, guide element)`` at ``gap``, in mm."""
@@ -854,12 +932,20 @@ class SolverWindow(QtWidgets.QMainWindow):
 
     def set_equilibrium(self, view) -> None:
         """Take the equilibrium the equilibrium tab passes on."""
+        if not same_equilibrium(view, self.view):
+            # a new equilibrium: the zooms chosen on the old one no longer apply
+            for canvas in (self.spectrum_canvas, self.mode_canvas, self.refine_canvas):
+                canvas.view_memory.forget()
         self.view = view
         self.preview = None
+        if self.state.species != view.species:
+            self.state.species = view.species
+            self._write_state_to_widgets()
         self._update_resolution_guide()
         self._refresh_equilibrium_label()
         self._schedule_preview()
         self._draw_spectrum()
+        self._adopt_restored()
 
     def _refresh_equilibrium_label(self) -> None:
         view = self.view
@@ -877,7 +963,8 @@ class SolverWindow(QtWidgets.QMainWindow):
                      "scale would be wrong. Give the Equilibrium tab a density "
                      "file before solving.</span>")
         elif "n_axis_m3" in s:
-            text += f", n<sub>axis</sub> = {s['n_axis_m3']:.3g} m<sup>-3</sup>"
+            text += (f", n<sub>axis</sub> = {s['n_axis_m3']:.3g} m<sup>-3</sup> of "
+                     f"{_escape(view.species)}")
         self.equilibrium_label.setText(text)
 
     # -------------------------------------------------------------- preview
@@ -953,6 +1040,7 @@ class SolverWindow(QtWidgets.QMainWindow):
             return
 
         self._solving = True
+        self._restored = None                 # a session's solve would overwrite this one
         self.solve_button.setEnabled(False)
         self.solve_action.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -988,16 +1076,8 @@ class SolverWindow(QtWidgets.QMainWindow):
 
     def _on_solved(self, result: SolverResult) -> None:
         self._finish_solving()
-        self.result = result
-        self.export_action.setEnabled(result.mode_count > 0)
-        labels = result.labels
-        gaps = np.flatnonzero(labels == "gap")
-        self.selected = (int(gaps[0]) if gaps.size
-                         else (0 if result.mode_count else None))
-        self._fill_mode_table()
-        self._fill_window_table()
-        self._draw_spectrum()
-        self._draw_mode()
+        self._show_result(result)
+        gaps = np.flatnonzero(result.labels == "gap")
         statuses = {}
         for window in result.windows:
             statuses[window.status] = statuses.get(window.status, 0) + 1
@@ -1007,9 +1087,28 @@ class SolverWindow(QtWidgets.QMainWindow):
                    f"{result.seconds:.1f} s  |  windows: "
                    + ", ".join(f"{n} {key}" for key, n in statuses.items()))
         self.status.showMessage(message)
-        self._update_refine_button()
         self._append_log(message + (f"\n{FILTER_TITLES[result.filter_method]}: " + counts
                                     if counts else "") + "\n")
+
+    def _show_result(self, result: SolverResult, selected: int | None = None) -> None:
+        """Put a pass on show, with ``selected`` picked, else its first gap mode.
+
+        A path pass is judged at the thresholds set now, which may have moved
+        while it was solving.
+        """
+        result = result.with_path_thresholds(self.state.path_tolerance,
+                                              self.state.path_correlation)
+        self.result = result
+        self.export_action.setEnabled(result.mode_count > 0)
+        if selected is None or not 0 <= selected < result.mode_count:
+            gaps = np.flatnonzero(result.labels == "gap")
+            selected = int(gaps[0]) if gaps.size else (0 if result.mode_count else None)
+        self.selected = selected
+        self._fill_mode_table()
+        self._fill_window_table()
+        self._draw_spectrum()
+        self._draw_mode()
+        self._update_refine_button()
 
     def _on_failed(self, message: str, detail: str) -> None:
         self._finish_solving()
@@ -1041,12 +1140,15 @@ class SolverWindow(QtWidgets.QMainWindow):
 
     def _fill_mode_table(self) -> None:
         rows = self._visible_rows()
-        set_rows(self.mode_table, MODE_HEADERS, [
+        path = self.result is not None and self.result.filter_method == "path"
+        set_rows(self.mode_table, MODE_HEADERS + (PATH_HEADERS if path else ()), [
             (row["mode"], round(row["frequency_khz"], 4),
              float(f"{row['growth_ratio']:.3e}"), row["label"],
              round(row["peak_rho"], 4), round(row["center"], 4),
              round(row["width"], 4), row["dominant_m"],
              float(f"{row['backward_error']:.3e}"), row["window"])
+            + ((_number(row["path_drift"], "{:.2e}"), _number(row["path_correlation"], "{:.4f}"),
+                _number(row["path_alpha"], "{:.3g}")) if path else ())
             for row in rows])
         for index, row in enumerate(rows):
             style = LOCATE_STYLE.get(locate_family(row["label"]))
@@ -1062,7 +1164,8 @@ class SolverWindow(QtWidgets.QMainWindow):
         windows = result.windows if result else ()
         set_rows(self.window_table, WINDOW_HEADERS, [
             (w.window, f"{w.range_khz[0]:.3f} - {w.range_khz[1]:.3f}", w.nconv,
-             w.kept, w.nev, w.iterations, w.reason_text, round(w.seconds, 2), w.status)
+             w.kept, w.dropped, w.nev, w.iterations, w.reason_text, round(w.seconds, 2),
+             w.status)
             for w in windows], colours=[STATUS_COLOURS.get(w.status) for w in windows])
         self.window_message.setText("")
         if result is None:
@@ -1070,9 +1173,12 @@ class SolverWindow(QtWidgets.QMainWindow):
         statuses = {}
         for window in windows:
             statuses[window.status] = statuses.get(window.status, 0) + 1
+        dropped = sum(window.dropped for window in windows)
         self.window_summary.setText(
             f"<b>{len(windows)} windows</b>: "
             + ", ".join(f"{n} {key}" for key, n in statuses.items())
+            + (f"; <span style='color:{WARNING}'>{dropped} root(s) dropped for a backward "
+               f"error above {BACKWARD_ERROR_GATE:g}</span>" if dropped else "")
             + ". Select a row to see its SLEPc message, if it raised one.")
 
     def _on_window_selection(self) -> None:
@@ -1138,178 +1244,284 @@ class SolverWindow(QtWidgets.QMainWindow):
         return None
 
     def _draw_spectrum(self) -> None:
-        figure = self.spectrum_figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        self.spectrum_axes = ax
-        s = self.state
-        stale = self._result_is_stale()
-        low, high = s.f_low_khz, s.f_high_khz
-        margin = 0.06 * max(high - low, 1.0e-9)
+        memory = self.spectrum_canvas.view_memory
+        with memory.drawing():
+            figure = self.spectrum_figure
+            figure.clear()
+            ax = figure.add_subplot(111)
+            self.spectrum_axes = ax
+            s = self.state
+            stale = self._result_is_stale()
+            low, high = s.f_low_khz, s.f_high_khz
+            margin = 0.06 * max(high - low, 1.0e-9)
 
-        continuum = self._continuum_to_draw()
-        if continuum is not None:
-            ax.plot(continuum[0], continuum[1], color=CONTINUUM_COLOUR, lw=0.6, alpha=0.6)
+            continuum = self._continuum_to_draw()
+            if continuum is not None:
+                ax.plot(continuum[0], continuum[1], color=CONTINUUM_COLOUR, lw=0.6, alpha=0.6)
 
-        # windows: the solve's own while current, otherwise the planned ones
-        current = self.result is not None and not stale
-        if current:
-            ranges = [w.range_khz for w in self.result.windows]
-            statuses = [w.status for w in self.result.windows]
-        else:
-            try:
-                ranges = s.windows_khz() if not s.validate() else []
-            except ValueError:
-                ranges = []
-            statuses = []
-        for index, (bottom, top) in enumerate(ranges):
-            ax.axhspan(bottom, top, color="#2B5EA6" if index % 2 else "#0E7466",
-                       alpha=0.09, lw=0)
-            ax.axhline(bottom, color="0.6", lw=0.3)
-        strip = ax.get_yaxis_transform()
-        for (bottom, top), status in zip(ranges, statuses):
-            ax.add_patch(Rectangle((1.0, bottom), 0.018, top - bottom, transform=strip,
-                                   color=STATUS_COLOURS.get(status, "#78879D"),
-                                   clip_on=False, lw=0))
-        for edge in (low, high):
-            ax.axhline(edge, color="0.3", lw=0.8, ls="--")
-        if current:
-            for wall in self.result.walls:
-                if 0.0 < wall < 1.0:
-                    ax.axvline(wall, color="0.3", lw=0.8, ls=":")
+            # windows: the solve's own while current, otherwise the planned ones
+            current = self.result is not None and not stale
+            if current:
+                ranges = [w.range_khz for w in self.result.windows]
+                statuses = [w.status for w in self.result.windows]
+            else:
+                try:
+                    ranges = s.windows_khz() if not s.validate() else []
+                except ValueError:
+                    ranges = []
+                statuses = []
+            for index, (bottom, top) in enumerate(ranges):
+                ax.axhspan(bottom, top, color="#2B5EA6" if index % 2 else "#0E7466",
+                           alpha=0.09, lw=0)
+                ax.axhline(bottom, color="0.6", lw=0.3)
+            strip = ax.get_yaxis_transform()
+            for (bottom, top), status in zip(ranges, statuses):
+                ax.add_patch(Rectangle((1.0, bottom), 0.018, top - bottom, transform=strip,
+                                       color=STATUS_COLOURS.get(status, "#78879D"),
+                                       clip_on=False, lw=0))
+            for edge in (low, high):
+                ax.axhline(edge, color="0.3", lw=0.8, ls="--")
+            if current:
+                for wall in self.result.walls:
+                    if 0.0 < wall < 1.0:
+                        ax.axvline(wall, color="0.3", lw=0.8, ls=":")
 
-        self._gap_points = []
-        for gap in self._gaps_in_band():
-            verdict, _, _ = self._resolution(gap)
-            ax.add_patch(Rectangle((gap.psi_n - 0.006, gap.f_low), 0.012, gap.f_high - gap.f_low,
-                                   color=GAP_COLOUR, alpha=0.12, lw=0, zorder=2))
-            ax.plot(gap.psi_n, gap.f_center, marker="h", markersize=11, linestyle="none",
-                    markerfacecolor="white", markeredgecolor=RESOLUTION_COLOURS[verdict],
-                    markeredgewidth=1.8, zorder=4)
-            ax.annotate(gap.kind, (gap.psi_n, gap.f_center), xytext=(8, 0),
-                        textcoords="offset points", va="center", fontsize=7,
-                        color=GAP_COLOUR, zorder=4)
-            self._gap_points.append(gap)
+            self._gap_points = []
+            for gap in self._gaps_in_band():
+                verdict, _, _ = self._resolution(gap)
+                ax.add_patch(Rectangle((gap.psi_n - 0.006, gap.f_low), 0.012, gap.f_high - gap.f_low,
+                                       color=GAP_COLOUR, alpha=0.12, lw=0, zorder=2))
+                y = self._gap_marker_f(gap)
+                ax.plot(gap.psi_n, y, marker="h", markersize=11, linestyle="none",
+                        markerfacecolor="white", markeredgecolor=RESOLUTION_COLOURS[verdict],
+                        markeredgewidth=1.8, zorder=4)
+                ax.annotate(gap.kind, (gap.psi_n, y), xytext=(8, 0),
+                            textcoords="offset points", va="center", fontsize=7,
+                            color=GAP_COLOUR, zorder=4)
+                self._gap_points.append(gap)
 
-        rows = self._visible_rows()
-        if rows:
-            families = [locate_family(row["label"]) for row in rows]
-            for family in LOCATE_ORDER:
-                chosen = [row for row, value in zip(rows, families) if value == family]
-                if not chosen:
-                    continue
-                style = LOCATE_STYLE[family]
-                gap = family == "gap"
-                ax.errorbar([row["center"] for row in chosen],
-                            [row["frequency_khz"] for row in chosen],
-                            xerr=[row["width"] for row in chosen],
-                            fmt=style["marker"], color=style["color"],
-                            markersize=7 if gap else 5, elinewidth=0.8, capsize=0,
-                            alpha=1.0 if gap else 0.6, zorder=6 if gap else 5,
-                            label=f"{style['title']} ({len(chosen)})")
-            selected = [row for row in rows if row["mode"] == self.selected]
-            if selected:
-                row = selected[0]
-                ax.plot(row["center"], row["frequency_khz"], marker="o", markersize=15,
-                        markerfacecolor="none", markeredgecolor=SELECTED_COLOUR,
-                        markeredgewidth=1.6, zorder=7)
-            ax.legend(loc="upper left", fontsize=7, frameon=False)
-        elif continuum is not None:
-            handles = [Line2D([], [], color=CONTINUUM_COLOUR, lw=0.8, label="continuum")]
-            if self._gap_points:
-                handles.append(Line2D([], [], marker="h", linestyle="none", markersize=9,
-                                      markerfacecolor="white", markeredgecolor=GAP_COLOUR,
-                                      label="gap centre: hover for the mode size"))
-            ax.legend(handles=handles, loc="upper left", fontsize=7, frameon=False)
-        if self.result is not None and stale:
-            ax.text(0.01, 0.99, "settings changed since the last solve; Solve to update",
-                    transform=ax.transAxes, va="top", ha="left", fontsize=8,
-                    color=WARNING)
-        if self.view is None:
-            ax.text(0.5, 0.5, "Load an equilibrium in the Equilibrium tab",
-                    transform=ax.transAxes, ha="center", va="center", color="0.45")
+            rows = self._visible_rows()
+            if rows:
+                families = [locate_family(row["label"]) for row in rows]
+                for family in LOCATE_ORDER:
+                    chosen = [row for row, value in zip(rows, families) if value == family]
+                    if not chosen:
+                        continue
+                    style = LOCATE_STYLE[family]
+                    gap = family == "gap"
+                    ax.errorbar([row["center"] for row in chosen],
+                                [row["frequency_khz"] for row in chosen],
+                                xerr=[row["width"] for row in chosen],
+                                fmt=style["marker"], color=style["color"],
+                                markersize=7 if gap else 5, elinewidth=0.8, capsize=0,
+                                alpha=1.0 if gap else 0.6, zorder=6 if gap else 5,
+                                label=f"{style['title']} ({len(chosen)})")
+                selected = [row for row in rows if row["mode"] == self.selected]
+                if selected:
+                    row = selected[0]
+                    ax.plot(row["center"], row["frequency_khz"], marker="o", markersize=15,
+                            markerfacecolor="none", markeredgecolor=SELECTED_COLOUR,
+                            markeredgewidth=1.6, zorder=7)
+                ax.legend(loc="upper left", fontsize=7, frameon=False)
+            elif continuum is not None:
+                handles = [Line2D([], [], color=CONTINUUM_COLOUR, lw=0.8, label="continuum")]
+                if self._gap_points:
+                    handles.append(Line2D([], [], marker="h", linestyle="none", markersize=9,
+                                          markerfacecolor="white", markeredgecolor=GAP_COLOUR,
+                                          label="gap centre: hover for the mode size"))
+                ax.legend(handles=handles, loc="upper left", fontsize=7, frameon=False)
+            if self.result is not None and stale:
+                ax.text(0.01, 0.99, "settings changed since the last solve; Solve to update",
+                        transform=ax.transAxes, va="top", ha="left", fontsize=8,
+                        color=WARNING)
+            if self.view is None:
+                ax.text(0.5, 0.5, "Load an equilibrium in the Equilibrium tab",
+                        transform=ax.transAxes, ha="center", va="center", color="0.45")
 
-        ax.set_xlim(0.0, 1.0)
-        ax.set_ylim(max(0.0, low - margin), high + margin)
-        ax.set_xlabel(r"$\psi_N$ (mode centre, bar = radial width; dotted: walls)")
-        ax.set_ylabel("f [kHz]")
-        ax.set_title(f"n = {s.ntor}: {len(ranges)} windows of {s.window_width_khz:g} kHz, "
-                     f"nev = {s.nev}, {s.spans} spans", fontsize=10)
-        ax.grid(alpha=0.2)
-        self.spectrum_canvas.draw_idle()
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(max(0.0, low - margin), high + margin)
+            ax.set_xlabel(r"$\psi_N$ (mode centre, bar = radial width; dotted: walls)")
+            ax.set_ylabel("f [kHz]")
+            ax.set_title(f"n = {s.ntor}: {len(ranges)} windows of {s.window_width_khz:g} kHz, "
+                         f"nev = {s.nev}, {s.spans} spans", fontsize=10)
+            ax.grid(alpha=0.2)
+            memory.keep(ax, "spectrum")
+            self.spectrum_canvas.draw_idle()
 
     def _draw_mode(self) -> None:
-        figure = self.mode_figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        result = self.result
-        if (result is None or not result.mode_count or self.selected is None
-                or self._result_is_stale()):
-            ax.text(0.5, 0.5, "Solve, then pick a mode on the spectrum or in the table",
-                    ha="center", va="center", transform=ax.transAxes, color="0.45")
-            ax.set_axis_off()
-            self.reason_label.setText("")
+        memory = self.mode_canvas.view_memory
+        with memory.drawing():
+            figure = self.mode_figure
+            figure.clear()
+            ax = figure.add_subplot(111)
+            result = self.result
+            if (result is None or not result.mode_count or self.selected is None
+                    or self._result_is_stale()):
+                ax.text(0.5, 0.5, "Solve, then pick a mode on the spectrum or in the table",
+                        ha="center", va="center", transform=ax.transAxes, color="0.45")
+                ax.set_axis_off()
+                self.reason_label.setText("")
+                self.mode_canvas.draw_idle()
+                return
+            mode = self.selected
+            row = result.mode_rows()[mode]
+            crossings = result.crossings[mode]
+            on_continuum = self.state.mode_view == "continuum"
+            # what MODELOCATE judged: the excluded core and edge; and the walls
+            ax.axvspan(0.0, result.psi_core, color="0.85", alpha=0.6, lw=0)
+            ax.axvspan(result.psi_edge, 1.0, color="0.85", alpha=0.6, lw=0)
+            for wall in result.walls:
+                if 0.0 < wall < 1.0:
+                    ax.axvline(wall, color="0.3", lw=0.8, ls=":")
+            ax.set_xlim(0.0, 1.0)
+            ax.grid(alpha=0.2)
+            if on_continuum:
+                top = self._draw_mode_on_continuum(ax, result, mode, row)
+                ordered = (top, ax)
+            else:
+                top = self._draw_mode_harmonics(ax, result, mode)
+                ordered = (ax, top)
+
+            family = locate_family(row["label"])
+            style = LOCATE_STYLE.get(family, {"title": row["label"]})
+            ax.set_title(f"mode {mode}: {row['frequency_khz']:.4f} kHz, "
+                         f"Im/Re omega = {row['growth_ratio']:.2e} -- {row['label']}",
+                         fontsize=10)
+            ax.set_xlabel(r"$\psi_N$ ("
+                          + ("" if result.filter_method == "path"
+                             else "shaded: MODELOCATE core and edge; ")
+                          + ("circles" if on_continuum else "ticks")
+                          + ": continuum crossings; dotted: walls)")
+            handles, labels = [], []
+            for axes in ordered:
+                more, more_labels = axes.get_legend_handles_labels()
+                handles += more
+                labels += more_labels
+            # on the top axes: only they receive the picks
+            legend = top.legend(handles, labels, fontsize=7, ncol=2 if len(labels) > 12 else 1,
+                                frameon=on_continuum, framealpha=0.85, loc="upper right")
+            self.mode_toggles.attach(legend)
+            why = result.why(row["label"])
+            if np.isfinite(row["path_alpha"]):
+                why += (f" (alpha = {row['path_alpha']:.3g}; worst change "
+                        f"{row['path_drift']:.2g}, worst correlation {row['path_correlation']:.3f})")
+            self.reason_label.setText(
+                f"<b>{_escape(style['title'])}</b>: {_escape(why)}.<br>"
+                f"<span style='color:{MUTED}'>envelope peak at rho_pol = "
+                f"{row['peak_rho']:.4f}; dominant m = {row['dominant_m']}; width "
+                f"{row['width']:.4f}; backward error {row['backward_error']:.2e}; "
+                f"{crossings.size} continuum crossing(s); found in window "
+                f"{row['window']}.</span>")
             self.mode_canvas.draw_idle()
-            return
-        mode = self.selected
-        row = result.mode_rows()[mode]
+
+    def _field_title(self) -> str:
+        return f"{self.state.part}  {FIELD_TITLES.get(self.state.field, self.state.field)}"
+
+    def _plot_harmonics(self, ax, result, values) -> list:
+        """Draw each harmonic on ``ax``; returns the indices of those shown.
+
+        Up to LEGEND_HARMONICS each has its own legend entry. Past that only the
+        strongest do, spread over the colour map, and the rest are drawn pale
+        under the shared entry WEAKER_HARMONICS.
+        """
+        shows = self.mode_toggles.shows
+        labels = [f"m = {m}" for m in result.m_pol]
+        if len(labels) > LEGEND_HARMONICS:
+            peak = np.where(np.isfinite(values), np.abs(values), 0.0).max(axis=0)
+            strong = set(np.argsort(peak)[::-1][:LEGEND_HARMONICS].tolist())
+            labels = [label if index in strong else WEAKER_HARMONICS
+                      for index, label in enumerate(labels)]
+        colours = iter(_harmonic_colours(sum(label != WEAKER_HARMONICS for label in labels)))
+        shown = []
+        for index, label in enumerate(labels):
+            weaker = label == WEAKER_HARMONICS
+            ax.plot(result.x, values[:, index], color=WEAKER_COLOUR if weaker else next(colours),
+                    lw=0.8 if weaker else 1.1, label="_nolegend_" if weaker else label,
+                    visible=shows(label), zorder=1.9 if weaker else 2.0)
+            if shows(label):
+                shown.append(index)
+        if WEAKER_HARMONICS in labels:
+            ax.plot([], [], color=WEAKER_COLOUR, lw=0.8, label=WEAKER_HARMONICS,
+                    visible=shows(WEAKER_HARMONICS))
+        return shown
+
+    def _draw_mode_harmonics(self, ax, result, mode):
+        """The harmonics alone, over MODELOCATE's envelope; returns the twin."""
+        memory = self.mode_canvas.view_memory
+        shows = self.mode_toggles.shows
         values = result.field(mode, self.state.field, self.state.part)
-        colours = _harmonic_colours(result.m_pol.size)
-        for index, m in enumerate(result.m_pol):
-            ax.plot(result.x, values[:, index], color=colours[index], lw=1.1,
-                    label=f"m = {m}")
-        # what MODELOCATE judged: the excluded core and edge, the crossings,
-        # and the envelope on the breakpoints
-        ax.axvspan(0.0, result.psi_core, color="0.85", alpha=0.6, lw=0)
-        ax.axvspan(result.psi_edge, 1.0, color="0.85", alpha=0.6, lw=0)
-        for wall in result.walls:
-            if 0.0 < wall < 1.0:
-                ax.axvline(wall, color="0.3", lw=0.8, ls=":")
+        self._plot_harmonics(ax, result, values)
         crossings = result.crossings[mode]
         if crossings.size:
             ax.plot(crossings, np.zeros(crossings.size), transform=ax.get_xaxis_transform(),
                     linestyle="none", marker="|", markersize=14, color=CONTINUUM_COLOUR)
         ax.axhline(0.0, color="0.3", lw=0.5)
+        ax.relim(visible_only=True)          # fit what is still shown
+        ax.autoscale_view()
+        ax.set_ylabel(self._field_title())
         envelope_axes = ax.twinx()
         points, envelope = result.envelope(mode)
-        envelope_axes.plot(points, envelope, color="k", lw=0.9, ls="--",
-                           marker=".", markersize=3, label="MODELOCATE envelope")
-        thresholds = result.state.locate_thresholds()
-        envelope_axes.axhline(thresholds.continuum_level, color=CONTINUUM_COLOUR,
-                              lw=0.6, ls=":")
+        path = result.filter_method == "path"
+        label = "envelope" if path else "MODELOCATE envelope"
+        envelope_axes.plot(points, envelope, color="k", lw=0.9, ls="--", marker=".",
+                           markersize=3, label=label, visible=shows(label))
+        if not path:
+            envelope_axes.axhline(result.state.locate_thresholds().continuum_level,
+                                  color=CONTINUUM_COLOUR, lw=0.6, ls=":")
         envelope_axes.set_ylim(0.0, 1.05)
         envelope_axes.set_ylabel("envelope / peak", fontsize=8)
         envelope_axes.tick_params(labelsize=8)
+        memory.keep(ax, "mode")
+        memory.keep(envelope_axes, "envelope")
+        return envelope_axes
 
-        family = locate_family(row["label"])
-        style = LOCATE_STYLE.get(family, {"title": row["label"]})
-        ax.set_title(f"mode {mode}: {row['frequency_khz']:.4f} kHz, "
-                     f"Im/Re omega = {row['growth_ratio']:.2e} -- {row['label']}",
-                     fontsize=10)
-        ax.set_xlabel(r"$\psi_N$ (shaded: MODELOCATE core and edge; ticks: continuum "
-                      "crossings; dotted: walls)")
-        ax.set_ylabel(f"{self.state.part}  "
-                      f"{FIELD_TITLES.get(self.state.field, self.state.field)}")
-        ax.set_xlim(0.0, 1.0)
-        ax.grid(alpha=0.2)
-        if result.m_pol.size <= 30:
-            handles, labels = ax.get_legend_handles_labels()
-            extra, extra_labels = envelope_axes.get_legend_handles_labels()
-            ax.legend(handles + extra, labels + extra_labels, fontsize=7,
-                      ncol=2 if result.m_pol.size > 10 else 1, frameon=False,
-                      loc="upper right")
-        why = result.why(row["label"])
-        if np.isfinite(row["path_alpha"]):
-            why += (f" (alpha = {row['path_alpha']:.3g}; worst change "
-                    f"{row['path_drift']:.2g}, worst correlation {row['path_correlation']:.3f})")
-        self.reason_label.setText(
-            f"<b>{_escape(style['title'])}</b>: {_escape(why)}.<br>"
-            f"<span style='color:{MUTED}'>envelope peak at rho_pol = "
-            f"{row['peak_rho']:.4f}; dominant m = {row['dominant_m']}; width "
-            f"{row['width']:.4f}; backward error {row['backward_error']:.2e}; "
-            f"{crossings.size} continuum crossing(s); found in window "
-            f"{row['window']}.</span>")
-        self.mode_canvas.draw_idle()
+    def _draw_mode_on_continuum(self, ax, result, mode, row):
+        """The continuum in kHz, with the harmonics drawn about the mode's frequency.
+
+        The harmonics go on a twin axis whose zero sits on the mode's frequency
+        line, so the structure at each crossing reads against the continuum
+        there. Only the frequency axis is remembered across redraws; the twin
+        is laid out again from it each time, which keeps that zero in place
+        under any zoom.
+        """
+        memory = self.mode_canvas.view_memory
+        shows = self.mode_toggles.shows
+        frequency = float(row["frequency_khz"])
+        label = "continuum"
+        lines = ax.plot(result.continuum_x, result.continuum_khz, color=CONTINUUM_COLOUR,
+                        lw=0.7, alpha=0.7, visible=shows(label))
+        if lines:
+            lines[0].set_label(label)
+        label = "mode frequency (harmonics' zero)"
+        ax.axhline(frequency, color=SELECTED_COLOUR, lw=0.9, ls="--", label=label,
+                   visible=shows(label))
+        crossings = result.crossings[mode]
+        if crossings.size:
+            label = "continuum crossings"
+            ax.plot(crossings, np.full(crossings.size, frequency), linestyle="none",
+                    marker="o", markersize=7, markerfacecolor="none",
+                    markeredgecolor=SELECTED_COLOUR, markeredgewidth=1.2, zorder=5,
+                    label=label, visible=shows(label))
+        low = min(result.state.f_low_khz, frequency)
+        high = max(result.state.f_high_khz, frequency)
+        margin = 0.06 * max(high - low, 1.0e-9)
+        ax.set_ylim(max(0.0, low - margin), high + margin)
+        ax.set_ylabel("f [kHz]")
+        memory.keep(ax, "mode_continuum")
+
+        twin = ax.twinx()
+        values = result.field(mode, self.state.field, self.state.part)
+        shown = self._plot_harmonics(twin, result, values)
+        magnitude = np.abs(values[:, shown])
+        magnitude = magnitude[np.isfinite(magnitude)]
+        amplitude = float(magnitude.max()) if magnitude.size and magnitude.max() > 0 else 1.0
+        bottom, top = ax.get_ylim()
+        where = (frequency - bottom) / (top - bottom)      # the line's height in the axes
+        scale = 1.05 * amplitude / max(min(where, 1.0 - where), 0.1)
+        twin.set_ylim(-where * scale, (1.0 - where) * scale)
+        twin.set_ylabel(f"{self._field_title()}  (0 on the mode frequency)", fontsize=8)
+        twin.tick_params(labelsize=8)
+        return twin
 
     def _on_spectrum_click(self, event) -> None:
         rows = self._visible_rows()
@@ -1327,7 +1539,7 @@ class SolverWindow(QtWidgets.QMainWindow):
         if not self._gap_points or event.inaxes is not self.spectrum_axes:
             QtWidgets.QToolTip.hideText()
             return
-        points = np.array([[gap.psi_n, gap.f_center] for gap in self._gap_points])
+        points = np.array([[gap.psi_n, self._gap_marker_f(gap)] for gap in self._gap_points])
         pixels = self.spectrum_axes.transData.transform(points)
         distance = np.hypot(pixels[:, 0] - event.x, pixels[:, 1] - event.y)
         nearest = int(np.argmin(distance))
@@ -1473,13 +1685,21 @@ class SolverWindow(QtWidgets.QMainWindow):
             return
         verdicts = []
         for mode in refinement.modes:
-            verdict = refinement.path.get(mode)
-            if verdict:
-                colour = LOCATE_STYLE.get(verdict["label"], {}).get("color", MUTED)
-                verdicts.append(
-                    f"mode {mode}: <span style='color:{colour}'><b>{verdict['label']}</b>"
-                    f"</span> on the finest mesh (alpha = {verdict['alpha']:.3g}, change "
-                    f"{verdict['drift']:.2g}, correlation {verdict['correlation']:.3f})")
+            label, why = refinement.verdict(mode)
+            colour = VERDICT_COLOURS.get(label, MUTED)
+            line = (f"mode {mode}: <span style='color:{colour}'><b>{label}</b></span> -- "
+                    f"{_escape(why)}")
+            test = refinement.path.get(mode, {})
+            if "label" in test:
+                line += (f"<br>&nbsp;&nbsp;<span style='color:{MUTED}'>path test: "
+                         f"{test['label']} (alpha = {test['alpha']:.3g}, change "
+                         f"{test['drift']:.2g}, correlation {test['correlation']:.3f})")
+                line += "</span>"
+            twin = refinement.same_root_as(mode)
+            if twin is not None:
+                line += (f"<br>&nbsp;&nbsp;<span style='color:{WARNING}'>ends on the same root "
+                         f"as mode {twin}</span>")
+            verdicts.append(line)
         self.refine_summary.setText(
             f"<b>{len(refinement.modes)} mode(s)</b>, {refinement.state.refine_levels} "
             "meshes graded towards them, each halving the element at the modes. A gap "
@@ -1487,51 +1707,55 @@ class SolverWindow(QtWidgets.QMainWindow):
             + ("<br>" + "<br>".join(verdicts) if verdicts else ""))
 
     def _draw_refinement(self) -> None:
-        figure = self.refine_figure
-        figure.clear()
-        refinement = self.refinement
-        if refinement is None or not refinement.rows:
+        memory = self.refine_canvas.view_memory
+        with memory.drawing():
+            figure = self.refine_figure
+            figure.clear()
+            refinement = self.refinement
+            if refinement is None or not refinement.rows:
+                self.refine_canvas.draw_idle()
+                return
+            converge, shapes = figure.subplots(1, 2)
+            colours = _harmonic_colours(max(len(refinement.modes), 2))
+            for colour, mode in zip(colours, refinement.modes):
+                rows = [row for row in refinement.rows_for(mode) if np.isfinite(row["frequency_khz"])]
+                if len(rows) < 2:
+                    continue
+                h = np.array([row["h_mm"] for row in rows])
+                f = np.array([row["frequency_khz"] for row in rows])
+                change = np.maximum(np.abs(f[:-1] - f[-1]), 1.0e-7)
+                converge.loglog(h[:-1], change, marker="o", color=colour,
+                                label=f"mode {mode}: {f[-1]:.4f} kHz")
+            converge.invert_xaxis()
+            plain = FuncFormatter(lambda value, _: f"{value:g}")
+            converge.xaxis.set_major_formatter(plain)
+            converge.xaxis.set_minor_formatter(plain)
+            converge.set_xlabel("element at the mode [mm]")
+            converge.set_ylabel("|f - f(finest)| [kHz]")
+            converge.set_title("frequency against mesh", fontsize=9)
+            converge.grid(alpha=0.2, which="both")
+            if converge.lines:
+                converge.legend(fontsize=7, frameon=False)
+            mode = (self.selected if self.selected in refinement.envelopes
+                    else refinement.modes[0])
+            envelopes = refinement.envelopes.get(mode, np.empty((0, 0)))
+            for level, envelope in enumerate(envelopes):
+                shapes.plot(refinement.x, envelope, lw=1.0 + 0.4 * level,
+                            label=f"mesh {level + 1}")
+            shapes.set_xlabel(r"$\psi_N$")
+            shapes.set_ylabel(r"$|\xi^\psi|$ envelope")
+            shapes.set_title(f"mode {mode} on each mesh", fontsize=9)
+            shapes.grid(alpha=0.2)
+            if envelopes.size:
+                peak = refinement.x[np.argmax(envelopes[-1])]
+                shapes.set_xlim(max(0.0, peak - 0.15), min(1.0, peak + 0.15))
+                shapes.legend(fontsize=7, frameon=False)
+            figure.tight_layout()
+            memory.keep(converge, "converge")
+            memory.keep(shapes, "shapes")
             self.refine_canvas.draw_idle()
-            return
-        converge, shapes = figure.subplots(1, 2)
-        colours = _harmonic_colours(max(len(refinement.modes), 2))
-        for colour, mode in zip(colours, refinement.modes):
-            rows = [row for row in refinement.rows_for(mode) if np.isfinite(row["frequency_khz"])]
-            if len(rows) < 2:
-                continue
-            h = np.array([row["h_mm"] for row in rows])
-            f = np.array([row["frequency_khz"] for row in rows])
-            change = np.maximum(np.abs(f[:-1] - f[-1]), 1.0e-7)
-            converge.loglog(h[:-1], change, marker="o", color=colour,
-                            label=f"mode {mode}: {f[-1]:.4f} kHz")
-        converge.invert_xaxis()
-        plain = FuncFormatter(lambda value, _: f"{value:g}")
-        converge.xaxis.set_major_formatter(plain)
-        converge.xaxis.set_minor_formatter(plain)
-        converge.set_xlabel("element at the mode [mm]")
-        converge.set_ylabel("|f - f(finest)| [kHz]")
-        converge.set_title("frequency against mesh", fontsize=9)
-        converge.grid(alpha=0.2, which="both")
-        if converge.lines:
-            converge.legend(fontsize=7, frameon=False)
-        mode = (self.selected if self.selected in refinement.envelopes
-                else refinement.modes[0])
-        envelopes = refinement.envelopes.get(mode, np.empty((0, 0)))
-        for level, envelope in enumerate(envelopes):
-            shapes.plot(refinement.x, envelope, lw=1.0 + 0.4 * level,
-                        label=f"mesh {level + 1}")
-        shapes.set_xlabel(r"$\psi_N$")
-        shapes.set_ylabel(r"$|\xi^\psi|$ envelope")
-        shapes.set_title(f"mode {mode} on each mesh", fontsize=9)
-        shapes.grid(alpha=0.2)
-        if envelopes.size:
-            peak = refinement.x[np.argmax(envelopes[-1])]
-            shapes.set_xlim(max(0.0, peak - 0.15), min(1.0, peak + 0.15))
-            shapes.legend(fontsize=7, frameon=False)
-        figure.tight_layout()
-        self.refine_canvas.draw_idle()
 
-    # -------------------------------------------------------------- actions
+        # -------------------------------------------------------------- actions
 
     def _export(self) -> None:
         if self.result is None or not self.result.mode_count:
@@ -1557,30 +1781,94 @@ class SolverWindow(QtWidgets.QMainWindow):
             figure.savefig(path, dpi=180, bbox_inches="tight")
             self.status.showMessage(f"Wrote {path}")
 
+    # ------------------------------------------------------------- sessions
+
+    def session_results(self) -> dict:
+        """What a session keeps of this tab's work.
+
+        The pass and the refinement go in only if they were computed on the
+        equilibrium loaded now, whose key they are filed under; the mode picked
+        and the log always do.
+        """
+        results = {"log": self.log.toPlainText()}
+        if self.view is None:
+            return results
+        results["equilibrium_key"] = self.view.key
+        if self.result is not None and same_equilibrium(self.result, self.view):
+            results.update(result=self.result, selected=self.selected)
+        if self.refinement is not None and self.refinement.handle == self.view.handle:
+            results["refinement"] = self.refinement
+        return results
+
+    def restore(self, results: dict) -> None:
+        """Take back a session's pass and refinement, and its log.
+
+        They come back once the equilibrium they were computed on is loaded --
+        at once if it already is; until then they wait, and a solve started
+        meanwhile drops them.
+        """
+        if results.get("log"):
+            self._append_log(results["log"].rstrip("\n") + "\n=== session restored ===\n")
+        if results.get("result") is None and results.get("refinement") is None:
+            return
+        self._restored = results
+        self._adopt_restored()
+        if self._restored is not None:
+            self.status.showMessage("The session's solve comes back once its "
+                                    "equilibrium has loaded.")
+
+    def _adopt_restored(self) -> None:
+        pending = self._restored
+        if (pending is None or self.view is None
+                or tuple(self.view.key) != tuple(pending.get("equilibrium_key") or ())):
+            return
+        self._restored = None
+        result, refinement = pending.get("result"), pending.get("refinement")
+        if result is not None:
+            # the compute process names this load differently now
+            self._show_result(dataclasses.replace(result, handle=self.view.handle),
+                              pending.get("selected"))
+        if refinement is not None:
+            self.refinement = dataclasses.replace(refinement, handle=self.view.handle)
+            self._fill_refine_table()
+            self._draw_refinement()
+            self._update_refine_button()
+        found = f"{result.mode_count} modes" if result is not None else "no pass"
+        self.status.showMessage(f"Restored the session's solve: {found}"
+                                + (", and its refinement" if refinement is not None else ""))
+
     def _save_session(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save solver session", "solver_session.json", "JSON (*.json)")
+        if self.session_owner is not None:      # in the app: the whole session
+            self.session_owner.save_session()
+            return
+        path = ask_session_to_save(self, "Save solver session", "solver_session.h5")
         if not path:
             return
         try:
             self._read_widgets_into_state()
-        except ValueError as error:
-            self.status.showMessage(f"Unreadable value: {error}")
+            write_session(path, solver=self.state, results={"solver": self.session_results()})
+        except (ValueError, OSError, TypeError) as error:
+            self.status.showMessage(f"Could not save the session: {error}")
             return
-        self.state.to_json(path)
         self.status.showMessage(f"Wrote {path}")
 
     def _load_session(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load solver session", str(Path.cwd()), "JSON (*.json)")
+        if self.session_owner is not None:
+            self.session_owner.open_session()
+            return
+        path = ask_session_to_open(self, "Load solver session")
         if not path:
             return
         try:
-            state = SolverState.from_json(path)
+            loaded = read_session(path)
         except (ValueError, OSError, TypeError) as error:
-            self.status.showMessage(f"Could not load session: {error}")
+            self.status.showMessage(f"Could not load the session: {error}")
             return
-        self.set_state(state)
+        if "solver" not in loaded:
+            self.status.showMessage(f"{path} holds no solver settings.")
+            return
+        self.set_state(loaded["solver"])
+        self.restore(loaded.get("results", {}).get("solver", {}))
 
     def shutdown(self) -> None:
         if self._solving:
@@ -1612,6 +1900,11 @@ def _harmonic_colours(count: int):
 
     cmap = colormaps["viridis"]
     return [cmap(value) for value in np.linspace(0.0, 0.9, max(count, 1))]
+
+
+def _number(value: float, form: str):
+    """A table cell: the value as ``form`` shows it, empty when not measured."""
+    return float(form.format(value)) if np.isfinite(value) else ""
 
 
 def _escape(text: str) -> str:

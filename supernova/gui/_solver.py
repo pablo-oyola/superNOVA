@@ -34,7 +34,7 @@ the two differ whenever that domain is not (0, 1).
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 import time
 
@@ -52,7 +52,7 @@ SOUND_MODELS = ("ideal", "nova")
 SOUND_TITLES = {"ideal": "ideal MHD", "nova": "NOVA ksound=1 (no parallel sound)"}
 MODE_FILTERS = ("modelocate", "path")
 FILTER_TITLES = {"modelocate": "MODELOCATE (Kramer)",
-                 "path": "global path alpha (+ MODELOCATE spikes)"}
+                 "path": "global path alpha"}
 BACKWARD_ERROR_GATE = 1.0e-8      # the production acceptance of an eigenpair
 FOLLOW_UP_TOL = 1.0e-10           # SLEPc tol of the path and refinement solves
 # Path and refinement solves aim at a known root. Shift-and-invert exactly on
@@ -61,8 +61,16 @@ TARGET_OFFSET = 1.0e-4
 # Some shifts give a factorization too inaccurate for the gate; such a solve is
 # repeated with the target moved by these (relative, in omega) before giving up.
 RETRY_OFFSETS = (3.0e-3, -3.0e-3)
+CONVERGED = 1.0e-4                # relative change between the two finest meshes
+TRACK_FIRST = 0.5                 # shape correlation to follow a mode onto the first refined mesh
 INCONCLUSIVE = 32                 # mode_class code of a path test that could not decide
+PATH_LEGEND = ("0 gap (path-invariant at the thresholds), 8 continuum (moves on a path), "
+               f"16 ideal (Re omega^2 < 0, not tested), {INCONCLUSIVE} path test inconclusive")
 PARTS = ("real", "imag", "abs")
+# how the mode-structure page draws a mode: over the continuum with xi = 0 on
+# the mode's frequency, or its harmonics alone
+MODE_VIEWS = ("continuum", "harmonics")
+MODE_VIEW_TITLES = {"harmonics": "harmonics", "continuum": "on the continuum"}
 MAX_WINDOWS = 2000
 DUPLICATE_RELATIVE = 1.0e-8       # two windows returning one root
 
@@ -119,9 +127,9 @@ PATH_WHY = {
     "gap": "it stays put on the complex paths +alpha and -alpha: same frequency "
            "within the tolerance and the same shape. A discrete eigenvalue does "
            "not depend on the path",
-    "continuum": "it moves on the complex paths (or no eigenvalue of its shape is "
-                 "left there): a continuum approximant, which the path rotates "
-                 "into the complex plane",
+    "continuum": "it moves on the complex paths by more than the tolerance, or "
+                 "changes shape below the correlation threshold: a continuum "
+                 "approximant, which the path rotates into the complex plane",
     "inconclusive": "either nothing converged on a path, or the singular points of "
                     "a continuum extremum next to it are so close that the path "
                     "cannot rise a quarter element there. Refine the mode first",
@@ -129,10 +137,12 @@ PATH_WHY = {
 
 # fields that never change what is solved: what is drawn, and how the
 # windows are spread over worker processes
-_VIEW_FIELDS = frozenset({"field", "part", "continuum_preview", "gap_only",
+# The path test's thresholds are here too: every mode keeps its drift and
+# correlation, so moving a threshold relabels the pass without solving it again.
+_VIEW_FIELDS = frozenset({"field", "part", "mode_view", "continuum_preview", "gap_only",
                           "workers", "threads_per_worker", "resolution_target",
                           "refine_h_mm", "refine_levels", "refine_growth",
-                          "refine_path_check"})
+                          "refine_path_check", "path_tolerance", "path_correlation"})
 
 
 def locate_family(label: str) -> str:
@@ -244,6 +254,7 @@ class SolverState(JsonState):
     gap_only: bool = False
     field: str = "xi_psi"
     part: str = "real"
+    mode_view: str = "continuum"
 
     # ------------------------------------------------------------ derived
 
@@ -339,6 +350,8 @@ class SolverState(JsonState):
             problems.append("Reconstruct on at least 16 points.")
         if self.field not in FIELDS or self.part not in PARTS:
             problems.append("Unknown field or part to draw.")
+        if self.mode_view not in MODE_VIEWS:
+            problems.append(f"The mode view must be one of {', '.join(MODE_VIEWS)}.")
         if self.mode_filter not in MODE_FILTERS:
             problems.append(f"The mode filter must be one of {', '.join(MODE_FILTERS)}.")
         if not 0.0 < self.path_alpha_max <= 0.5:
@@ -450,6 +463,7 @@ class WindowRow:
     nev: int
     nconv: int = 0
     kept: int = 0
+    dropped: int = 0                  # converged, but outside the backward-error gate
     iterations: int = 0
     reason: str = ""
     status: str = "ok"
@@ -504,6 +518,19 @@ class SolverResult:
         texts = PATH_WHY if self.filter_method == "path" else {}
         return " and ".join(texts.get(flag, LOCATE_WHY.get(flag, flag))
                             for flag in str(label).split("|"))
+
+    def with_path_thresholds(self, tolerance: float, correlation: float) -> "SolverResult":
+        """This pass with its path verdicts drawn again at these thresholds.
+
+        Nothing is solved: each mode keeps the drift and correlation the paths
+        gave it, and only the cut moves. A MODELOCATE pass comes back as it is.
+        """
+        if self.filter_method != "path":
+            return self
+        state = self.state.copy()
+        state.path_tolerance, state.path_correlation = float(tolerance), float(correlation)
+        return replace(self, state=state,
+                       located=_apply_path_thresholds(self.located, tolerance, correlation))
 
     @property
     def mode_count(self) -> int:
@@ -575,6 +602,54 @@ class RefineResult:
 
     def rows_for(self, mode: int) -> list[dict]:
         return [row for row in self.rows if row["mode"] == int(mode)]
+
+    def change(self, mode: int) -> float:
+        """Relative frequency change between the two finest meshes it was found on."""
+        f = [row["frequency_khz"] for row in self.rows_for(mode)
+             if np.isfinite(row["frequency_khz"])]
+        if len(f) < 2:
+            return np.nan
+        return float(abs(f[-1] - f[-2]) / abs(f[-1]))
+
+    def same_root_as(self, mode: int):
+        """Another refined mode that ended on the same root, or None."""
+        mine = self.rows_for(mode)
+        if not mine or not np.isfinite(mine[-1]["frequency_khz"]):
+            return None
+        for other in self.modes:
+            theirs = self.rows_for(other)
+            if (other != mode and theirs and np.isfinite(theirs[-1]["frequency_khz"])
+                    and abs(theirs[-1]["frequency_khz"] - mine[-1]["frequency_khz"])
+                    <= 1.0e-7 * abs(mine[-1]["frequency_khz"])):
+                return other
+        return None
+
+    def verdict(self, mode: int) -> tuple[str, str]:
+        """``(label, why)`` from convergence and the path test on the finest mesh.
+
+        Lost on refinement, or still moving between the two finest meshes:
+        continuum. Converged and
+        path-invariant: a gap mode. Converged but moving on the +-alpha path:
+        continuum-coupled -- its frequency meets the continuum where it has
+        amplitude (its damping is not computed here). Otherwise inconclusive.
+        """
+        change = self.change(mode)
+        test = self.path.get(mode, {})
+        if not np.isfinite(change):
+            return "continuum", ("it does not survive refinement: no root of its shape on "
+                                 "the refined meshes")
+        if change > CONVERGED:
+            return "continuum", f"the frequency still moves by {change:.1e} between the two finest meshes"
+        label = test.get("label")
+        if label == "gap":
+            return "gap", (f"converged (change {change:.1e}) and path-invariant (alpha = "
+                           f"{test['alpha']:.3g}, change {test['drift']:.1e})")
+        if label == "continuum":
+            return "continuum-coupled", (
+                f"converged (change {change:.1e}) but moves by {test['drift']:.1e} on the "
+                f"+-alpha path (alpha = {test['alpha']:.3g}): it reaches the continuum")
+        return "inconclusive", (f"converged (change {change:.1e}); the path test on the "
+                                "finest mesh could not decide")
 
 
 class SolverModel:
@@ -733,9 +808,8 @@ class SolverModel:
         thresholds = state.locate_thresholds()
         if state.mode_filter == "path":
             if progress:
-                progress(f"Reconstructing {len(modes)} modes; MODELOCATE's spike, core "
-                         "and edge tests...")
-            # no crossings: the continuum test is the path test's job
+                progress(f"Reconstructing {len(modes)} modes for the path test...")
+            # for its envelopes and peaks only: the path test judges every mode
             located = modes.locate(thresholds=thresholds, continuum=_NO_CONTINUUM)
             located = self._path_filter(equilibrium, scan, modes, located, state, band,
                                         progress, cancel, pool)
@@ -769,18 +843,25 @@ class SolverModel:
 
     def _path_filter(self, equilibrium, scan, modes, located, state, band, progress,
                      cancel, pool):
-        """MODELOCATE's gap modes (spike, core and edge already set aside) put
-        to the global-path test; the verdicts replace their labels."""
-        labels = np.asarray(located["mode_label"].values).astype(object)
-        codes = np.asarray(located["mode_class"].values).copy()
-        count = labels.size
+        """Every mode put to the global-path test; MODELOCATE judges none of them.
+
+        ``located`` lends its envelopes and peaks, not its labels. A mode with
+        Re(omega^2) < 0 grows without oscillating, so it has no frequency to
+        follow on a path: it is "ideal", untested. Every other mode keeps the
+        drift and correlation the paths gave it, and its label follows from
+        the thresholds (:func:`_apply_path_thresholds`), which can therefore
+        change after the solve.
+        """
+        omega = np.asarray(modes.omega, dtype=complex)
+        count = omega.size
+        ideal = np.real(omega ** 2) < 0.0
         alpha = np.full(count, np.nan)
         drift = np.full(count, np.nan)
         correlation = np.full(count, np.nan)
-        candidates = [index for index in range(count) if labels[index] == "gap"]
-        if candidates:
+        candidates = np.flatnonzero(~ideal)
+        if candidates.size:
             reference = modes.field("xi_psi", n=int(state.reconstruction_points))
-            targets = [(index, complex(modes.omega[index]),
+            targets = [(int(index), complex(omega[index]),
                         float(located["peak_x"].values[index]),
                         np.asarray(reference.values[index]))
                        for index in candidates]
@@ -788,26 +869,18 @@ class SolverModel:
                                       np.asarray(reference.coords["x"].values),
                                       progress=progress, cancel=cancel, pool=pool)
             for index, verdict in verdicts.items():
-                labels[index] = verdict["label"]
-                codes[index] = {"gap": 0, "continuum": 8}.get(verdict["label"], INCONCLUSIVE)
                 alpha[index] = verdict["alpha"]
                 drift[index] = verdict["drift"]
                 correlation[index] = verdict["correlation"]
         located = located.copy()
-        located["mode_label"] = ("eigenpair", labels.astype(str))
-        located["mode_class"] = ("eigenpair", codes.astype(np.int32))
-        located["mode_class"].attrs["legend"] = (
-            "0 gap (path-invariant), 1 spike, 2 core, 4 edge, 8 continuum (moves "
-            f"on the path), 16 ideal, {INCONCLUSIVE} path test inconclusive")
         located["path_alpha"] = ("eigenpair", alpha)
         located["path_drift"] = ("eigenpair", drift)
         located["path_correlation"] = ("eigenpair", correlation)
+        located["path_ideal"] = ("eigenpair", ideal)
         located.attrs.update({
             "method": "global_path", "path_alpha_max": float(state.path_alpha_max),
-            "path_kappa": float(state.path_kappa),
-            "path_tolerance": float(state.path_tolerance),
-            "path_correlation": float(state.path_correlation)})
-        return located
+            "path_kappa": float(state.path_kappa)})
+        return _apply_path_thresholds(located, state.path_tolerance, state.path_correlation)
 
     def path_test(self, equilibrium, scan, state, band, targets, x, *, progress=None,
                   cancel=None, pool=None, tips=None) -> dict:
@@ -950,7 +1023,7 @@ class SolverModel:
         band = Band(*state.band, units="kHz", vscale=float(state.region_vscale)).for_case(case)
         settings = dict(prefix="nova_refine_pep", pep_type=state.pep_type,
                         st_type=state.st_type, which=state.which,
-                        nev=max(int(state.path_nev), 4),
+                        nev=max(2 * int(state.path_nev), 8),
                         tol=min(float(state.tol), FOLLOW_UP_TOL),
                         maxit=int(state.maxit), options=state.petsc_options().as_dict(),
                         verbose=False, compute_residuals=True)
@@ -1012,12 +1085,26 @@ class SolverModel:
                         harmonic_correlation(field, tracked[index]) if error <= BACKWARD_ERROR_GATE
                         else -1.0 for field, error in zip(fields, errors)])
                     best = int(np.argmax(correlations))
-                    if correlations[best] > 0.0:
+                    # below the floor it is another root: the mode is lost on this
+                    # mesh. On the first refined mesh an unresolved mode may change
+                    # shape a lot, so it only has to be recognizably the same one.
+                    floor = TRACK_FIRST if level == 0 else float(state.path_correlation)
+                    if correlations[best] >= floor:
                         w = complex(found.omega[best])
                         envelope = np.sqrt(np.sum(np.abs(fields[best]) ** 2, axis=1))
                         envelope = envelope / max(envelope.max(), 1e-300)
-                        r_mm = geometry.at("r", np.asarray(xi.coords["x"].values)) * 1.0e3
+                        x_grid = np.asarray(xi.coords["x"].values)
+                        r_mm = geometry.at("r", x_grid) * 1.0e3
                         above = np.flatnonzero(envelope >= 0.5)
+                        if above[-1] - above[0] <= 3:
+                            # narrower than the drawing grid: measure it on a fine one
+                            peak = int(np.argmax(envelope))
+                            dense = np.linspace(x_grid[max(peak - 4, 0)],
+                                                x_grid[min(peak + 4, x_grid.size - 1)], 2001)
+                            local = found._evaluate("xi_psi", dense)[best]
+                            fine = np.sqrt(np.sum(np.abs(local) ** 2, axis=1))
+                            r_mm = geometry.at("r", dense) * 1.0e3
+                            above = np.flatnonzero(fine >= 0.5 * fine.max())
                         row.update(frequency_khz=float(found.frequency_khz[best]),
                                    growth_ratio=float(w.imag / w.real) if w.real else np.nan,
                                    correlation=float(correlations[best]),
@@ -1082,8 +1169,9 @@ class SolverModel:
                                               message=f"{type(error).__name__}: {error}",
                                               seconds=time.perf_counter() - started))
                         break
+                    dataset, dropped = _gate(dataset)
                     rows.append(_window_row(index, (low, high), nev, dataset,
-                                            time.perf_counter() - started))
+                                            time.perf_counter() - started, dropped))
                     if dataset.sizes.get("eigenpair", 0):
                         found.append(dataset.assign_coords(
                             window=("eigenpair", np.full(dataset.sizes["eigenpair"], index))))
@@ -1151,7 +1239,8 @@ class SolverModel:
                 rows[index] = WindowRow(index, window, nev, status="failed",
                                         message=error, seconds=seconds)
             else:
-                rows[index] = _window_row(index, window, nev, dataset, seconds)
+                dataset, dropped = _gate(dataset)
+                rows[index] = _window_row(index, window, nev, dataset, seconds, dropped)
                 if dataset.sizes.get("eigenpair", 0):
                     found.append(dataset.assign_coords(
                         window=("eigenpair", np.full(dataset.sizes["eigenpair"], index))))
@@ -1233,8 +1322,9 @@ class SolverModel:
             state=state, title=title, windows=tuple(rows), dataset=dataset,
             located=located, continuum_x=to_psi(psi),
             continuum_khz=np.asarray(continuum_khz, dtype=float),
-            psi_core=float(thresholds.core_edge) ** 2,
-            psi_edge=float(thresholds.boundary_edge) ** 2,
+            # MODELOCATE's core and edge, where it judged anything
+            psi_core=0.0 if state.mode_filter == "path" else float(thresholds.core_edge) ** 2,
+            psi_edge=1.0 if state.mode_filter == "path" else float(thresholds.boundary_edge) ** 2,
             walls=walls, seconds=time.perf_counter() - started,
             equilibrium=equilibrium, **arrays)
 
@@ -1269,7 +1359,7 @@ class SolverModel:
         dimension = "search_window"
         dataset["window_low_khz"] = (dimension, [row.range_khz[0] for row in rows])
         dataset["window_high_khz"] = (dimension, [row.range_khz[1] for row in rows])
-        for name in ("nconv", "kept", "iterations"):
+        for name in ("nconv", "kept", "dropped", "iterations"):
             dataset[f"window_{name}"] = (dimension, [getattr(row, name) for row in rows])
         dataset["window_status"] = (dimension, [row.status for row in rows])
         dataset.attrs = {key: value for key, value in dataset.attrs.items()
@@ -1287,7 +1377,21 @@ class SolverModel:
         return path
 
 
-def _window_row(index, window, nev, dataset, seconds) -> WindowRow:
+def _gate(dataset):
+    """``(dataset, dropped)``: the window's roots inside BACKWARD_ERROR_GATE only.
+
+    A root outside it is not an eigenpair of the pencil to any useful accuracy
+    -- an inaccurate factorization returns a pile of them on the shift -- so it
+    never reaches the filter, which would judge its envelope like any other.
+    """
+    if "backward_error" not in dataset or not dataset.sizes.get("eigenpair", 0):
+        return dataset, 0
+    errors = np.asarray(dataset["backward_error"].values, dtype=float)
+    keep = np.flatnonzero(~(errors > BACKWARD_ERROR_GATE))     # nan: not measured, kept
+    return dataset.isel(eigenpair=keep), int(errors.size - keep.size)
+
+
+def _window_row(index, window, nev, dataset, seconds, dropped=0) -> WindowRow:
     """What one window did, read from its dataset's SLEPc attributes."""
     attrs = dataset.attrs
     nconv = int(attrs.get("nconv", 0))
@@ -1297,7 +1401,7 @@ def _window_row(index, window, nev, dataset, seconds) -> WindowRow:
         status = "empty" if reason in ("1", "2") else "unconverged"
     else:
         status = "saturated" if nconv >= nev else "ok"
-    return WindowRow(index, window, nev, nconv=nconv, kept=kept,
+    return WindowRow(index, window, nev, nconv=nconv, kept=kept, dropped=int(dropped),
                      iterations=int(attrs.get("iterations", 0)), reason=reason,
                      status=status, seconds=seconds)
 
@@ -1376,6 +1480,32 @@ def _khz(equilibrium, omega) -> np.ndarray:
 
 # no continuum at all: MODELOCATE then runs its spike, core and edge tests only
 _NO_CONTINUUM = (np.array([0.0, 1.0]), np.full((2, 0), np.nan, dtype=complex))
+
+
+def _apply_path_thresholds(located, tolerance: float, min_correlation: float):
+    """The path verdicts at these thresholds, on a copy of ``located``.
+
+    Gap if a mode moved by no more than ``tolerance`` (relative) on either path
+    and kept a harmonic correlation of at least ``min_correlation``; continuum
+    otherwise. What the paths could not judge -- an ideal mode, or a test that
+    found nothing or could not rise -- stays so whatever the thresholds.
+    """
+    drift = np.asarray(located["path_drift"].values, dtype=float)
+    correlation = np.asarray(located["path_correlation"].values, dtype=float)
+    ideal = (np.asarray(located["path_ideal"].values, dtype=bool) if "path_ideal" in located
+             else np.asarray(located["mode_class"].values) == 16)
+    judged = np.isfinite(drift) & np.isfinite(correlation)
+    gap = judged & (drift <= float(tolerance)) & (correlation >= float(min_correlation))
+    labels = np.where(ideal, "ideal", np.where(~judged, "inconclusive",
+                                               np.where(gap, "gap", "continuum")))
+    codes = np.where(ideal, 16, np.where(~judged, INCONCLUSIVE, np.where(gap, 0, 8)))
+    located = located.copy()
+    located["mode_label"] = ("eigenpair", labels.astype(str))
+    located["mode_class"] = ("eigenpair", codes.astype(np.int32))
+    located["mode_class"].attrs["legend"] = PATH_LEGEND
+    located.attrs.update(path_tolerance=float(tolerance),
+                         path_correlation=float(min_correlation))
+    return located
 
 
 def _dispatch_gamma(scan, state) -> float:

@@ -42,7 +42,7 @@ def run_in_offscreen_qt(body: str) -> str:
 
         def load_itpa():
             window.equilibrium.set_state(
-                EquilibriumState(source="itpa", itpa_ns=48, itpa_ntheta=48))
+                EquilibriumState(source="itpa", itpa_ns=48, itpa_ntheta=48, species="H"))
             wait_until(lambda: window.equilibrium.view is not None
                        and not window.equilibrium._loading)
     ''') + textwrap.dedent(body)
@@ -56,7 +56,7 @@ def run_in_offscreen_qt(body: str) -> str:
     return completed.stdout
 
 
-def test_the_window_has_three_tabs_and_the_continuum_one_is_the_old_window():
+def test_the_window_has_three_tabs():
     out = run_in_offscreen_qt('''
         print("TABS", [window.tabs.tabText(i) for i in range(window.tabs.count())])
         print("CONTINUUM", type(window.continuum).__name__)
@@ -163,6 +163,170 @@ def test_solving_itpa_fills_the_tables_and_a_settings_change_marks_it_stale():
     assert "STALE_AFTER True" in out
 
 
+def test_legend_picks_hide_lines_and_the_continuum_view_puts_zero_on_the_mode():
+    pytest.importorskip("slepc4py")
+    out = run_in_offscreen_qt('''
+        from matplotlib.backend_bases import MouseEvent
+        load_itpa()
+        solver = window.solver
+        solver.set_state(SolverState(ntor=6, mmax=20, max_dm=5, regularizer=1e-5,
+                                     gamma_s=0.0, species="H", f_low_khz=68.0,
+                                     f_high_khz=72.0, window_width_khz=4.0, nev=4,
+                                     tol=1e-7, maxit=80, spans=100))
+        solver.solve()
+        wait_until(lambda: solver.result is not None and not solver._solving)
+        print("DEFAULT_VIEW", solver.state.mode_view)
+        solver.mode_view_combo.setCurrentIndex(solver.mode_view_combo.findData("harmonics"))
+        canvas = solver.mode_canvas
+
+        def click(label, dblclick=False):
+            canvas.draw()
+            legend = canvas.figure.axes[-1].get_legend()
+            text = next(t for t in legend.get_texts() if t.get_text() == label)
+            box = text.get_window_extent()
+            x, y = (box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2
+            MouseEvent("button_press_event", canvas, x, y, button=1,
+                       dblclick=dblclick)._process()
+            app.processEvents()
+
+        def shown():
+            return sorted(line.get_label() for ax in canvas.figure.axes
+                          for line in ax.get_lines()
+                          if line.get_visible() and not line.get_label().startswith("_"))
+
+        everything = shown()
+        click("m = 10")
+        print("HIDDEN", "m = 10" not in shown(), len(shown()) == len(everything) - 1)
+        click("m = 10")
+        print("BACK", shown() == everything)
+        click("m = 11"); click("m = 11", dblclick=True)
+        print("ALONE", shown())
+        click("m = 11"); click("m = 11", dblclick=True)
+        print("ALL_AGAIN", shown() == everything)
+
+        click("m = 10")
+        solver.mode_view_combo.setCurrentIndex(solver.mode_view_combo.findData("continuum"))
+        print("VIEW", solver.state.mode_view, solver._result_is_stale())
+        ax, twin = canvas.figure.axes[0], canvas.figure.axes[-1]
+        canvas.draw()
+        f = solver.result.mode_rows()[solver.selected]["frequency_khz"]
+        (low, high), (bottom, top) = ax.get_ylim(), twin.get_ylim()
+        print("ZERO_ON_F", abs((f - low) / (high - low) + bottom / (top - bottom)) < 1e-9)
+        print("STILL_HIDDEN", "m = 10" not in shown(), "continuum" in shown())
+
+        # many harmonics: the strongest are named, the rest share one entry
+        import supernova.gui.solver as module
+        module.LEGEND_HARMONICS = 4
+        solver.mode_toggles.hidden.clear()
+        solver._draw_mode()
+        legend = canvas.figure.axes[-1].get_legend()
+        names = [text.get_text() for text in legend.get_texts()]
+        print("NAMED", sum(name.startswith("m = ") for name in names),
+              module.WEAKER_HARMONICS in names)
+        click(module.WEAKER_HARMONICS)
+        twin = canvas.figure.axes[-1]
+        print("WEAKER_HIDDEN", sum(line.get_visible() for line in twin.get_lines()
+                                   if line.get_label() == "_nolegend_"),
+              len(shown()))
+    ''')
+    assert "HIDDEN True True" in out
+    assert "BACK True" in out
+    assert "ALONE ['m = 11']" in out
+    assert "ALL_AGAIN True" in out
+    assert "VIEW continuum False" in out           # a view change is not a new solve
+    assert "ZERO_ON_F True" in out
+    assert "STILL_HIDDEN True True" in out
+    assert "DEFAULT_VIEW continuum" in out
+    assert "NAMED 4 True" in out
+    assert "WEAKER_HIDDEN 0 6" in out              # 4 named + continuum + mode frequency
+
+
+def test_a_saved_session_brings_the_solve_back_without_solving_again(tmp_path):
+    """Save after a solve; a fresh window reloads the equilibrium and takes the
+    pass back onto it, with the same mode picked -- and solves nothing."""
+    pytest.importorskip("slepc4py")
+    path = tmp_path / "session.h5"
+    out = run_in_offscreen_qt(f'''
+        load_itpa()
+        solver = window.solver
+        solver.set_state(SolverState(ntor=6, mmax=20, max_dm=5, regularizer=1e-5,
+                                     gamma_s=0.0, species="H", f_low_khz=68.0,
+                                     f_high_khz=72.0, window_width_khz=2.0, nev=4,
+                                     tol=1e-7, maxit=80, spans=100))
+        solver.solve()
+        wait_until(lambda: solver.result is not None and not solver._solving)
+        solver.selected = solver.result.mode_count - 1
+        window.write_session(r"{path}")
+        before = solver.result
+
+        fresh = SupernovaWindow()
+        fresh.compute.submit = lambda kind, *a, _submit=fresh.compute.submit, **k: (
+            print("SUBMITTED", kind) or _submit(kind, *a, **k))
+        fresh.load_session(r"{path}")
+        wait_until(lambda: fresh.solver.result is not None)
+        after = fresh.solver.result
+        print("SAME_MODES", list(after.frequency_khz) == list(before.frequency_khz))
+        print("SAME_WINDOWS", after.windows == before.windows)
+        print("ON_THE_NEW_LOAD", after.handle == fresh.solver.view.handle,
+              fresh.solver._result_is_stale())
+        print("PICKED", fresh.solver.selected == before.mode_count - 1)
+        print("TABLE", fresh.solver.mode_table.rowCount() == before.mode_count)
+        print("LOG", "session restored" in fresh.solver.log.toPlainText())
+        fresh.close()
+    ''')
+    assert "SAME_MODES True" in out
+    assert "SAME_WINDOWS True" in out
+    assert "ON_THE_NEW_LOAD True False" in out
+    assert "PICKED True" in out
+    assert "TABLE True" in out
+    assert "LOG True" in out
+    assert "SUBMITTED solve" not in out
+    assert "SUBMITTED load_equilibrium" in out
+
+
+def test_the_path_tolerance_relabels_a_path_pass_without_solving_again():
+    """The global path runs on its own; its thresholds are applied after the solve."""
+    pytest.importorskip("slepc4py")
+    out = run_in_offscreen_qt('''
+        load_itpa()
+        solver = window.solver
+        solver.set_state(SolverState(ntor=6, mmax=20, max_dm=5, regularizer=1e-5,
+                                     gamma_s=0.0, species="H", f_low_khz=68.0,
+                                     f_high_khz=72.0, window_width_khz=4.0, nev=6,
+                                     tol=1e-7, maxit=80, spans=100, mode_filter="path"))
+        print("MODELOCATE_FORM_HIDDEN", solver.locate_form.isHidden())
+        solver.solve()
+        wait_until(lambda: solver.result is not None and not solver._solving)
+        result = solver.result
+        print("NO_MODELOCATE_LABELS", not set(result.labels) & {"spike", "core", "edge"})
+        headers = [solver.mode_table.horizontalHeaderItem(i).text()
+                   for i in range(solver.mode_table.columnCount())]
+        print("PATH_COLUMNS", "path drift" in headers and "path correlation" in headers)
+        windows = [solver.window_table.horizontalHeaderItem(i).text()
+                   for i in range(solver.window_table.columnCount())]
+        print("DROPPED_COLUMN", "dropped" in windows)
+        before = list(result.labels)
+        solver.compute.submit = lambda kind, *a, **k: print("SUBMITTED", kind)
+        solver.path_tolerance_edit.setText("0.01")          # typed, as a user would
+        solver.path_tolerance_edit.editingFinished.emit()
+        after = list(solver.result.labels)
+        print("RELABELLED", after != before and after.count("gap") > before.count("gap"))
+        print("STALE", solver._result_is_stale())
+        import numpy as np
+        print("SAME_DRIFT", np.array_equal(solver.result.located["path_drift"].values,
+                                           result.located["path_drift"].values,
+                                           equal_nan=True))
+    ''')
+    assert "MODELOCATE_FORM_HIDDEN True" in out
+    assert "NO_MODELOCATE_LABELS True" in out
+    assert "PATH_COLUMNS True" in out
+    assert "DROPPED_COLUMN True" in out
+    assert "RELABELLED True" in out
+    assert "STALE False" in out
+    assert "SAME_DRIFT True" in out
+    assert "SUBMITTED solve" not in out
+
+
 def test_closing_the_window_with_an_idle_worker_exits_cleanly():
     """Regression: an idle QThread worker aborted the process on exit."""
     out = run_in_offscreen_qt('''
@@ -193,34 +357,32 @@ def test_a_new_state_gets_its_own_continuum_preview_after_one_has_arrived():
 
 # ------------------------------------------------------- sharing between tabs
 
-def test_a_shared_load_reaches_the_solver_and_writes_the_continuum_choices():
+def test_a_shared_load_reaches_the_continuum_and_solver_tabs():
     out = run_in_offscreen_qt('''
-        import dataclasses
         from supernova.gui._equilibrium import EquilibriumModel
         view = EquilibriumModel().load(
             EquilibriumState(source="itpa", itpa_ns=16, itpa_ntheta=16))
-        inputs = {"eqdsk": "/nowhere/shot.geqdsk", "cocos_in": 7,
-                  "boozer_min": 0.01, "boozer_max": 0.98,
-                  "density_file": "/nowhere/ne.dat", "density_units": "m^-3",
-                  "density_x": "psi_n", "density_interpolate_in": "rho_pol"}
-        window._on_equilibrium(dataclasses.replace(view, inputs=inputs), True)
-        c = window.continuum
-        print("SOLVER", window.solver.view is not None)
-        print("CONTINUUM", c.eqdsk_edit.text(), c.cocos_spin.value(),
-              c.density_edit.text(), c.boozer_max.value())
+        window._on_equilibrium(view, True)
+        print("SAME", window.continuum.view is view, window.solver.view is view)
+        print("LABEL", window.continuum.equilibrium_label.text())
     ''')
-    assert "SOLVER True" in out
-    assert "CONTINUUM /nowhere/shot.geqdsk 7 /nowhere/ne.dat 0.98" in out
+    assert "SAME True True" in out
+    assert "ITPA" in out
 
 
-def test_an_itpa_load_leaves_the_continuum_tab_alone():
+def test_the_continuum_tab_solves_on_the_loaded_equilibrium():
+    """Even the analytic ITPA case, which the tab could not load on its own."""
     out = run_in_offscreen_qt('''
         load_itpa()
-        print("SOLVER", window.solver.view is window.equilibrium.view)
-        print("CONTINUUM_EQDSK", repr(window.continuum.state.eqdsk))
+        c = window.continuum
+        c.ntor_spin.setValue(6)
+        wait_until(lambda: c.result is not None and c.result.ntor == 6 and not c._solving)
+        print("SAME", c.view is window.equilibrium.view)
+        print("BRANCHES", c.result.n_branches > 0)
+        print("RADII", round(float(c.result.psi_n[0]), 4), round(float(c.result.psi_n[-1]), 4))
     ''')
-    assert "SOLVER True" in out
-    assert "CONTINUUM_EQDSK ''" in out
+    assert "SAME True" in out
+    assert "BRANCHES True" in out
 
 
 def test_a_re_solve_kept_to_its_tab_is_not_passed_on():
@@ -234,7 +396,8 @@ def test_a_re_solve_kept_to_its_tab_is_not_passed_on():
             EquilibriumState(source="itpa", itpa_ns=24, itpa_ntheta=24))
         eq._comparison_pending, eq._share_refined = True, False
         eq._on_loaded(refined)
-        print("KEPT", solver.view is first, eq.view is refined)
+        print("KEPT", solver.view is first, eq.view is refined,
+              window.continuum.view is first)
         print("SUMMARY_SAYS", "Kept to this tab" in eq.summary_label.text())
         again = EquilibriumModel().load(
             EquilibriumState(source="itpa", itpa_ns=20, itpa_ntheta=20))
@@ -242,24 +405,30 @@ def test_a_re_solve_kept_to_its_tab_is_not_passed_on():
         eq._on_loaded(again)
         print("PASSED", solver.view is again)
     ''')
-    assert "KEPT True True" in out
+    assert "KEPT True True True" in out
     assert "SUMMARY_SAYS True" in out
     assert "PASSED True" in out
 
 
-def test_an_empty_equilibrium_tab_takes_the_continuum_tabs_choices():
-    out = run_in_offscreen_qt('''
-        c = window.continuum
-        c.eqdsk_edit.setText("/nowhere/shot.geqdsk")
-        c.density_edit.setText("/nowhere/ne.dat")
-        c.cocos_spin.setValue(7)
-        window.tabs.setCurrentIndex(1)
-        window.tabs.setCurrentIndex(0)
+def test_an_old_continuum_session_fills_the_equilibrium_form(tmp_path):
+    """Its continuum settings go to the Continuum tab, its file and density to
+    the Equilibrium tab's form, unloaded."""
+    import json
+
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"eqdsk": "/nowhere/shot.geqdsk", "cocos_in": 7,
+                                "density_file": "/nowhere/ne.dat", "ntor": 4}))
+    out = run_in_offscreen_qt(f'''
+        window.load_session(r"{path}")
         eq = window.equilibrium
         print("FILLED", eq.eqdsk_edit.text(), eq.density_edit.text(),
               eq.cocos_spin.value(), eq._loading)
+        print("NTOR", window.continuum.ntor_spin.value())
+        print("TAB", window.tabs.tabText(window.tabs.currentIndex()))
     ''')
     assert "FILLED /nowhere/shot.geqdsk /nowhere/ne.dat 7 False" in out
+    assert "NTOR 4" in out
+    assert "TAB Equilibrium" in out
 
 
 # ------------------------------------------------------ the compute process
