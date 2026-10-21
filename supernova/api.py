@@ -61,6 +61,12 @@ _FACTORIZATIONS = {
         "st_ksp_type": "preonly",
         "st_pc_type": "lu",
         "st_pc_factor_mat_solver_type": "mumps",
+        # MUMPS's own threshold, 0.01, lets the shifted operator through with
+        # pivots inaccurate enough that at many radial element counts (most odd
+        # ones) every root comes back with a backward error ~1e-4, piled on the
+        # shift. 0.1 gives 1e-18 - 1e-15 on every mesh tried; 0.5 runs MUMPS
+        # out of workspace.
+        "st_mat_mumps_cntl_1": "0.1",
     },
     "spqr": {
         "st_ksp_type": "preonly",
