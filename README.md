@@ -1,8 +1,22 @@
-# superNOVA
+<p align="center">
+  <img src="docs/img/supernova_logo.png" alt="superNOVA" width="520">
+</p>
 
 Linear ideal-MHD stability of tokamak equilibria: Boozer coordinates,
-continuum spectrum and global eigenmodes on a radial finite-element ×
-poloidal Fourier basis.  PyPI-style name `pynova`, import name `supernova`.
+sound-Alfvén continuum and global eigenmodes on a radial B-spline finite-element
+× poloidal Fourier basis, solved with SLEPc.  The distribution is called
+`pynova`; the import name is `supernova`.
+
+- **Equilibria** from a g-EQDSK file (through
+  [pyCOCOS](https://github.com/pablo-oyola/pyCOCOS), any COCOS), from DESC, or
+  analytic (the ITPA TAE benchmark), with an optional TokaMaker fixed-boundary
+  re-solve.
+- **Continuum** for any toroidal mode number, with or without sound coupling.
+- **Eigenmodes** in a frequency band, swept window by window with
+  shift-and-invert, and sorted into gap modes and continuum-resonant ones
+  (Kramer's `modelocate`).
+- **Two front ends**: a Python API for scripts and a desktop window with
+  Equilibrium, Continuum and Solver tabs.
 
 ## Installation
 
@@ -12,7 +26,7 @@ so the stack is compiled from the official `petsc`/`slepc` source
 distributions by one script that pins every version:
 
 ```bash
-git clone git@github.com:pablo-oyola/superNOVA-2.git supernova
+git clone git@github.com:pablo-oyola/superNOVA.git supernova
 cd supernova
 python3.12 tools/install_stack.py --venv .venv          # ~15-30 min, mostly PETSc
 source .venv/bin/activate
@@ -33,21 +47,207 @@ git, and an MPI with Fortran wrappers (`mpicc`, `mpifort`) unless you pass
 sudo apt install build-essential gfortran cmake git python3-venv libopenmpi-dev
 ```
 
+The desktop window needs PySide6, which the stack script does not install.
+Inside the activated environment:
+
+```bash
+pip install -e ".[gui]"
+```
+
 ### Without the compiled stack
 
 `pip install .` alone installs the pure-Python layers (equilibrium, Boozer
 coordinates, continuum, verification).  Anything that reaches the eigenvalue
 backend raises an `ImportError` naming `petsc4py`/`slepc4py`.
 
-## Running
+## Quick start: the ITPA TAE benchmark
+
+The analytic ITPA equilibrium needs no input file and solves in a couple of
+seconds, so it is the place to start.  It is a circular plasma with
+R₀ = 10 m, a = 1 m, B₀ = 3 T, q rising from 1.71 to 1.87, hydrogen ions, and
+the sound coupling switched off (γ = 0).  The benchmark mode is the n = 6
+TAE in the gap between the m = 10 and m = 11 continua, near ψ_N ≈ 0.25.
+
+### From a script
+
+```python
+import matplotlib.pyplot as plt
+import unyt
+
+import supernova as sn
+from supernova.cases.itpa import ITPAEq
+
+# MUMPS's default workspace headroom, ICNTL(14) = 20 %, runs out on these
+# pencils under SLEPc 3.25; the GUI uses 200 % as well.
+mumps = sn.PetscOptions(extra={"st_mat_mumps_icntl_14": "200"})
+
+# 1. Equilibrium and continuum: built once, reused by every scan.
+equilibrium = ITPAEq(aminor=1.0 * unyt.m, Rmajor=10.0 * unyt.m, B0=3.0 * unyt.T,
+                     q0=1.71, qedge=1.87, ns=256, ntheta=256, m_max=20)
+continuum = sn.superContinuum(equilibrium, gamma_s=0.0, species="H")
+case = sn.Case(equilibrium, continuum)
+
+# 2. n = 6 on 100 cubic B-spline elements, harmonics up to m = 20.
+scan = sn.Scan(case, sn.RadialGrid.uniform(spans=100), ntor=6, mmax=20,
+               max_dm=5, regularizer=1e-5)
+
+# 3. Search 60-76 kHz in one window for 4 roots.
+modes = scan.run(sn.Band(60.0, 76.0, units="kHz"), window=16.0, nev=4,
+                 tol=1e-7, maxit=80, options=mumps)
+
+print(modes.frequency_khz)            # every root found in the band
+tae = modes.gap_modes()               # those modelocate calls gap modes
+print(tae.frequency_khz, tae.centroid, tae.width)
+
+# 4. The mode on its continuum, and its poloidal harmonics.
+fig, (left, right) = plt.subplots(1, 2, figsize=(10, 4))
+psi = scan.continuum.coords["psi"].values
+left.plot(psi, scan.band_for(scan.continuum["omega"].values.real), "k.", ms=1)
+left.axhline(tae.frequency_khz[0], color="C3")
+left.set(xlabel=r"$\psi_N$", ylabel="f [kHz]", ylim=(0, 150))
+
+xi = tae.field("xi_psi").isel(eigenpair=0)      # dims: x, m_pol
+for m in xi.m_pol.values:
+    right.plot(xi.x, xi.sel(m_pol=m).real, label=f"m = {m}")
+right.set(xlabel=r"$\psi_N$", ylabel=r"Re $\xi^\psi$")
+right.legend()
+plt.show()
+```
+
+The scan returns five roots between 69.95 and 71.02 kHz.  Only the first,
+at **69.954 kHz**, is a gap mode; the other four sit on the continuum.  The
+gap mode is centred at ψ_N ≈ 0.25 and is dominated by the m = 10 and 11
+harmonics.
+
+Every result wraps the solver's `xarray.Dataset` (`modes.dataset`).  The main
+objects are listed below:
+
+| Object | What it is |
+|---|---|
+| `Case` | equilibrium + continuum; `Case.from_eqdsk(...)` and `Case.from_refined(...)` build one from a file |
+| `RadialGrid` | the radial finite elements: `.uniform(spans)` or `.graded(spans, centers, local)` |
+| `Band` | a frequency band in physical units, converted to the solver's normalised ω² |
+| `Scan` | one toroidal mode number on one grid; `.run(band, window=...)` sweeps the band |
+| `ModeSet` | the roots: `.frequency_khz`, `.growth_rate_khz`, `.field(name)`, `.locate()`, `.gap_modes()`, `.centroid`, `.width`, `.to_netcdf(path)` |
+| `PetscOptions` | the shift-and-invert factorisation (`mumps`, `spqr`, `petsc_qr`) plus raw PETSc options |
+
+### From the GUI
 
 ```bash
-supernova solve --help          # also: reclassify, reacquire
-python -m supernova --help
+supernova gui                 # or: python -m supernova gui
 ```
+
+The window has three tabs.  The Equilibrium tab loads an equilibrium and
+passes it to the Continuum and Solver tabs.  It is the same object in all
+three, held by one compute process.
+
+1. **Equilibrium tab.**  In the *Equilibrium* box, choose
+   *ITPA TAE benchmark (analytic)*.  The fields already hold the published
+   configuration (a = 1 m, R0 = 10 m, B0 = 3 T, q0 = 1.71, q edge = 1.87,
+   m_max = 20).  Set *ion species* to **H** and press **Load equilibrium**.
+   The *Shape*, *Profiles* and *Surface* pages show the Boozer grid, the 1-D
+   profiles and any metric element on one flux surface.
+2. **Continuum tab.**  Set *n* = 6, *gamma_s* = 0 and *mmax* = 20.  The
+   continuum redraws on every edit.  Under *View*, a band of 60-76 kHz marks
+   the search range on the plot.
+3. **Solver tab.**
+   - *Problem*: *n / mmax* = 6 / 20, *max dm / regularizer* = 5 / 1e-5,
+     *gamma_s* = 0.  The species is greyed out because it is taken from the
+     Equilibrium tab.
+   - *Frequency search*: *band* = 60-76 kHz, *window* = 16 kHz,
+     *nev* = 4, *tol / maxit* = 1e-7 / 80.
+   - *Radial grid*: *spans* = 100.
+
+   Then press **Solve**.  The roots appear on the continuum in the *Spectrum*
+   page.  *Mode structure* draws the selected root's harmonics.  *show gap
+   modes only* keeps the modes `modelocate` accepts.  *Refine selected modes*
+   re-solves the chosen modes on graded meshes to check their convergence.
+4. **Save.**  *File → Save session…* (Ctrl+Shift+S) writes every tab's
+   settings and the solver's results to one HDF5 file.  Reopen it with
+   `supernova gui session.h5`; the equilibrium is loaded again and the roots
+   are put back.
+
+For a g-EQDSK, choose *g-EQDSK file* in step 1 instead.  Then give the file,
+its COCOS and a density, either a two-column file or a uniform value.  Without
+a density the geometry still loads, but the kHz scale in the other tabs is
+marked as a placeholder.
+
+## Your own equilibrium
+
+The same scan, on an eqdsk with a measured density:
+
+```python
+import supernova as sn
+
+case = sn.Case.from_eqdsk(
+    "shot.geqdsk", cocos_in=5,
+    density=sn.profile_from_columns("ne.dat", units="m^-3"),   # psi_N, n_e
+    boozer_domain=(0.005, 0.995), gamma_s=5 / 3, species="D",
+)
+scan = sn.Scan(case, sn.RadialGrid.uniform(spans=150), ntor=4, mmax=40, max_dm=5)
+modes = scan.run(sn.Band(50, 150, units="kHz"), window=2.5, nev=8,
+                 sound_model="nova",
+                 options=sn.PetscOptions(extra={"st_mat_mumps_icntl_14": "200"}))
+```
+
+`sound_model="nova"` drops the parallel sound coupling, as NOVA-K's
+`ksound = 1` does.  The full sound-Alfvén problem at γ = 5/3 (the default
+`"ideal"` model) is not ready for production use yet; in the GUI the same
+choice is the *sound* row of the Solver tab's *Problem* box.
+
+`ne.dat` has one header line, then ψ_N and n_e columns; `x="rho_pol"` reads
+a ρ_pol column instead.  Pressure comes from the eqdsk unless `pressure=` is
+given as a `Profile`.  `boozer_domain` is in ρ_pol and keeps the Boozer
+transform away from the axis and the separatrix.  `case.with_continuum(gamma_s=0)`
+swaps the continuum without repeating the Boozer transform, which is the slow
+step.  For a band crossed by many continuum branches, use the multigrid
+classification pipeline (`supernova.MultigridSolver`, or `supernova solve`
+below).
+
+## Command line
+
+```bash
+supernova solve --equilibrium shot.geqdsk --density ne.dat --cocos-in 5 \
+                --ntor 4 --frequency-khz 50 150 --artifact-dir runs/n4
+supernova reclassify --artifact-dir runs/n4    # re-sort saved roots, no SLEPc
+supernova reacquire  --artifact-dir runs/n4    # follow roots lost between levels
+supernova gui [session.h5]
+```
+
+`solve` runs the multigrid scan: three radial levels, each root tracked
+across them and classified from that evidence.  `supernova <command> --help`
+lists every option.
 
 `OMP_NUM_THREADS` controls the OpenMP threads used by MUMPS and OpenBLAS.
 Under `mpiexec`, keep `OMP_NUM_THREADS × ranks` at or below the core count.
+The GUI's Solver tab sets its own split under *Parallel windows*.
+
+## Package layout
+
+| Module | Contents |
+|---|---|
+| `supernova.api` | `Case`, `Scan`, `Band`, `RadialGrid`, `ModeSet`: the script-facing surface |
+| `supernova.equilibrium` | `superEquilibrium`: Boozer coordinates and metric from an eqdsk |
+| `supernova.cases.itpa` | `ITPAEq`, the analytic ITPA TAE equilibrium |
+| `supernova.continuum` | `superContinuum`: the sound-Alfvén continuum |
+| `supernova.radial` | B-spline finite elements, graded meshes, radial profiles |
+| `supernova.operators` | block assembly, boundary conditions, projections |
+| `supernova.eigen` | SLEPc/PETSc backends (GEVP for γ = 0, PEP otherwise) |
+| `supernova.solve` | `StabilitySolver`, `MultigridSolver`, `modelocate`, gap estimates |
+| `supernova.refine` | TokaMaker fixed-boundary re-solve of an eqdsk |
+| `supernova.interop` | DESC equilibria |
+| `supernova.gui` | the desktop window; `python -m supernova.gui.solver` (or `.equilibrium`, `.continuum`) opens one tab |
+| `supernova.app` | the workflow behind `supernova solve/reclassify/reacquire` |
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest tests
+```
+
+`tests/test_itpa_acceptance.py` runs the quick-start case end to end against
+reference frequencies.
 
 ## Conventions
 

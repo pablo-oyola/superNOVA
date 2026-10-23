@@ -25,3 +25,5 @@ dist/
 .venv/
 *.whl
 install-stack.log
+# README images, exempt from the *.png rule above
+!docs/img/*.png
