@@ -210,6 +210,8 @@ def classify_full_modes_at_radius(
 
 @dataclass
 class ContinuumClassifier:
+    """Label continuum eigenmodes Alfvenic, sound or mixed from their eigenvectors."""
+
     vr: np.ndarray
     vl: np.ndarray
     w: np.ndarray

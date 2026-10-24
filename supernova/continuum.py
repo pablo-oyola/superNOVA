@@ -48,16 +48,15 @@ def _eigh_signed_definite(A: np.ndarray, B: np.ndarray) -> np.ndarray:
 
 
 class superContinuum:
-    """
-    """
+    """The sound-Alfven continuum of a superEquilibrium, for any toroidal mode number."""
     def __init__(self, equ: superEquilibrium, gamma_s: float=5/3, species: str='D',
                  dense: bool=True):
         """
         Initializes the class by calling the superEquilibrium constructor and
         setting the parameters for the continuum solver.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         dense: bool
             Whether to use a dense grid in the radial direction for the continuum solver.
         gamma_s: float
@@ -145,8 +144,8 @@ class superContinuum:
         """
         Solves the continuum spectrum for the given equilibrium and parameters.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         ntor: int
             The toroidal mode number to consider for the continuum spectrum.
         psi_vals: np.ndarray, optional
@@ -162,8 +161,8 @@ class superContinuum:
         **classify_kwargs
             Additional keyword arguments for the classification.
 
-        Returns:
-        --------
+        Returns
+        -------
         frequencies: np.ndarray
             The computed continuum frequencies at the specified psi values.
         eigvecs: Optional[np.ndarray]
@@ -347,15 +346,15 @@ class superContinuum:
         """
         Constructs the A and B matrices without solving the eigenvalue problem.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         ntor: int
             The toroidal mode number to consider for the continuum spectrum.
         psi_vals: np.ndarray, optional
             The specific values of the poloidal flux to evaluate the continuum spectrum at. If None, it will be evaluated at all available radial points.
 
-        Returns:
-        --------
+        Returns
+        -------
         A: np.ndarray
             The A matrix of the generalized eigenvalue problem.
         B: np.ndarray
@@ -435,8 +434,8 @@ def continuum_crossings(x: float, w: np.ndarray, freq: float) -> np.ndarray:
     """
     Returns the points where the continuum crosses a given frequency.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     x: np.ndarray
         The radial positions (normalized poloidal flux).
     w: np.ndarray
@@ -444,8 +443,8 @@ def continuum_crossings(x: float, w: np.ndarray, freq: float) -> np.ndarray:
     freq: float
         The frequency to find crossings with.
 
-    Returns:
-    --------
+    Returns
+    -------
     crossings: np.ndarray
         The x positions where the continuum crosses the given frequency.
     """
@@ -479,8 +478,8 @@ def get_knots_clustered_at(x: np.ndarray, nknots: int, eta: float=1e-5,
     """
     Returns a set of knots clustered at the points in x.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     x: np.ndarray
         The points to cluster the knots around.
     nknots: int
@@ -489,8 +488,8 @@ def get_knots_clustered_at(x: np.ndarray, nknots: int, eta: float=1e-5,
         If provided, this will provide a way to distribute better the 
         knots.
 
-    Returns:
-    --------
+    Returns
+    -------
     knots: np.ndarray
         The generated knots clustered around the points in x.
     """
