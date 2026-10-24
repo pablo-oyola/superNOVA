@@ -27,3 +27,5 @@ dist/
 install-stack.log
 # README images, exempt from the *.png rule above
 !docs/img/*.png
+docs/_build/
+docs/generated/

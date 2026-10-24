@@ -43,6 +43,8 @@ desc = ["desc-opt>=0.17.3,<0.18"]
 tokamaker = ["freeqdsk<0.4.0"]
 dev = ["pytest>=8"]
 gui = ["pyside6-essentials", "matplotlib", "h5netcdf"]
+# The Sphinx site (docs/, deployed by .github/workflows/docs.yml).
+docs = ["sphinx>=7", "sphinx-rtd-theme>=2", "myst-parser>=3"]
 
 [project.scripts]
 supernova = "supernova.cli:main"

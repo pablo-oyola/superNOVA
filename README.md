@@ -2,6 +2,12 @@
   <img src="docs/img/supernova_logo.png" alt="superNOVA" width="520">
 </p>
 
+<p align="center">
+  <a href="https://pablo-oyola.github.io/superNOVA/"><b>Documentation</b></a> ·
+  <a href="https://github.com/pablo-oyola/superNOVA/actions/workflows/docs.yml"><img src="https://github.com/pablo-oyola/superNOVA/actions/workflows/docs.yml/badge.svg" alt="Docs"></a>
+</p>
+
+<!-- docs-intro-start -->
 Linear ideal-MHD stability of tokamak equilibria: Boozer coordinates,
 sound-Alfvén continuum and global eigenmodes on a radial B-spline finite-element
 × poloidal Fourier basis, solved with SLEPc.  The distribution is called
@@ -17,7 +23,9 @@ sound-Alfvén continuum and global eigenmodes on a radial B-spline finite-elemen
   (Kramer's `modelocate`).
 - **Two front ends**: a Python API for scripts and a desktop window with
   Equilibrium, Continuum and Solver tabs.
+<!-- docs-intro-end -->
 
+<!-- docs-guide-start -->
 ## Installation
 
 The solver needs PETSc and SLEPc built with **complex scalars**, the **MUMPS**
@@ -147,9 +155,10 @@ three, held by one compute process.
    m_max = 20).  Set *ion species* to **H** and press **Load equilibrium**.
    The *Shape*, *Profiles* and *Surface* pages show the Boozer grid, the 1-D
    profiles and any metric element on one flux surface.
-2. **Continuum tab.**  Set *n* = 6, *gamma_s* = 0 and *mmax* = 20.  The
-   continuum redraws on every edit.  Under *View*, a band of 60-76 kHz marks
-   the search range on the plot.
+2. **Continuum tab.**  Set *n* = 6, *gamma_s* = 0, *mmax* = 20 and
+   *branches* to *no sound (Alfven only)*.  The continuum redraws on every
+   edit.  Under *View*, *f max* = 150 and *shade band* = 60-76 kHz show the
+   TAE gap and the search range.
 3. **Solver tab.**
    - *Problem*: *n / mmax* = 6 / 20, *max dm / regularizer* = 5 / 1e-5,
      *gamma_s* = 0.  The species is greyed out because it is taken from the
@@ -174,7 +183,9 @@ marked as a placeholder.
 
 ## Your own equilibrium
 
-The same scan, on an eqdsk with a measured density:
+The same scan, on an eqdsk with a measured density.  The
+[user guide](https://pablo-oyola.github.io/superNOVA/user_guide/equilibria.html)
+covers the other sources (DESC, TokaMaker refinement) and every option:
 
 ```python
 import supernova as sn
@@ -248,6 +259,7 @@ pytest tests
 
 `tests/test_itpa_acceptance.py` runs the quick-start case end to end against
 reference frequencies.
+<!-- docs-guide-end -->
 
 ## Conventions
 

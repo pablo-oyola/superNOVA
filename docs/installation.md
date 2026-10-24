@@ -1,8 +1,9 @@
 # Installation reference
 
 This page explains what `tools/install_stack.py` does, why each choice was
-made, and the conflicts it works around.  The short version is in the
-[README](../README.md).
+made, and the conflicts it works around.  The short version is the
+Installation section of the
+[README](https://github.com/pablo-oyola/superNOVA#installation).
 
 ## What gets built
 
