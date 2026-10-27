@@ -1,4 +1,4 @@
-"""``python -m supernova`` -- solve, reclassify, reacquire.
+"""``python -m supernova`` -- solve, reclassify, reacquire, gui, check, install-solver.
 
 A thin argparse shell over :mod:`supernova.app.workflow`.  The subcommands are
 the ones that survived the explorer's removal; ``serve`` and ``demo`` went with
@@ -133,6 +133,17 @@ def _parser() -> argparse.ArgumentParser:
         help="a session JSON saved from the window, or a continuum-only one "
              "from the old continuum window; omit to start empty")
 
+    subparsers.add_parser(
+        "check",
+        help="check that PETSc/SLEPc were built with complex scalars and MUMPS")
+
+    from supernova.eigen.stack import add_install_arguments
+
+    install = subparsers.add_parser(
+        "install-solver",
+        help="compile PETSc, SLEPc and their Python bindings with pip (15-30 min)")
+    add_install_arguments(install)
+
     return parser
 
 
@@ -150,6 +161,15 @@ def main() -> None:
 
         raise SystemExit(_gui_main(
             ["supernova"] + ([str(args.session)] if args.session else [])))
+    elif args.command == "check":
+        from supernova.eigen.stack import main as _check_main
+
+        raise SystemExit(_check_main([]))
+    elif args.command == "install-solver":
+        from supernova.eigen.stack import install_solver
+
+        raise SystemExit(install_solver(
+            args.extra_options, args.force, args.dry_run, args.verbose))
     else:
         raise SystemExit(f"unknown command: {args.command}")
 

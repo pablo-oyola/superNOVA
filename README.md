@@ -28,39 +28,54 @@ sound-Alfvén continuum and global eigenmodes on a radial B-spline finite-elemen
 <!-- docs-guide-start -->
 ## Installation
 
-The solver needs PETSc and SLEPc built with **complex scalars**, the **MUMPS**
-LU factorisation and **OpenMP**.  No binary wheel provides that combination,
-so the stack is compiled from the official `petsc`/`slepc` source
-distributions by one script that pins every version:
+Everything installs with pip into any Python 3.10-3.13 environment, for
+example a fresh conda one.  The machine needs C, C++ and Fortran compilers
+(`gcc`, `g++`, `gfortran`), `make`, `git` and internet access.  MPI, CMake and
+BLAS do not have to be installed first.
+
+```bash
+conda create -n supernova python=3.12 -y
+conda activate supernova
+
+pip install "pynova[gui] @ git+https://github.com/pablo-oyola/superNOVA.git"
+supernova install-solver
+```
+
+The first command installs superNOVA and its pure-Python dependencies in a
+minute.  The second compiles the eigenvalue backend, PETSc and SLEPc with
+their Python bindings, which took 20 minutes on a 20-core machine.  It runs pip
+four times in a row, and ends with `supernova check`, which confirms the
+build and solves one small shift-and-invert problem through MUMPS.  Run
+`supernova check` again at any time.
+
+The backend needs a step of its own because PyPI has PETSc and SLEPc only as
+source releases.  The solver needs them built with complex scalars and the
+MUMPS LU, and a plain `pip install petsc slepc` cannot do that.
+`install-solver` builds a serial PETSc that downloads its own CMake, OpenBLAS,
+METIS, MUMPS and SuiteSparse.  Its OpenBLAS picks CPU kernels at run time, so
+a build made on a login node also runs on compute nodes with another CPU.
+`supernova install-solver --dry-run` prints the pip commands, and
+`--extra-options=--with-make-np=8` appends a PETSc configure option, here
+for a login node that limits processes.
+
+For a development checkout:
 
 ```bash
 git clone git@github.com:pablo-oyola/superNOVA.git supernova
 cd supernova
-python3.12 tools/install_stack.py --venv .venv          # ~15-30 min, mostly PETSc
-source .venv/bin/activate
-supernova --help
+pip install -e ".[gui,dev]"
+supernova install-solver
 ```
 
-Add `--desc` for the optional DESC equilibrium reader, `--tokamaker` for the
-TokaMaker refinement layer, `--dev` for the test dependencies, `-e` for an
-editable install, and `--download-mpich` on a machine without an MPI.
-`--dry-run` prints the exact commands.  Full reference, prerequisites and the
-list of known conflicts: [docs/installation.md](docs/installation.md).
+| Extra | Adds |
+|---|---|
+| `gui` | the desktop window (PySide6) and HDF5 sessions |
+| `desc` | the DESC equilibrium reader (pulls JAX) |
+| `tokamaker` | the TokaMaker refinement layer (OpenFUSIONToolkit itself is not on pip) |
+| `dev`, `docs` | pytest; Sphinx |
 
-Prerequisites: Python 3.10-3.13 with `venv`, gcc/g++/gfortran, make, cmake,
-git, and an MPI with Fortran wrappers (`mpicc`, `mpifort`) unless you pass
-`--download-mpich`.  On Debian/Ubuntu:
-
-```bash
-sudo apt install build-essential gfortran cmake git python3-venv libopenmpi-dev
-```
-
-The desktop window needs PySide6, which the stack script does not install.
-Inside the activated environment:
-
-```bash
-pip install -e ".[gui]"
-```
+[docs/installation.md](docs/installation.md) explains every build option and
+lists the known pitfalls.
 
 ### Without the compiled stack
 

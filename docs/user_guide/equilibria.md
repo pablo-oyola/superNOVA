@@ -89,7 +89,7 @@ in a fraction of a second, which makes it the case to try things on.
 
 {py:class}`~supernova.interop.desc.DESCSolver` re-solves the equilibrium
 with DESC from a boundary, a q profile and a pressure profile. It needs the
-optional `desc` extra (`tools/install_stack.py --desc`). From an eqdsk, the
+optional `desc` extra (`pip install ".[desc]"`). From an eqdsk, the
 boundary, q and pressure come from the file:
 
 ```python

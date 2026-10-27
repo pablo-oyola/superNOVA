@@ -25,15 +25,12 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-# The eigenvalue backend.  These have no PyPI wheels and must be compiled
-# against a PETSc built with complex scalars, MUMPS and OpenMP; use
-# tools/install_stack.py, which pins the same versions and sets the configure
-# options.  Listed here so `pip check` and dependency tools see the contract.
-solver = [
-    "petsc4py>=3.25,<3.26",
-    "slepc4py>=3.25,<3.26",
-]
-mpi = ["mpi4py>=4.0,<5"]
+# The eigenvalue backend (petsc4py/slepc4py) is not an extra on purpose.
+# PyPI has PETSc and SLEPc only as source releases, they need complex scalars
+# and MUMPS, and `pip install petsc slepc` cannot build SLEPc against a PETSc
+# with MUMPS (the petsc wheel deletes the static MUMPS archives but keeps
+# their -l flags).  `supernova install-solver` runs the four pip builds in
+# order and repairs the flags in between; see supernova/eigen/stack.py.
 # DESC equilibria (supernova.interop.desc).  0.17.3 is the first release
 # whose caps (scipy<=1.18.0, numpy<=2.5.1) fit the rest of this stack.
 desc = ["desc-opt>=0.17.3,<0.18"]

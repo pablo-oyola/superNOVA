@@ -1,6 +1,6 @@
 """The ITPA TAE benchmark, end to end: equilibrium, continuum, eigenmodes.
 
-Needs the compiled PETSc/SLEPc stack (``tools/install_stack.py``) and takes a
+Needs the compiled PETSc/SLEPc stack (``supernova install-solver``) and takes a
 couple of seconds::
 
     python examples/itpa_tae.py [figure.png]

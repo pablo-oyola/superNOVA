@@ -34,7 +34,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       # Only the pure-Python layers: autodoc never reaches the PETSc/SLEPc
-      # backend, so the compiled stack from tools/install_stack.py is not needed.
+      # backend, so the compiled stack (supernova install-solver) is not needed.
       - name: Install the package and the docs tools
         run: |
           python -m pip install --upgrade pip
