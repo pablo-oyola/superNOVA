@@ -38,6 +38,7 @@ import numpy as np
 import unyt
 import xarray as xr
 
+from supernova import defaults
 from supernova.continuum import superContinuum
 from supernova.equilibrium import superEquilibrium
 from supernova.radial.bspline import BSplineFE
@@ -67,6 +68,7 @@ _FACTORIZATIONS = {
         # shift. 0.1 gives 1e-18 - 1e-15 on every mesh tried; 0.5 runs MUMPS
         # out of workspace.
         "st_mat_mumps_cntl_1": "0.1",
+        "st_mat_mumps_icntl_14": str(defaults.MUMPS_ICNTL_14),
     },
     "spqr": {
         "st_ksp_type": "preonly",
@@ -89,7 +91,7 @@ class PetscOptions:
     trying when MUMPS runs out of memory or reports a zero pivot.
     """
 
-    factorization: str = "mumps"
+    factorization: str = defaults.FACTORIZATION
     extra: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -123,7 +125,7 @@ class Band:
     low: float
     high: float
     units: str = "kHz"
-    vscale: float = 0.25
+    vscale: float = defaults.REGION_VSCALE
     _case: "Case | None" = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -214,12 +216,13 @@ class RadialGrid:
     """The radial finite-element space, described by what a user chooses."""
 
     knots: np.ndarray
-    order: int = 3
-    quad_order: int = 6
+    order: int = defaults.ORDER
+    quad_order: int = defaults.QUAD_ORDER
     domain: tuple[float, float] = (0.0, 1.0)
 
     @classmethod
-    def uniform(cls, spans: int, order: int = 3, quad_order: int = 6,
+    def uniform(cls, spans: int, order: int = defaults.ORDER,
+                quad_order: int = defaults.QUAD_ORDER,
                 domain: tuple[float, float] = (0.0, 1.0)) -> "RadialGrid":
         """``spans`` equal elements over ``domain``."""
         if spans < 1:
@@ -229,7 +232,7 @@ class RadialGrid:
 
     @classmethod
     def graded(cls, spans: int, centers, local, *, growth: float = 0.15,
-               order: int = 3, quad_order: int = 6,
+               order: int = defaults.ORDER, quad_order: int = defaults.QUAD_ORDER,
                domain: tuple[float, float] = (0.0, 1.0)) -> "RadialGrid":
         """``spans`` equal elements, refined to ``local`` around ``centers``.
 
@@ -332,8 +335,9 @@ class Case:
 
     @classmethod
     def from_eqdsk(cls, path, *, cocos_in: int, density: Profile,
-                   pressure="eqdsk", boozer_domain=None, gamma_s: float = 5.0 / 3.0,
-                   species: str = "D", profile_points: int = 128,
+                   pressure="eqdsk", boozer_domain=None,
+                   gamma_s: float = defaults.GAMMA_S,
+                   species: str = defaults.SPECIES, profile_points: int = 128,
                    dense_continuum: bool = True, **equilibrium_kwargs) -> "Case":
         """Load an eqdsk and build the equilibrium and continuum around it.
 
@@ -376,7 +380,8 @@ class Case:
         to sweep gamma_s would pay for the transform again for nothing.
         """
         gamma_s = self.gamma_s if gamma_s is None else float(gamma_s)
-        species = self.metadata.get("species", "D") if species is None else species
+        species = (self.metadata.get("species", defaults.SPECIES)
+                   if species is None else species)
         continuum = superContinuum(self.equilibrium, gamma_s=gamma_s,
                                    species=species, dense=dense)
         metadata = dict(self.metadata)
@@ -587,11 +592,14 @@ class Scan:
     the solver blocks and the mixed bases are built once, and each window is a
     retargeted solve.  For the multigrid classification pipeline use
     :class:`~supernova.solve.multigrid.MultigridSolver` directly.
+
+    ``mmax=None`` takes :func:`~supernova.defaults.default_mmax`, ceil(n q) at
+    rho_pol = 0.95, so the harmonic limit follows the toroidal mode number.
     """
 
     def __init__(self, case: Case, grid: RadialGrid, *, ntor: int,
-                 mmax: int | None = None, max_dm: int = 10,
-                 regularizer: float = 0.0):
+                 mmax: int | None = None, max_dm: int = defaults.MAX_DM,
+                 regularizer: float = defaults.REGULARIZER):
         self.case = case
         self.grid = grid
         self.ntor = int(ntor)
@@ -647,9 +655,9 @@ class Scan:
                                   "omegaA", registry=self.case.registry)
         return np.asarray(angular.to(units).v, dtype=float)
 
-    def solve_window(self, band: Band, *, low=None, high=None, nev: int = 4,
+    def solve_window(self, band: Band, *, low=None, high=None, nev: int = defaults.NEV,
                      options: PetscOptions | Mapping[str, str] | None = None,
-                     tol: float = 1.0e-8, maxit: int = 100,
+                     tol: float = defaults.TOL, maxit: int = defaults.MAXIT,
                      verbose: bool = False, **kwargs) -> ModeSet:
         """Solve one window and return its eigenpairs."""
         band = band.for_case(self.case)
@@ -667,8 +675,9 @@ class Scan:
         return ModeSet(dataset, self)
 
     def run(self, band: Band, *, window: float, overlap: float = 0.0,
-            nev: int = 4, options: PetscOptions | Mapping[str, str] | None = None,
-            tol: float = 1.0e-8, maxit: int = 100, verbose: bool = False,
+            nev: int = defaults.NEV,
+            options: PetscOptions | Mapping[str, str] | None = None,
+            tol: float = defaults.TOL, maxit: int = defaults.MAXIT, verbose: bool = False,
             on_window=None, **kwargs) -> ModeSet:
         """Sweep the band in windows and concatenate what each one returns.
 

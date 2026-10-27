@@ -100,23 +100,20 @@ import unyt
 import supernova as sn
 from supernova.cases.itpa import ITPAEq
 
-# MUMPS's default workspace headroom, ICNTL(14) = 20 %, runs out on these
-# pencils under SLEPc 3.25; the GUI uses 200 % as well.
-mumps = sn.PetscOptions(extra={"st_mat_mumps_icntl_14": "200"})
-
 # 1. Equilibrium and continuum: built once, reused by every scan.
 equilibrium = ITPAEq(aminor=1.0 * unyt.m, Rmajor=10.0 * unyt.m, B0=3.0 * unyt.T,
                      q0=1.71, qedge=1.87, ns=256, ntheta=256, m_max=20)
 continuum = sn.superContinuum(equilibrium, gamma_s=0.0, species="H")
 case = sn.Case(equilibrium, continuum)
 
-# 2. n = 6 on 100 cubic B-spline elements, harmonics up to m = 20.
+# 2. n = 6 on 100 cubic B-spline elements, with the benchmark's harmonics.
+#    Left out, mmax is ceil(n q) at rho_pol = 0.95 and max_dm is 20.
 scan = sn.Scan(case, sn.RadialGrid.uniform(spans=100), ntor=6, mmax=20,
                max_dm=5, regularizer=1e-5)
 
 # 3. Search 60-76 kHz in one window for 4 roots.
 modes = scan.run(sn.Band(60.0, 76.0, units="kHz"), window=16.0, nev=4,
-                 tol=1e-7, maxit=80, options=mumps)
+                 tol=1e-7, maxit=80)
 
 print(modes.frequency_khz)            # every root found in the band
 tae = modes.gap_modes()               # those modelocate calls gap modes
@@ -170,16 +167,17 @@ three, held by one compute process.
    m_max = 20).  Set *ion species* to **H** and press **Load equilibrium**.
    The *Shape*, *Profiles* and *Surface* pages show the Boozer grid, the 1-D
    profiles and any metric element on one flux surface.
-2. **Continuum tab.**  Set *n* = 6, *gamma_s* = 0, *mmax* = 20 and
-   *branches* to *no sound (Alfven only)*.  The continuum redraws on every
+2. **Continuum tab.**  Set *n* = 6, *gamma_s* = 0 and *branches* to *no
+   sound (Alfven only)*; *mmax* stays *auto*.  The continuum redraws on every
    edit.  Under *View*, *f max* = 150 and *shade band* = 60-76 kHz show the
    TAE gap and the search range.
-3. **Solver tab.**
-   - *Problem*: *n / mmax* = 6 / 20, *max dm / regularizer* = 5 / 1e-5,
-     *gamma_s* = 0.  The species is greyed out because it is taken from the
-     Equilibrium tab.
+3. **Solver tab.**  Every field opens on the script API's default, so only
+   the benchmark's own choices need typing:
+   - *Problem*: *n* = 6, *regularizer* = 1e-5, *gamma_s* = 0.  *mmax* stays
+     *auto* (m = 7-12 here) and *max dm* at 20.  The species is greyed out
+     because it is taken from the Equilibrium tab.
    - *Frequency search*: *band* = 60-76 kHz, *window* = 16 kHz,
-     *nev* = 4, *tol / maxit* = 1e-7 / 80.
+     *tol / maxit* = 1e-7 / 80.
    - *Radial grid*: *spans* = 100.
 
    Then press **Solve**.  The roots appear on the continuum in the *Spectrum*
@@ -210,10 +208,9 @@ case = sn.Case.from_eqdsk(
     density=sn.profile_from_columns("ne.dat", units="m^-3"),   # psi_N, n_e
     boozer_domain=(0.005, 0.995), gamma_s=5 / 3, species="D",
 )
-scan = sn.Scan(case, sn.RadialGrid.uniform(spans=150), ntor=4, mmax=40, max_dm=5)
+scan = sn.Scan(case, sn.RadialGrid.uniform(spans=150), ntor=4)   # mmax, max_dm: defaults
 modes = scan.run(sn.Band(50, 150, units="kHz"), window=2.5, nev=8,
-                 sound_model="nova",
-                 options=sn.PetscOptions(extra={"st_mat_mumps_icntl_14": "200"}))
+                 sound_model="nova")
 ```
 
 `sound_model="nova"` drops the parallel sound coupling, as NOVA-K's

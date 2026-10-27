@@ -18,6 +18,7 @@ import xarray as xr
 from scipy.linalg import eig
 from scipy.optimize import linear_sum_assignment
 
+from supernova.defaults import MAX_DM
 from supernova.radial import BSplineFE
 from supernova.eigen.petsc import NEPResult
 from supernova.operators.blocks import mu_0
@@ -2808,7 +2809,7 @@ class MultigridSolver:
         omega_range,
         *,
         mmax: int | None = None,
-        max_dm: int = 10,
+        max_dm: int = MAX_DM,
         regularizer: float = 0.0,
         apply_bcs: bool = True,
         bc_kind: str | None = "full",

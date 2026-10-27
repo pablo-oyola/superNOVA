@@ -18,10 +18,6 @@ import unyt
 import supernova as sn
 from supernova.cases.itpa import ITPAEq
 
-# MUMPS's default workspace headroom, ICNTL(14) = 20 %, runs out on these
-# pencils under SLEPc 3.25; the GUI uses 200 % as well.
-MUMPS = sn.PetscOptions(extra={"st_mat_mumps_icntl_14": "200"})
-
 
 def main(figure="itpa_tae.png"):
     # The published configuration: circular, R0/a = 10, q from 1.71 to 1.87.
@@ -42,7 +38,7 @@ def main(figure="itpa_tae.png"):
     scan = sn.Scan(case, sn.RadialGrid.uniform(spans=100), ntor=6, mmax=20,
                    max_dm=5, regularizer=1e-5)
     modes = scan.run(sn.Band(60.0, 76.0, units="kHz"), window=16.0, nev=4,
-                     tol=1e-7, maxit=80, options=MUMPS)
+                     tol=1e-7, maxit=80)
 
     located = modes.locate()
     for f, label, rho in zip(modes.frequency_khz, located["mode_label"].values,

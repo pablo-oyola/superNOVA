@@ -5,6 +5,7 @@ a tokamak equilibrium.
 
 import unyt
 
+from supernova.defaults import CONTINUUM_BRANCHES, GAMMA_S, MAX_DM, SPECIES, default_mmax
 from supernova.equilibrium import superEquilibrium
 from supernova.operators.continuum_kernel import assemble_full_matrices, assembly_slow_sound, assembly_only_saw
 import numpy as np
@@ -49,7 +50,7 @@ def _eigh_signed_definite(A: np.ndarray, B: np.ndarray) -> np.ndarray:
 
 class superContinuum:
     """The sound-Alfven continuum of a superEquilibrium, for any toroidal mode number."""
-    def __init__(self, equ: superEquilibrium, gamma_s: float=5/3, species: str='D',
+    def __init__(self, equ: superEquilibrium, gamma_s: float=GAMMA_S, species: str=SPECIES,
                  dense: bool=True):
         """
         Initializes the class by calling the superEquilibrium constructor and
@@ -137,9 +138,9 @@ class superContinuum:
             iprof.data = iprof.data.reindex(mpol=mpol, fill_value=0)
 
     def solve(self, ntor: int, mmax: int=None, psi_vals: np.ndarray=None, 
-              which: str='full', return_eigvecs: bool=False,
+              which: str=CONTINUUM_BRANCHES, return_eigvecs: bool=False,
               normalize_eigvals: bool=False, classify: bool=False, 
-              max_dm: int=1000, max_dn: int=1000,
+              max_dm: int=MAX_DM, max_dn: int=1000,
               **classify_kwargs):
         """
         Solves the continuum spectrum for the given equilibrium and parameters.
@@ -148,10 +149,16 @@ class superContinuum:
         ----------
         ntor: int
             The toroidal mode number to consider for the continuum spectrum.
+        mmax: int, optional
+            The highest poloidal harmonic. None takes ceil(n q) at rho_pol = 0.95
+            (:func:`supernova.defaults.default_mmax`).
         psi_vals: np.ndarray, optional
             The specific values of the poloidal flux to evaluate the continuum spectrum at. If None, it will be evaluated at all available radial points.
         which: str
-            Which part of the spectrum to return. Options are 'full', 'alfven', 'slow_sound'.
+            Which part of the spectrum to return: 'slow_sound' (the default), 'alfven' or 'full'.
+        max_dm, max_dn: int
+            The widest poloidal and toroidal harmonic couplings kept. Only the
+            full spectrum couples harmonics, so the other branches ignore them.
         return_eigvecs: bool
             Whether to return the eigenvectors along with the eigenvectors (left, right and normalizations).
         normalize_eigvals: bool
@@ -184,6 +191,8 @@ class superContinuum:
         # If the user provides no mode limit, we will take the maximum poloidal mode
         # number from the H profile.
         H_mmax = np.abs(self.H.m_pol).max()
+        if mmax is None:
+            mmax = default_mmax(self.equ, ntor)
         if mmax is None:
             mmax = int(H_mmax)
         else:
@@ -307,7 +316,8 @@ class superContinuum:
 
             A, B = fun(H_nm=iH_mn, J_nm=iJ_mn, 
                        K_mn=iK_mn, L_mn=iL_mn, M_mn=iM_mn, N_mn=iN_mn,
-                       q=iqval, m_range=m_range, ntor=ntor, p0=ip0)
+                       q=iqval, m_range=m_range, ntor=ntor, p0=ip0,
+                       max_dm=max_dm, max_dn=max_dn)
             
             # We obtain the eigenvalues and eigenvectors of the generalized eigenvalue problem A v = lambda B v.
             w, vl, vr = _solve_(A, B)
@@ -367,6 +377,8 @@ class superContinuum:
         # If the user provides no mode limit, we will take the maximum poloidal mode
         # number from the H profile.
         H_mmax = np.abs(self.H.m_pol).max()
+        if mmax is None:
+            mmax = default_mmax(self.equ, ntor)
         if mmax is None:
             mmax = int(H_mmax)
         else:

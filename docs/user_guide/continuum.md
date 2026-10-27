@@ -39,9 +39,12 @@ f_khz = np.sqrt(omega2.real).to("kHz").v / (2 * np.pi)    # (radius, branch)
 ```
 
 `which` picks the branches:
+- `"slow_sound"` (the default): the slow sound branches;
 - `"alfven"`: shear Alfvén only, no sound;
-- `"slow_sound"`: the slow sound branches;
 - `"full"`: the coupled sound-Alfvén spectrum.
+
+`mmax` and `max_dm` default as in the eigensolve: ⌈n·q⌉ at ρ_pol = 0.95,
+and 20 (see [Eigenmode scans](eigenmodes.md)).
 
 `classify=True` labels each root Alfvénic, sound or mixed from its
 eigenvector. The labels only mean something for `which="full"`, since the

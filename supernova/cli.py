@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from supernova.defaults import MAX_DM
 from supernova.app.workflow import (
     DEFAULT_ARTIFACT_DIR,
     DEFAULT_DENSITY,
@@ -31,8 +32,10 @@ def _parser() -> argparse.ArgumentParser:
     solve.add_argument("--frequency-khz", nargs=2, type=float, default=(50.0, 150.0))
     solve.add_argument("--cocos-in", type=int, default=7)
     solve.add_argument("--ntor", type=int, default=4)
-    solve.add_argument("--mmax", type=int, default=68)
-    solve.add_argument("--max-dm", type=int, default=5)
+    solve.add_argument(
+        "--mmax", type=int, default=None,
+        help="highest poloidal harmonic; default ceil(n q) at rho_pol = 0.95")
+    solve.add_argument("--max-dm", type=int, default=MAX_DM)
     solve.add_argument("--gamma-s", type=float, default=1.0e-3)
     solve.add_argument("--species", default="D")
     solve.add_argument("--regularizer", type=float, default=0.0)

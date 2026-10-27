@@ -22,6 +22,7 @@ import time
 import numpy as np
 
 from supernova.api import Case
+from supernova.defaults import default_mmax
 from supernova.gui._state import ContinuumState
 
 
@@ -106,7 +107,7 @@ def _harmonic_band(q_min: float, q_max: float, ntor: int, mmax: int):
     return lowest, highest
 
 
-def classification_feasibility(case, ntor: int, mmax: int) -> tuple[bool, str]:
+def classification_feasibility(case, ntor: int, mmax: int | None) -> tuple[bool, str]:
     """Can the family classifier run for this harmonic band, and if not, why?
 
     The operators are convolutions: an entry between state harmonics m and m'
@@ -117,6 +118,9 @@ def classification_feasibility(case, ntor: int, mmax: int) -> tuple[bool, str]:
     q = np.abs(np.asarray(case.equilibrium.qprof.data).squeeze().real)
     q_min, q_max = float(np.nanmin(q)), float(np.nanmax(q))
     available = int(np.abs(case.continuum.H.m_pol).max())
+    if mmax is None:
+        # the solvers' own default; for n = 0, the equilibrium's harmonic count
+        mmax = default_mmax(case.equilibrium, ntor) or available
 
     lowest, highest = _harmonic_band(q_min, q_max, abs(int(ntor)), int(mmax))
     if highest < lowest:
@@ -178,7 +182,7 @@ class ContinuumModel:
 
         if state.classify and state.which == "full":
             feasible, why = classification_feasibility(
-                self.case, int(state.ntor), int(state.mmax))
+                self.case, int(state.ntor), state.mmax_limit)
             if not feasible:
                 # Predicted from the harmonic band, so the expensive classified
                 # solve is skipped rather than run and thrown away.
@@ -187,7 +191,7 @@ class ContinuumModel:
                     progress("Family labels unavailable here; solving without them...")
                 eigenvalues = self.case.continuum.solve(
                     ntor=int(state.ntor), which="full", normalize_eigvals=True,
-                    psi_vals=x, classify=False, mmax=int(state.mmax),
+                    psi_vals=x, classify=False, mmax=state.mmax_limit,
                 )
                 elapsed = time.perf_counter() - started
                 return self._pack(state, x, eigenvalues, elapsed, reloaded,
@@ -197,7 +201,7 @@ class ContinuumModel:
             try:
                 eigenvalues, _vectors, classifier = self.case.continuum.solve(
                     ntor=int(state.ntor), which="full", normalize_eigvals=True,
-                    psi_vals=x, mmax=int(state.mmax),
+                    psi_vals=x, mmax=state.mmax_limit,
                     return_eigvecs=True, classify=True,
                 )
                 family_code = np.asarray(
@@ -214,7 +218,7 @@ class ContinuumModel:
                     progress("Classification unavailable; solving without it...")
                 eigenvalues = self.case.continuum.solve(
                     ntor=int(state.ntor), which="full", normalize_eigvals=True,
-                    psi_vals=x, classify=False, mmax=int(state.mmax),
+                    psi_vals=x, classify=False, mmax=state.mmax_limit,
                 )
         else:
             if progress:
@@ -225,7 +229,7 @@ class ContinuumModel:
                 normalize_eigvals=True,
                 psi_vals=x,
                 classify=False,
-                mmax=int(state.mmax),
+                mmax=state.mmax_limit,
             )
         elapsed = time.perf_counter() - started
 

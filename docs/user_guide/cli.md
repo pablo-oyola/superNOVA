@@ -14,7 +14,7 @@ lists every option with its default.
 
 ```bash
 supernova solve --equilibrium shot.geqdsk --cocos-in 5 --density ne.dat \
-                --species D --ntor 4 --mmax 68 --frequency-khz 50 150 \
+                --species D --ntor 4 --frequency-khz 50 150 \
                 --artifact-dir runs/n4
 ```
 
@@ -28,7 +28,7 @@ in the repository.
 | Options | What they set |
 |---|---|
 | `--equilibrium`, `--cocos-in`, `--density` | the eqdsk, its COCOS, and a two-column ψ_N density file |
-| `--ntor`, `--mmax`, `--max-dm`, `--regularizer` | the problem, as in [Eigenmode scans](eigenmodes.md) |
+| `--ntor`, `--mmax`, `--max-dm`, `--regularizer` | the problem, as in [Eigenmode scans](eigenmodes.md); `--mmax` defaults to ⌈n·q⌉ at ρ_pol = 0.95 and `--max-dm` to 20 |
 | `--gamma-s`, `--species` | the continuum |
 | `--frequency-khz LOW HIGH` | the band |
 | `--window-width-khz`, `--window-padding`, `--region-vscale` | fixed core windows of at most this width, each padded on both sides by a fraction of a core width, and the ellipse's imaginary semi-axis |

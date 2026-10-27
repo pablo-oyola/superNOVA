@@ -31,9 +31,9 @@ class ITPAEq(superEquilibrium):
         q0: float = 1.71,
         qedge: float = 1.87,
         B0: float = 3.0 * unyt.T,
-        ns: int = 100,
+        ns: int = 256,
         ntheta: int = 256,
-        m_max: int = 128,
+        m_max: int = 20,
         Bt_sign: int = 1,
     ):
         if ns < 4:

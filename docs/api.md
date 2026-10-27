@@ -60,3 +60,10 @@ dependencies, and ITPA is a benchmark case rather than part of the solver.
    refine.refine_equilibrium
    refine.load_diagnostics
 ```
+
+## Shared defaults
+
+```{eval-rst}
+.. automodule:: supernova.defaults
+   :members: default_mmax
+```

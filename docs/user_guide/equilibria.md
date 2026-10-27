@@ -59,6 +59,14 @@ Other keywords
   - `m_max`: the poloidal harmonics kept in the metric;
   - `res_boozer=(npsi, ntheta)`: the Boozer grid, where the GUI's default is
     (511, 512);
+  - `boozer_spectral_modes`: the poloidal Fourier modes pyCOCOS keeps in its
+    fitted map of the flux surfaces, from which the metric is evaluated;
+    default `min(m_max, 64)`. pyCOCOS's own default of 16 cannot follow a
+    kinked last closed surface (a fixed-boundary export of a diverted
+    plasma): the outer surfaces then ripple by centimetres, visible in the
+    GUI's Equilibrium tab. 64 reproduces the raw ψ contours to the grid noise;
+    more modes need more trace points per surface and may fail for a very
+    small inner `boozer_domain`;
   - optional `vtor`, `vpol` and `resistivity` profiles.
 
   The profiles must depend on the flux surface only.

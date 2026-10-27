@@ -40,6 +40,7 @@ import time
 
 import numpy as np
 
+from supernova import defaults
 from supernova.gui._session import JsonState
 
 SPECIES = ("H", "D", "T", "He3", "He4")
@@ -190,30 +191,30 @@ def parse_petsc_options(text: str) -> dict[str, str]:
 class SolverState(JsonState):
     """Every control in the solver tab, and nothing else."""
 
-    # the problem
+    # the problem; every default is the script API's, from supernova.defaults
     ntor: int = 4
-    mmax: int = 40
-    max_dm: int = 5
-    regularizer: float = 0.0
-    gamma_s: float = 5.0 / 3.0
-    species: str = "D"
-    sound_model: str = "ideal"        # "nova": legacy ksound=1, no parallel sound
+    mmax: int = 0                     # 0 is auto: ceil(n q) at rho_pol = 0.95
+    max_dm: int = defaults.MAX_DM
+    regularizer: float = defaults.REGULARIZER
+    gamma_s: float = defaults.GAMMA_S
+    species: str = defaults.SPECIES
+    sound_model: str = defaults.SOUND_MODEL  # "nova": legacy ksound=1, no parallel sound
 
     # the frequency search
     f_low_khz: float = 50.0
     f_high_khz: float = 150.0
     window_width_khz: float = 2.5     # the size of each subrange
     window_overlap: float = 0.0       # fraction of a window shared with the next
-    nev: int = 8                      # roots requested per window
-    region_vscale: float = 0.25       # imaginary semi-axis of the ellipse
-    tol: float = 1.0e-8
-    maxit: int = 200
+    nev: int = defaults.NEV           # roots requested per window
+    region_vscale: float = defaults.REGION_VSCALE  # imaginary semi-axis of the ellipse
+    tol: float = defaults.TOL
+    maxit: int = defaults.MAXIT
 
     # the radial discretization, between walls at these rho_pol (clipped to
     # the equilibrium's Boozer domain)
     spans: int = 150
-    order: int = 3
-    quadrature_order: int = 6
+    order: int = defaults.ORDER
+    quadrature_order: int = defaults.QUAD_ORDER
     rho_min: float = 0.0
     rho_max: float = 1.0
 
@@ -221,8 +222,8 @@ class SolverState(JsonState):
     pep_type: str = "TOAR"
     st_type: str = "SINVERT"
     which: str = "TARGET_MAGNITUDE"
-    factorization: str = "mumps"
-    mumps_icntl_14: int = 200         # % workspace headroom; 20 fails on SLEPc 3.25
+    factorization: str = defaults.FACTORIZATION
+    mumps_icntl_14: int = defaults.MUMPS_ICNTL_14  # % workspace headroom; 0 keeps the preset's
     extra_options: str = ""
 
     # the mode filter, and MODELOCATE as overrides of ModeLocateThresholds
@@ -274,6 +275,11 @@ class SolverState(JsonState):
         step = float(self.window_width_khz) * (1.0 - float(self.window_overlap))
         return max(1, int(np.ceil((self.f_high_khz - self.f_low_khz) / step)))
 
+    @property
+    def mmax_limit(self) -> int | None:
+        """mmax as the solvers take it: None, the q-based default, when it reads auto (0)."""
+        return int(self.mmax) or None
+
     def petsc_options(self):
         from supernova.api import PetscOptions
 
@@ -295,8 +301,8 @@ class SolverState(JsonState):
         problems = []
         if self.ntor == 0:
             problems.append("n = 0 is not a toroidal eigenmode problem here; choose n != 0.")
-        if self.mmax < 1:
-            problems.append("mmax must be at least 1.")
+        if self.mmax < 0:
+            problems.append("mmax must be auto (0) or at least 1.")
         if self.max_dm < 1:
             problems.append("max_dm must be at least 1.")
         if not np.isfinite(self.regularizer) or self.regularizer < 0.0:
@@ -685,7 +691,7 @@ class SolverModel:
             omega = _nova_continuum(equilibrium, continuum, state, np.asarray(x, dtype=float))
             return "nova", _khz(equilibrium, omega)
         which = "alfven" if state.drops_sound else "full"
-        eigenvalues = continuum.solve(ntor=int(state.ntor), mmax=int(state.mmax),
+        eigenvalues = continuum.solve(ntor=int(state.ntor), mmax=state.mmax_limit,
                                       psi_vals=np.asarray(x, dtype=float), which=which,
                                       normalize_eigvals=True, max_dm=int(state.max_dm))
         with np.errstate(invalid="ignore"):
@@ -729,7 +735,7 @@ class SolverModel:
         estimates = []
         for gap in find_gaps(continuum_tips(x, khz)):
             w, _, classifier = continuum.solve(
-                ntor=int(state.ntor), mmax=int(state.mmax), psi_vals=np.array([gap.x]),
+                ntor=int(state.ntor), mmax=state.mmax_limit, psi_vals=np.array([gap.x]),
                 which="full", classify=True, max_dm=int(state.max_dm))
             with np.errstate(invalid="ignore"):
                 f = np.asarray(np.sqrt(w.real).to("kHz").v / (2.0 * np.pi), dtype=float)[0]
@@ -786,7 +792,7 @@ class SolverModel:
         scan = Scan(case, RadialGrid.uniform(int(state.spans), int(state.order),
                                              int(state.quadrature_order),
                                              domain=domain),
-                    ntor=int(state.ntor), mmax=int(state.mmax),
+                    ntor=int(state.ntor), mmax=state.mmax_limit,
                     max_dm=int(state.max_dm), regularizer=float(state.regularizer))
         band = Band(*state.band, units="kHz",
                     vscale=float(state.region_vscale)).for_case(case)
@@ -831,7 +837,7 @@ class SolverModel:
             return None
         from supernova.solve.multigrid import _solve_master_continuum
 
-        blocks = scan.solver.build_solver_blocks(ntor=int(state.ntor), mmax=int(state.mmax),
+        blocks = scan.solver.build_solver_blocks(ntor=int(state.ntor), mmax=state.mmax_limit,
                                                  max_dm=int(state.max_dm))
         dataset = _solve_master_continuum(
             _without_parallel_sound(blocks),
@@ -904,7 +910,7 @@ class SolverModel:
         if progress:
             progress(f"Path test: the complex-path operator for {len(targets)} mode(s)...")
         problem = ContourProblem(scan.solver, int(state.ntor), max_dm=int(state.max_dm),
-                                 mmax=int(state.mmax), regularizer=float(state.regularizer),
+                                 mmax=state.mmax_limit, regularizer=float(state.regularizer),
                                  sound="nova" if state.sound_model == "nova" else "ideal")
         if tips is None:
             tips = self.continuum_tips(equilibrium, state)
@@ -1044,10 +1050,10 @@ class SolverModel:
                          f"{h_mm.min():.3g} mm at the finest...")
             scan = Scan(case, RadialGrid(breakpoints, int(state.order),
                                          int(state.quadrature_order), domain),
-                        ntor=int(state.ntor), mmax=int(state.mmax),
+                        ntor=int(state.ntor), mmax=state.mmax_limit,
                         max_dm=int(state.max_dm), regularizer=float(state.regularizer))
             T0, T1, Tminus1 = scan.solver.assemble_split_matrices(
-                ntor=int(state.ntor), mmax=int(state.mmax), max_dm=int(state.max_dm),
+                ntor=int(state.ntor), mmax=state.mmax_limit, max_dm=int(state.max_dm),
                 regularizer=float(state.regularizer), sound_model=state.sound_model)
             jobs, regions = [], {}
             for index, f_khz in enumerate(frequency):
@@ -1070,7 +1076,7 @@ class SolverModel:
                     target_s, region = regions[index]
                     dataset = scan.solver.pack_window(
                         solution, ntor=int(state.ntor), target_omega=np.sqrt(target_s),
-                        region=region, mmax=int(state.mmax), max_dm=int(state.max_dm),
+                        region=region, mmax=state.mmax_limit, max_dm=int(state.max_dm),
                         regularizer=float(state.regularizer), pep_type=state.pep_type,
                         st_type=state.st_type, which=state.which,
                         sound_model=state.sound_model)
@@ -1139,7 +1145,7 @@ class SolverModel:
         """
         nev = int(state.nev)
         settings = dict(
-            ntor=int(state.ntor), mmax=int(state.mmax), max_dm=int(state.max_dm),
+            ntor=int(state.ntor), mmax=state.mmax_limit, max_dm=int(state.max_dm),
             regularizer=float(state.regularizer), pep_type=state.pep_type,
             st_type=state.st_type, which=state.which, nev=nev, tol=float(state.tol),
             maxit=int(state.maxit), options=state.petsc_options().as_dict(),
@@ -1197,7 +1203,7 @@ class SolverModel:
         if progress:
             progress(f"Assembling the pencil once for {len(windows)} windows...")
         T0, T1, Tminus1 = scan.solver.assemble_split_matrices(
-            ntor=int(state.ntor), mmax=int(state.mmax), max_dm=int(state.max_dm),
+            ntor=int(state.ntor), mmax=state.mmax_limit, max_dm=int(state.max_dm),
             regularizer=float(state.regularizer), verbose=bool(state.verbose),
             sound_model=state.sound_model)
         pencil = {
@@ -1229,7 +1235,7 @@ class SolverModel:
                 try:
                     dataset = scan.solver.pack_window(
                         solution, ntor=int(state.ntor), target_omega=target_omega,
-                        region=region, mmax=int(state.mmax), max_dm=int(state.max_dm),
+                        region=region, mmax=state.mmax_limit, max_dm=int(state.max_dm),
                         regularizer=float(state.regularizer), pep_type=state.pep_type,
                         st_type=state.st_type, which=state.which,
                         verbose=bool(state.verbose), sound_model=state.sound_model)
@@ -1462,7 +1468,7 @@ def _nova_continuum(equilibrium, continuum, state, x) -> np.ndarray:
     # a solver whose "quadrature points" are x evaluates every block there
     sampler = StabilitySolver(equilibrium, continuum,
                               _SampleGrid(x, RadialGrid.uniform(8).build()))
-    blocks = sampler.build_solver_blocks(ntor=int(state.ntor), mmax=int(state.mmax),
+    blocks = sampler.build_solver_blocks(ntor=int(state.ntor), mmax=state.mmax_limit,
                                          max_dm=int(state.max_dm))
     dataset = _solve_master_continuum(_without_parallel_sound(blocks), x)
     return np.asarray(dataset["omega"].values, dtype=complex)

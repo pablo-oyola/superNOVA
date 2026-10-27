@@ -29,6 +29,7 @@ import unyt
 import xarray as xr
 
 import supernova as sn
+from supernova.defaults import default_mmax
 from supernova.app.artifacts import (
     REPO_ROOT,
     _git_commit,
@@ -83,16 +84,8 @@ DEFAULT_ARTIFACT_DIR = REPO_ROOT / "no_sync/D3D/202020/multigrid_n4_50_150"
 
 
 def _factorization_options(name: str) -> dict[str, str]:
-    if name == "mumps":
-        return {
-            "st_ksp_type": "preonly",
-            "st_pc_type": "lu",
-            "st_pc_factor_mat_solver_type": "mumps",
-        }
-    options = {"st_ksp_type": "preonly", "st_pc_type": "qr"}
-    if name == "spqr":
-        options["st_pc_factor_mat_solver_type"] = "spqr"
-    return options
+    # the script API's presets, so the CLI factorizes exactly as scripts and the GUI do
+    return sn.PetscOptions(name).as_dict()
 
 
 def _base_spline(spans: int, order: int, quadrature_order: int):
@@ -546,6 +539,10 @@ def _run_solve(args: argparse.Namespace) -> None:
     frequency_band = tuple(np.sort(np.asarray(args.frequency_khz, dtype=float)))
     window_count = _window_count(frequency_band, args.window_width_khz)
     equilibrium, continuum_solver = _load_case(args)
+    if args.mmax is None:
+        # resolved here so the artifacts and the manifest record the number used
+        args.mmax = (default_mmax(equilibrium, args.ntor)
+                     or int(np.abs(continuum_solver.H.m_pol).max()))
     multigrid = sn.MultigridSolver(
         equilibrium,
         continuum_solver,

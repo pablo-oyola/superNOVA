@@ -203,8 +203,11 @@ class ContinuumWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.classify_check, 3, 0, 1, 4)
 
         self.mmax_spin = QtWidgets.QSpinBox()
-        self.mmax_spin.setRange(1, 512)
-        self.mmax_spin.setToolTip("Poloidal harmonics retained. Cost is flat in mmax.")
+        self.mmax_spin.setRange(0, 512)
+        self.mmax_spin.setSpecialValueText("auto")
+        self.mmax_spin.setToolTip(
+            "Poloidal harmonics retained. Cost is flat in mmax. auto (0) is "
+            "ceil(n q) at rho_pol = 0.95, which follows n.")
         grid.addWidget(QtWidgets.QLabel("mmax"), 2, 0)
         grid.addWidget(self.mmax_spin, 2, 1)
 

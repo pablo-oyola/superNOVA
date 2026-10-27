@@ -370,7 +370,8 @@ class superEquilibrium:
                  m_max: int=128,
                  resistivity: Profile=None, vtor: Profile=None, vpol: Profile=None,
                  rhodomain_boozer: Optional[Tuple[float, float]]=None,
-                 res_boozer: Optional[Tuple[int, int]]=None):
+                 res_boozer: Optional[Tuple[int, int]]=None,
+                 boozer_spectral_modes: Optional[int]=None):
         """
         Initializes the class with the equilbrium and the profiles. From here,
         we will compute the Boozer coordinates and compute the metric coefficients.
@@ -383,6 +384,23 @@ class superEquilibrium:
             The density profile.
         pressure : Profile
             The pressure profile.
+        m_max : int, optional
+            Poloidal harmonics kept in the Boozer expansion of the metric and
+            the profiles. Default 128.
+        rhodomain_boozer : (float, float), optional
+            ``rho_pol`` range of the Boozer domain. Default (0.005, 0.995).
+        res_boozer : (int, int), optional
+            Radial and poloidal points of the Boozer grid. Default (511, 512).
+        boozer_spectral_modes : int, optional
+            Poloidal Fourier modes pyCOCOS keeps in its fitted map of the flux
+            surfaces (``spectral_max_mode``), which is what the metric is
+            evaluated from. Default ``min(m_max, 64)``. pyCOCOS's own default
+            of 16 cannot follow a kinked last closed surface: on the NSTX
+            128741 fixed-boundary equilibrium the outer surfaces then ring by
+            up to 7 cm, while 64 modes reproduce the raw contours to the grid
+            noise (6 mm) and more modes add nothing. More modes need more
+            trace points per surface (at least ``2 m + 4``), which the
+            innermost surfaces of a tiny ``rhodomain_boozer[0]`` may not have.
         vtor : Optional[Profile], optional
             The toroidal flow velocity profile.
         vpol : Optional[Profile], optional
@@ -460,9 +478,15 @@ class superEquilibrium:
         # Preparing the normalization.
         self._prepare_unit_system()
 
+        if boozer_spectral_modes is None:
+            boozer_spectral_modes = min(abs(int(m_max)), 64)
+        if boozer_spectral_modes < 1:
+            raise ValueError(f"boozer_spectral_modes must be positive, got {boozer_spectral_modes}.")
+        self.boozer_spectral_modes = int(boozer_spectral_modes)
         self.boozer = self.equ.compute_coordinates(coordinate_system="boozer",
                                                    lpsi=npsi, ltheta=ntheta, 
-                                                   rhopol_min=a, rhopol_max=b)
+                                                   rhopol_min=a, rhopol_max=b,
+                                                   spectral_max_mode=self.boozer_spectral_modes)
         self._eval_boozer_profiles()
 
         # We prepare some pre-calculated quantities.

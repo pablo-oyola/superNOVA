@@ -32,6 +32,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.sparse import coo_array
 
+from supernova.defaults import MAX_DM
 from supernova.eigen.dispatch import build_eigensolver
 from supernova.eigen.region import _as_scalar_complex, _ellipse_region_dict
 from supernova.operators.contour import GlobalPath, LocalPolynomialContinuation, continue_tensor
@@ -158,7 +159,7 @@ class ContourProblem:
         neighbours).
     """
 
-    def __init__(self, solver, ntor: int, max_dm: int = 10, mmax: int | None = None,
+    def __init__(self, solver, ntor: int, max_dm: int = MAX_DM, mmax: int | None = None,
                  regularizer: float = 0.0, sample_x: np.ndarray | None = None,
                  sound: str = "ideal",
                  continuation: LocalPolynomialContinuation | None = None):

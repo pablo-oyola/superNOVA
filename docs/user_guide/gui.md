@@ -74,8 +74,9 @@ only if *pass it on* was ticked when the re-solve finished.
 :alt: The Continuum tab showing the n = 6 Alfvén continuum of the ITPA case with the 60–76 kHz band shaded.
 ```
 
-- ***n***, ***gamma_s*** and ***mmax*** set the problem. *species* is the
-  Equilibrium tab's, shown greyed.
+- ***n***, ***gamma_s*** and ***mmax*** set the problem. *mmax* opens on
+  *auto*, ⌈n·q⌉ at ρ_pol = 0.95, which follows n; step it up from auto to
+  fix a value. *species* is the Equilibrium tab's, shown greyed.
 - ***branches*** offers *slow sound only*, *no sound (Alfven only)* and
   *full sound-Alfven*. *label families* colours the full spectrum's roots as
   Alfvénic, sound or mixed, which costs about a second instead of 0.1 s.
@@ -97,9 +98,10 @@ The continuum is solved again on every edit; *Solve now* forces it. Under
 The left column holds every setting of one pass:
 
 *Problem*
-: n and mmax, max dm and regularizer, gamma_s, and the *sound* model: *ideal
-  MHD*, or *NOVA ksound=1* without the parallel sound. See
-  [Eigenmode scans](eigenmodes.md) for what each one means.
+: n and mmax (*auto* by default, as on the Continuum tab), max dm (20) and
+  regularizer, gamma_s, and the *sound* model: *ideal MHD*, or *NOVA
+  ksound=1* without the parallel sound. See [Eigenmode scans](eigenmodes.md)
+  for what each one means. Every field opens on the script API's default.
 
 *Frequency search*
 : The band, the window width and overlap, nev and the region's vscale, and

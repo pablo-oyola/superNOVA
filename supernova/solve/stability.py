@@ -27,6 +27,7 @@ import unyt
 import xarray as xr
 from scipy.sparse import coo_array, csr_matrix
 
+from supernova.defaults import MAX_DM, default_mmax
 from supernova.equilibrium import superEquilibrium, _active_poloidal_flux_span
 from supernova.continuum import superContinuum
 from supernova.radial.base import RadialFE
@@ -543,7 +544,7 @@ class StabilitySolver:
         self,
         ntor: int,
         m_values: np.ndarray,
-        max_dm: int = 10,
+        max_dm: int = MAX_DM,
     ) -> SolverBlocks:
         """Build uncached blocks for an explicit diagnostic harmonic list.
 
@@ -558,15 +559,17 @@ class StabilitySolver:
             max_dm=max_dm,
         )
 
-    def build_solver_blocks(self, ntor: int, max_dm: int=10, mmax: int=None) -> SolverBlocks:
+    def build_solver_blocks(self, ntor: int, max_dm: int = MAX_DM, mmax: int=None) -> SolverBlocks:
         """
         We build the solver blocks using the pre-evaluated profiles already
         evaluated at the radial points and fill the class to be used later 
         in a faster assembly.
         """
-        # If the user provides no mode limit, we will take the maximum poloidal mode
-        # number from the H profile.
+        # With no mode limit, take ceil(n q) at rho_pol = 0.95; for n = 0, where
+        # that is undefined, the largest poloidal mode number of the H profile.
         H_mmax = np.abs(self.M.m_pol).max()
+        if mmax is None:
+            mmax = default_mmax(self.equ, ntor)
         if mmax is None:
             mmax = int(H_mmax)
         else:
@@ -705,7 +708,7 @@ class StabilitySolver:
         self,
         ntor: int,
         mmax: int | None = None,
-        max_dm: int = 10,
+        max_dm: int = MAX_DM,
         regularizer: float = 0.0,
         apply_bcs: bool = True,
         bc_kind: str | None = "full",
@@ -1113,7 +1116,7 @@ class StabilitySolver:
         target_omega: complex,
         region: dict | None,
         mmax: int | None = None,
-        max_dm: int = 10,
+        max_dm: int = MAX_DM,
         regularizer: float = 0.0,
         apply_bcs: bool = True,
         bc_kind: str | None = "full",
@@ -1185,7 +1188,7 @@ class StabilitySolver:
         target_omega: complex,
         region: dict | None,
         mmax: int | None = None,
-        max_dm: int = 10,
+        max_dm: int = MAX_DM,
         regularizer: float = 0.0,
         apply_bcs: bool = True,
         bc_kind: str | None = "full",
@@ -1281,7 +1284,7 @@ class StabilitySolver:
         ntor: int,
         windows,
         mmax: int | None = None,
-        max_dm: int = 10,
+        max_dm: int = MAX_DM,
         regularizer: float = 0.0,
         apply_bcs: bool = True,
         bc_kind: str | None = "full",
@@ -1383,7 +1386,7 @@ class StabilitySolver:
         target_omega: complex,
         region: dict | None,
         mmax: int | None = None,
-        max_dm: int = 10,
+        max_dm: int = MAX_DM,
         regularizer: float = 0.0,
         apply_bcs: bool = True,
         bc_kind: str | None = "full",

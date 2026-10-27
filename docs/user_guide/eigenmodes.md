@@ -68,13 +68,18 @@ scan = sn.Scan(case, grid, ntor=6, mmax=20, max_dm=5, regularizer=1e-5)
 : The toroidal mode number.
 
 `mmax`
-: The highest poloidal harmonic allowed. The scan keeps the harmonics that
-  can resonate across the q range, from ⌊n·q_min⌋ − 3 to ⌈n·q_max⌉ + 3,
-  capped at `mmax`. For the ITPA case at n = 6 that is m = 7–15. The
-  results list them in `m_pol`.
+: The highest poloidal harmonic allowed. Left out, it is ⌈n·q⌉ at
+  ρ_pol = 0.95, the harmonic resonant there
+  ({py:func}`~supernova.defaults.default_mmax`), so it follows n
+  automatically. The scan keeps the harmonics that can resonate across the q
+  range, from ⌊n·q_min⌋ − 3 to ⌈n·q_max⌉ + 3, capped at `mmax`. For the ITPA
+  case at n = 6 the default gives m = 7–12; the benchmark's `mmax=20` gives
+  m = 7–15. For n = 0 no harmonic is resonant, and the cap is the
+  equilibrium's own harmonic count. The results list the harmonics in
+  `m_pol`.
 
 `max_dm`
-: The widest coupling |m − m′| kept in the operator.
+: The widest coupling |m − m′| kept in the operator, 20 by default.
 
 `regularizer`
 : ε scales the inertia by (1 + iε)². This is a small imaginary frequency
@@ -88,8 +93,7 @@ only a new shift-and-invert solve.
 
 ```python
 band = sn.Band(60.0, 76.0, units="kHz")         # vscale=0.25 by default
-modes = scan.run(band, window=2.0, overlap=0.0, nev=4, tol=1e-7, maxit=200,
-                 options=sn.PetscOptions(extra={"st_mat_mumps_icntl_14": "200"}))
+modes = scan.run(band, window=2.0, overlap=0.0, nev=4, tol=1e-7, maxit=200)
 ```
 
 {py:class}`~supernova.Band` holds the band in physical units. It converts
@@ -122,7 +126,7 @@ found = []
 for low, high in band.windows(2.0):
     try:
         found.append(scan.solve_window(band, low=low, high=high, nev=4,
-                                       maxit=200, options=options))
+                                       maxit=200))
     except RuntimeError:
         pass
 ```
@@ -140,14 +144,31 @@ factorization:
 - `"spqr"` and `"petsc_qr"` are the QR alternatives, worth trying when MUMPS
   runs out of memory or reports a zero pivot.
 
-`extra` takes raw PETSc options. On SLEPc 3.25, MUMPS's default workspace
-headroom (ICNTL(14) = 20 %) runs out on these pencils with
-`INFOG(1) = -9`. Pass `"st_mat_mumps_icntl_14": "200"`, which is what the GUI
-uses.
+`extra` takes raw PETSc options, which override the preset. The `"mumps"`
+preset raises MUMPS's workspace headroom to ICNTL(14) = 200 %. MUMPS's own
+20 % runs out on these pencils under SLEPc 3.25, with `INFOG(1) = -9`.
 
 `sound_model="nova"` and the other keywords of
 {py:meth}`StabilitySolver.solve_pep <supernova.StabilitySolver.solve_pep>`
 pass through `run` and `solve_window` unchanged.
+
+## Defaults
+
+The script API, the solver classes, the CLI and the GUI share their
+defaults through {py:mod}`supernova.defaults`. The GUI opens with the same
+values a script gets when it leaves an argument out:
+
+| | default |
+|---|---|
+| `mmax` | ⌈n·q⌉ at ρ_pol = 0.95 (*auto* in the GUI) |
+| `max_dm` | 20 |
+| `regularizer` | 0 |
+| `nev`, `tol`, `maxit` | 4, 10⁻⁸, 100 |
+| `vscale` | 0.25 |
+| `order`, `quad_order` | 3, 6 |
+| factorization | MUMPS, ICNTL(14) = 200 |
+| `gamma_s`, `species` | 5/3, `"D"` |
+| continuum branches | `"slow_sound"` |
 
 ## Working with the modes
 

@@ -35,6 +35,7 @@ from matplotlib.ticker import FuncFormatter
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from supernova.app.schema import FIELD_TITLES
+from supernova.defaults import MAX_DM
 from supernova.gui._qt import (
     ERROR,
     MUTED,
@@ -239,14 +240,17 @@ class SolverWindow(QtWidgets.QMainWindow):
         box = QtWidgets.QGroupBox("Problem")
         grid = QtWidgets.QGridLayout(box)
         self.ntor_spin = int_spin(-64, 64, 4, tooltip="Toroidal mode number.")
-        self.mmax_spin = int_spin(1, 1024, 40, tooltip=(
+        self.mmax_spin = int_spin(0, 1024, 0, tooltip=(
             "Highest poloidal harmonic. The band itself is chosen from q: "
-            "about n q_min - 3 to n q_max + 3, capped here."))
+            "about n q_min - 3 to n q_max + 3, capped here. auto (0) is "
+            "ceil(n q) at rho_pol = 0.95, which follows n."))
+        self.mmax_spin.setSpecialValueText("auto")
         grid.addWidget(QtWidgets.QLabel("n / mmax"), 0, 0)
         grid.addWidget(self.ntor_spin, 0, 1)
         grid.addWidget(self.mmax_spin, 0, 2)
-        self.max_dm_spin = int_spin(1, 256, 5, tooltip=(
-            "Largest harmonic difference |m - m'| coupled by the operators."))
+        self.max_dm_spin = int_spin(1, 256, MAX_DM, tooltip=(
+            f"Largest harmonic difference |m - m'| coupled by the operators; "
+            f"{MAX_DM} by default."))
         self.regularizer_edit = SciEdit(0.0, minimum=0.0, tooltip=(
             "Added to the inertia to keep the pencil regular near the axis; "
             "1e-5 in the ITPA benchmark."))
@@ -394,8 +398,9 @@ class SolverWindow(QtWidgets.QMainWindow):
             "The shift-and-invert factorization. MUMPS LU is the production "
             "choice; the QR ones are for when it runs out of memory or pivots.")
         self.icntl_spin = int_spin(0, 100000, 200, 20, tooltip=(
-            "MUMPS ICNTL(14): workspace headroom in percent. The default 20 "
-            "fails with INFOG(1) = -9 under SLEPc 3.25. 0 leaves it unset."))
+            "MUMPS ICNTL(14): workspace headroom in percent. MUMPS's own 20 "
+            "fails with INFOG(1) = -9 under SLEPc 3.25, so the preset uses "
+            "200; 0 keeps the preset's value."))
         self.extra_options = QtWidgets.QPlainTextEdit()
         self.extra_options.setPlaceholderText("key value  (one PETSc option per line)")
         self.extra_options.setFixedHeight(60)

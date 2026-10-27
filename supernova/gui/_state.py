@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass, fields
 import json
 from pathlib import Path
 
+from supernova import defaults
+
 # What the solver calls each branch set, and what a physicist calls it.
 BRANCHES = ("slow_sound", "alfven", "full")
 BRANCH_LABELS = {
@@ -45,11 +47,11 @@ class ContinuumState:
 
     # continuum
     ntor: int = 2
-    gamma_s: float = 5.0 / 3.0
-    species: str = "D"
-    mmax: int = 40
+    gamma_s: float = defaults.GAMMA_S
+    species: str = defaults.SPECIES
+    mmax: int = 0                     # 0 is auto: ceil(n q) at rho_pol = 0.95
     npsi: int = 256
-    which: str = "slow_sound"
+    which: str = defaults.CONTINUUM_BRANCHES
     classify: bool = False            # label each root Alfvenic / sound / mixed
 
     # view
@@ -61,8 +63,8 @@ class ContinuumState:
     def validate(self) -> list[str]:
         """Return the reasons this state cannot be solved, in reading order."""
         problems = []
-        if self.mmax < 1:
-            problems.append("mmax must be at least 1.")
+        if self.mmax < 0:
+            problems.append("mmax must be auto (0) or at least 1.")
         if self.npsi < 8:
             problems.append("Radial points must be at least 8.")
         if self.which not in BRANCHES:
@@ -77,6 +79,11 @@ class ContinuumState:
         if self.cursor_khz < 0.0:
             problems.append("The mode frequency cannot be negative.")
         return problems
+
+    @property
+    def mmax_limit(self) -> int | None:
+        """mmax as the solvers take it: None, the q-based default, when it reads auto (0)."""
+        return int(self.mmax) or None
 
     # what the continuum object depends on, given an equilibrium
     def continuum_key(self) -> tuple:
