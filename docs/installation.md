@@ -17,8 +17,8 @@ install-solver` then runs pip four times in the same environment:
 | 3 | SLEPc, PyPI sdist `slepc` | newest 3.25.x | compiled against step 1 |
 | 4 | slepc4py | same as SLEPc | Cython extension, `PETSC_DIR` and `SLEPC_DIR` set |
 
-pyCOCOS comes from GitHub at a pinned commit (`8e9aacb`), as a direct git
-reference in `pyproject.toml`.
+pyCOCOS comes from GitHub at a pinned commit (`d4eb8cc`, tag `v0.1.0`), as a
+direct git reference in `pyproject.toml`.
 
 Each step sets `PETSC_DIR` (and `SLEPC_DIR`) to what the previous one
 installed, so every library is compiled exactly once, and every step bypasses
@@ -121,7 +121,7 @@ in a checkout, or add `--force-reinstall --no-deps` to the git install.
 | **`PETSC_DIR` / `SLEPC_DIR` in the environment.**  Conda environments with conda-forge PETSc export them, and petsc4py then builds against that PETSc. | `install-solver` unsets both and sets its own for each step. |
 | **A second PETSc in the same environment.**  A conda-forge `petsc4py` next to the pip one leaves the import order deciding which library loads. | Use a fresh environment.  `install-solver` reinstalls the bindings on every run, so the pip ones win. |
 | **Python version.**  The compiled wheels are tied to the interpreter's minor version. | A new environment with another Python compiles the stack again. |
-| **`pycocos` name collision.**  PyPI has an unrelated `pycocos` (0.2.x). | Direct git reference pinned to commit `8e9aacb`.  That blocks uploading `pynova` to PyPI; bump the SHA when pyCOCOS moves. |
+| **`pycocos` name collision.**  PyPI has an unrelated `pycocos` (0.2.x). | Direct git reference pinned to commit `d4eb8cc` (pyCOCOS `v0.1.0`).  That blocks uploading `pynova` to PyPI; bump the SHA when pyCOCOS moves. |
 | **`pynova` name collision.**  PyPI also has an unrelated `pynova` (0.0.4). | No change: git and local installs ignore PyPI.  Rename before any PyPI release. |
 | **DESC pins.**  `desc-opt` 0.17.3 caps `scipy<=1.18.0`, `numpy<=2.5.1` and `matplotlib<=3.11.1`, and pulls JAX and about twenty more packages. | The `desc` extra is optional, and `import supernova` never imports `supernova.interop.desc`. |
 | **numba and numpy.**  numba 0.65 requires `numpy<2.5`. | Core `numpy>=1.26,<2.5`, consistent with DESC's cap. |

@@ -22,7 +22,7 @@ dependencies = [
     "findiff>=0.10",
     # pyCOCOS is not on PyPI: the PyPI project called 'pycocos' is an unrelated
     # package, so this must stay a direct git reference pinned to a commit.
-    "pycocos @ git+https://github.com/pablo-oyola/pyCOCOS.git@8e9aacb99dfd4382d366b786e4a684d722ea90e4",
+    "pycocos @ git+https://github.com/pablo-oyola/pyCOCOS.git@d4eb8cc19e6dd4976dba92db13b3c1ed86d40ba7",
 ]
 dynamic = ["version"]
 
