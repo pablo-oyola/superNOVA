@@ -1,11 +1,13 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pynova"
 description = "SuperNOVA: A Python package for computing the ideal MHD stability of tokamak equilibria."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 # Tested range.  numba, jax (DESC) and petsc4py all support it; 3.14 is
 # untested and numba is usually the last to follow a new interpreter.
 requires-python = ">=3.10,<3.14"

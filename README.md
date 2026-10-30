@@ -277,3 +277,7 @@ reference frequencies.
 
 See [CONVENTIONS.md](CONVENTIONS.md) for the coordinate, sign and Fourier
 conventions the physics layers share.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
