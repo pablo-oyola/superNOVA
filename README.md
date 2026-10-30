@@ -289,7 +289,8 @@ Zenodo.  GitHub's "Cite this repository" button reads
 
 ```bibtex
 @software{oyola_supernova,
-  author    = {Oyola, Pablo},
+  author    = {Oyola, Pablo and Gorelenkov, Nikolai N. and Belova, Elena V.
+               and Escoto-Lopez, F. Javier},
   title     = {superNOVA},
   publisher = {Zenodo},
   year      = {2026},
