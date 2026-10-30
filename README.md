@@ -4,7 +4,8 @@
 
 <p align="center">
   <a href="https://pablo-oyola.github.io/superNOVA/"><b>Documentation</b></a> ·
-  <a href="https://github.com/pablo-oyola/superNOVA/actions/workflows/docs.yml"><img src="https://github.com/pablo-oyola/superNOVA/actions/workflows/docs.yml/badge.svg" alt="Docs"></a>
+  <a href="https://github.com/pablo-oyola/superNOVA/actions/workflows/docs.yml"><img src="https://github.com/pablo-oyola/superNOVA/actions/workflows/docs.yml/badge.svg" alt="Docs"></a> ·
+  <a href="https://doi.org/10.5281/zenodo.23811077"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.23811077.svg" alt="DOI"></a>
 </p>
 
 <!-- docs-intro-start -->
@@ -277,6 +278,25 @@ reference frequencies.
 
 See [CONVENTIONS.md](CONVENTIONS.md) for the coordinate, sign and Fourier
 conventions the physics layers share.
+
+## Citing
+
+If you use superNOVA in published work, please cite it.  The DOI
+[10.5281/zenodo.23811077](https://doi.org/10.5281/zenodo.23811077) always
+resolves to the latest release, and each release also has its own DOI on
+Zenodo.  GitHub's "Cite this repository" button reads
+[CITATION.cff](CITATION.cff).
+
+```bibtex
+@software{oyola_supernova,
+  author    = {Oyola, Pablo},
+  title     = {superNOVA},
+  publisher = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.23811077},
+  url       = {https://doi.org/10.5281/zenodo.23811077}
+}
+```
 
 ## License
 

@@ -1,0 +1,53 @@
+name: Release
+
+# Pushing a tag vX.Y.Z publishes a GitHub release for it.  The Zenodo GitHub
+# integration archives every published release as a new version under the
+# concept DOI 10.5281/zenodo.23811077, with the metadata in CITATION.cff.
+# The tag must match supernova.__version__, and CITATION.cff must validate:
+# Zenodo fails the archive on an invalid citation file.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag against the package version
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' supernova/__init__.py)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ = $version"
+            exit 1
+          fi
+
+      - name: Validate CITATION.cff
+        run: |
+          pip install cffconvert==2.0.0
+          cffconvert --validate
+
+      # A release made by hand in the GitHub UI also pushes its tag; leave it.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists."
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+              --title "superNOVA $GITHUB_REF_NAME"
+          fi

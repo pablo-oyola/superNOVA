@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: >-
+  If you use superNOVA in your work, please cite it as below.  The DOI is the
+  Zenodo concept DOI: it resolves to the latest release, and every release
+  also has its own version DOI on Zenodo.
+type: software
+title: superNOVA
+abstract: >-
+  Linear ideal-MHD stability of tokamak equilibria: Boozer coordinates,
+  sound-Alfvén continuum and global eigenmodes on a radial B-spline
+  finite-element × poloidal Fourier basis, solved with SLEPc.
+authors:
+  - given-names: Pablo
+    family-names: Oyola
+    affiliation: Princeton Plasma Physics Laboratory
+    orcid: "https://orcid.org/0000-0002-8455-1090"
+  - given-names: Nikolai N.
+    family-names: Gorelenkov
+    affiliation: Princeton Plasma Physics Laboratory
+    orcid: "https://orcid.org/0000-0002-7345-8149"
+  - given-names: Elena V.
+    family-names: Belova
+    affiliation: Princeton Plasma Physics Laboratory
+    orcid: "https://orcid.org/0000-0002-1525-1027"
+  - given-names: F. Javier
+    family-names: Escoto-Lopez
+    affiliation: Princeton Plasma Physics Laboratory
+    orcid: "https://orcid.org/0000-0002-5315-7277"
+doi: 10.5281/zenodo.23811077
+repository-code: "https://github.com/pablo-oyola/superNOVA"
+url: "https://pablo-oyola.github.io/superNOVA/"
+license: MIT
+keywords:
+  - plasma physics
+  - tokamak
+  - magnetohydrodynamics
+  - MHD stability
+  - Alfvén eigenmodes
+  - shear Alfvén continuum
